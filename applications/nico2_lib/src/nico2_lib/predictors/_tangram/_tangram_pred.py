@@ -12,7 +12,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import tangram as tg
 from tangram import mapping_utils as mu
 from tangram import utils as ut
 from tangram import mapping_optimizer as mo
