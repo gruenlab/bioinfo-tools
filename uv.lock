@@ -866,6 +866,26 @@ wheels = [
 ]
 
 [[package]]
+name = "lightning"
+version = "2.5.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "fsspec", extra = ["http"] },
+    { name = "lightning-utilities" },
+    { name = "packaging" },
+    { name = "pytorch-lightning" },
+    { name = "pyyaml" },
+    { name = "torch" },
+    { name = "torchmetrics" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e9/da/289e17b2d4631b885771ce10ab7fe19c6c0ab2b1208d1dda418818ffbbfd/lightning-2.5.6.tar.gz", hash = "sha256:57b6abe87080895bc237fb7f36b7b4abaa2793760cbca00e3907e56607e0ed27", size = 640106, upload-time = "2025-11-05T20:53:06.823Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/23/dc/d7804f13928b6a81a0e948cfecbf0071e8cc74e3f341c704e23e75e504ad/lightning-2.5.6-py3-none-any.whl", hash = "sha256:25bb2053078c2efc57c082fda89dfbd975dfa76beb08def191947c2b571a8c8a", size = 827915, upload-time = "2025-11-05T20:53:03.169Z" },
+]
+
+[[package]]
 name = "lightning-utilities"
 version = "0.15.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1253,16 +1273,19 @@ name = "nico2-lib"
 version = "0.1.0"
 source = { virtual = "applications/nico2_lib" }
 dependencies = [
-    { name = "pytorch-lightning" },
+    { name = "lightning" },
     { name = "scikit-learn" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.16.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "tangram-sc" },
     { name = "torch" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "pytorch-lightning", specifier = ">=2.5.6" },
+    { name = "lightning", specifier = ">=2.5.6" },
     { name = "scikit-learn", specifier = ">=1.7.2" },
+    { name = "scipy", specifier = ">=1.15.3" },
     { name = "tangram-sc", specifier = ">=1.0.4" },
     { name = "torch", specifier = ">=2.9.1" },
 ]

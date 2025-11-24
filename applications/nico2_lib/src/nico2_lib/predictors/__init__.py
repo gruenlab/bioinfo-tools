@@ -1,3 +1,5 @@
-from ._nn_models._models import LDVAE, LEVAE, LVAE, VAE
+from nico2_lib.predictors._nmf_pred import NmfPredictor
+from nico2_lib.predictors._tangram._tangram_pred import TangramPredictor
 
-__all__ = ["LDVAE", "LEVAE", "LVAE", "VAE"]
+
+__all__ = ["NmfPredictor", "TangramPredictor"]
