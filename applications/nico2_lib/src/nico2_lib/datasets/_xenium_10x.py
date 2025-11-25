@@ -13,12 +13,14 @@ import shutil
 import zipfile
 import requests
 from pathlib import Path
-from typing import Dict, Literal, Optional
+from typing import Dict, Literal, Optional, Union
 from anndata import read_h5ad
 from anndata.typing import AnnData
 
 xenium_key = Literal[
-    "Xenium_V1_hLiver_nondiseased_section_FFPE", "Xenium_V1_hLiver_cancer_section_FFPE"
+    "Xenium_V1_hLiver_nondiseased_section_FFPE",
+    "Xenium_V1_hLiver_cancer_section_FFPE",
+    "Xenium_V1_Human_Lung_Cancer_FFPE",
 ]
 
 
@@ -41,6 +43,10 @@ DATASETS: Dict[xenium_key, DatasetEntry] = {
     ),
     "Xenium_V1_hLiver_cancer_section_FFPE": DatasetEntry(
         "https://cf.10xgenomics.com/samples/xenium/1.9.0/Xenium_V1_hLiver_cancer_section_FFPE/Xenium_V1_hLiver_cancer_section_FFPE_outs.zip"
+    ),
+    "Xenium_V1_Human_Lung_Cancer_FFPE": DatasetEntry(
+        "https://cf.10xgenomics.com/samples/xenium/3.0.0/Xenium_V1_Human_Lung_Cancer_FFPE/Xenium_V1_Human_Lung_Cancer_FFPE_outs.zip"
+        "Experiment 1: Xenium In Situ Gene Expression (Xenium v1) data for adult human lung adenocarcinoma tissue (FFPE) using the Xenium Human Lung Gene Expression Panel with nuclear expansion."
     ),
 }
 
@@ -79,34 +85,32 @@ def download_from_10x(dir: Path, url: str) -> None:
             zip_path.unlink()
 
 
-def xenium_10x_loader(name: xenium_key) -> AnnData:
+def xenium_10x_loader(name: xenium_key, dir: Optional[str] = None) -> AnnData:
     """Load a 10x Xenium dataset as AnnData.
-
-    Downloads the dataset if it is not already present in the current working directory.
-    Converts the dataset to `AnnData` format and caches it as an `.h5ad` file.
-
     Args:
         name (xenium_key): The key identifying the dataset to load.
+        dir (Optional[str]): Base directory where the dataset folder will be created.
+                             Defaults to the current working directory.
 
     Returns:
         AnnData: The loaded Xenium dataset in AnnData format.
     """
-    dataset_path = Path.cwd() / name
+    data_dir = Path(dir) if dir else Path.cwd()
+    dataset_path = data_dir / name
     anndata_name = f"{name}.h5ad"
     anndata_path = dataset_path / anndata_name
-
-    if not dataset_path.is_dir():
+    raw_data_path = dataset_path / "raw_data"
+    if anndata_path.is_file():
+        return read_h5ad(anndata_path)
+    if not raw_data_path.is_dir():
         url = DATASETS[name].url
-        download_from_10x(dataset_path, url)
+        download_from_10x(raw_data_path, url)
+    from spatialdata_io import xenium
+    from spatialdata_io.experimental import to_legacy_anndata
 
-    if not anndata_path.is_file():
-        from spatialdata_io import xenium
-        from spatialdata_io.experimental import to_legacy_anndata
-
-        data = xenium(dataset_path)
-        data = to_legacy_anndata(data)
-        data.write_h5ad(anndata_path)
-    else:
-        data = read_h5ad(anndata_path)
-
+    data = xenium(raw_data_path)
+    data = to_legacy_anndata(data)
+    data.write_h5ad(anndata_path)
+    if raw_data_path.exists():
+        shutil.rmtree(raw_data_path)
     return data
