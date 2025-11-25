@@ -3,9 +3,14 @@ Metrics module for evaluating similarity and error between two numeric arrays.
 Includes Pearson, Spearman, MSE, explained variance, and cosine similarity.
 """
 
+from typing import Any
+from param import Array
 from sklearn.metrics import explained_variance_score, mean_squared_error
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.stats import spearmanr, pearsonr
+import scipy
+import numpy as np
+from numpy.typing import ArrayLike
 
 from numpy.typing import NDArray
 from numpy import number
@@ -24,3 +29,18 @@ def explained_variance_metric(x: NDArray[number], y: NDArray[number]) -> float:
 
 def cosine_similarity_metric(x: NDArray[number], y: NDArray[number]) -> float:
     return cosine_similarity(x.reshape(1, -1), y.reshape(1, -1))[0, 0]
+
+def mae_metric(x: ArrayLike, y: ArrayLike) -> float:
+    return float(np.mean(np.abs(x - y)))
+
+def explained_variance_metric_v2(x: ArrayLike, y: ArrayLike) -> Any:
+    if scipy.sparse.issparse(X_original):
+        X_original = X_original.toarray()
+    if scipy.sparse.issparse(X_reconstructed):
+        X_reconstructed = X_reconstructed.toarray()
+    mse = np.mean((X_original - X_reconstructed) ** 2)
+    total_variance = np.var(X_original)
+    if total_variance == 0:
+        return 0.0
+    explained_var = 1 - (mse / total_variance)
+    return explained_var
