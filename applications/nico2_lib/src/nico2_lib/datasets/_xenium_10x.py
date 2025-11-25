@@ -132,8 +132,8 @@ def xenium_10x_loader(name: xenium_key, dir: Optional[str] = None) -> AnnData:
     if not raw_data_path.is_dir():
         url = DATASETS[name].url
         download_from_10x(raw_data_path, url)
-    from spatialdata_io import xenium
-    from spatialdata_io.experimental import to_legacy_anndata
+    from spatialdata_io import xenium # type: ignore
+    from spatialdata_io.experimental import to_legacy_anndata # type: ignore
 
     data = xenium(raw_data_path)
     data = to_legacy_anndata(data)
