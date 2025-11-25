@@ -13,14 +13,19 @@ import shutil
 import zipfile
 import requests
 from pathlib import Path
-from typing import Dict, Literal, Optional, Union
-from anndata import read_h5ad
-from anndata.typing import AnnData
+from typing import Dict, Literal, Optional
+from anndata import read_h5ad # type: ignore
+from anndata.typing import AnnData # type: ignore
 
 xenium_key = Literal[
     "Xenium_V1_hLiver_nondiseased_section_FFPE",
     "Xenium_V1_hLiver_cancer_section_FFPE",
     "Xenium_V1_Human_Lung_Cancer_FFPE",
+    "Xenium_Prime_Human_Lung_Cancer_FFPE",
+    "Xeniumranger_V1_hSkin_Melanoma_Add_on_FFPE",
+    "Xenium_FFPE_Human_Breast_Cancer_Rep1",
+    "Xenium_FFPE_Human_Breast_Cancer_Rep2",
+    "Xenium_V1_FFPE_Preview_Human_Breast_Cancer_Sample_2"
 ]
 
 
@@ -39,14 +44,36 @@ class DatasetEntry:
 
 DATASETS: Dict[xenium_key, DatasetEntry] = {
     "Xenium_V1_hLiver_nondiseased_section_FFPE": DatasetEntry(
-        "https://cf.10xgenomics.com/samples/xenium/1.9.0/Xenium_V1_hLiver_nondiseased_section_FFPE/Xenium_V1_hLiver_nondiseased_section_FFPE_outs.zip"
+        "https://cf.10xgenomics.com/samples/xenium/1.9.0/Xenium_V1_hLiver_nondiseased_section_FFPE/Xenium_V1_hLiver_nondiseased_section_FFPE_outs.zip",
+        "Xenium In Situ Gene Expression data for adult human liver sections using the Xenium Human Multi-Tissue and Cancer Panel."
     ),
     "Xenium_V1_hLiver_cancer_section_FFPE": DatasetEntry(
-        "https://cf.10xgenomics.com/samples/xenium/1.9.0/Xenium_V1_hLiver_cancer_section_FFPE/Xenium_V1_hLiver_cancer_section_FFPE_outs.zip"
+        "https://cf.10xgenomics.com/samples/xenium/1.9.0/Xenium_V1_hLiver_cancer_section_FFPE/Xenium_V1_hLiver_cancer_section_FFPE_outs.zip",
+        "Xenium In Situ Gene Expression data for adult human liver sections using the Xenium Human Multi-Tissue and Cancer Panel."
     ),
     "Xenium_V1_Human_Lung_Cancer_FFPE": DatasetEntry(
-        "https://cf.10xgenomics.com/samples/xenium/3.0.0/Xenium_V1_Human_Lung_Cancer_FFPE/Xenium_V1_Human_Lung_Cancer_FFPE_outs.zip"
+        "https://cf.10xgenomics.com/samples/xenium/3.0.0/Xenium_V1_Human_Lung_Cancer_FFPE/Xenium_V1_Human_Lung_Cancer_FFPE_outs.zip",
         "Experiment 1: Xenium In Situ Gene Expression (Xenium v1) data for adult human lung adenocarcinoma tissue (FFPE) using the Xenium Human Lung Gene Expression Panel with nuclear expansion."
+    ),
+    "Xenium_Prime_Human_Lung_Cancer_FFPE": DatasetEntry(
+        "https://s3-us-west-2.amazonaws.com/10x.files/samples/xenium/3.0.0/Xenium_Prime_Human_Lung_Cancer_FFPE/Xenium_Prime_Human_Lung_Cancer_FFPE_outs.zip",
+        "Experiment 2: Xenium Prime 5K In Situ Gene Expression with Cell Segmentation data for human lung adenocarcinoma tissue (FFPE) using the Xenium Prime 5K Human Pan Tissue and Pathways Panel."
+    ),
+    "Xeniumranger_V1_hSkin_Melanoma_Add_on_FFPE": DatasetEntry(
+        "https://cf.10xgenomics.com/samples/xenium/1.7.0/Xeniumranger_V1_hSkin_Melanoma_Add_on_FFPE/Xeniumranger_V1_hSkin_Melanoma_Add_on_FFPE_outs.zip",
+        "Preview of Xenium In Situ Gene Expression data for adult human skin sections, using a development version of the Xenium Human Skin Gene Expression Panel."
+    ),
+    "Xenium_FFPE_Human_Breast_Cancer_Rep1": DatasetEntry(
+        "https://cf.10xgenomics.com/samples/xenium/1.0.1/Xenium_FFPE_Human_Breast_Cancer_Rep1/Xenium_FFPE_Human_Breast_Cancer_Rep1_outs.zip",
+        "In Situ Sample 1, Replicate 1: This dataset is associated with the article High resolution mapping of the tumor microenvironment using integrated single-cell, spatial and in situ analysis published in Nature Communications. See the publication for full details on methods and results."
+    ),
+    "Xenium_FFPE_Human_Breast_Cancer_Rep2": DatasetEntry(
+        "https://cf.10xgenomics.com/samples/xenium/1.0.1/Xenium_FFPE_Human_Breast_Cancer_Rep2/Xenium_FFPE_Human_Breast_Cancer_Rep2_outs.zip",
+        "In Situ Sample 1, Replicate 2: This dataset is associated with the article High resolution mapping of the tumor microenvironment using integrated single-cell, spatial and in situ analysis published in Nature Communications. See the publication for full details on methods and results."
+    ),
+    "Xenium_V1_FFPE_Preview_Human_Breast_Cancer_Sample_2": DatasetEntry(
+        "https://cf.10xgenomics.com/samples/xenium/1.4.0/Xenium_V1_FFPE_Preview_Human_Breast_Cancer_Sample_2/Xenium_V1_FFPE_Preview_Human_Breast_Cancer_Sample_2_outs.zip",
+        "In Situ Sample 2: This dataset is associated with the article High resolution mapping of the tumor microenvironment using integrated single-cell, spatial and in situ analysis published in Nature Communications. See the publication for full details on methods and results."
     ),
 }
 
