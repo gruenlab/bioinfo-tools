@@ -1,4 +1,4 @@
-from .functions import (
+from nico2_lib.metrics._functions import (
     mse_metric,
     explained_variance_metric,
     cosine_similarity_metric,
