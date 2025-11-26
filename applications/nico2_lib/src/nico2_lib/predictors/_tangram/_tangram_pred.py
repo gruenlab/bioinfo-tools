@@ -40,7 +40,7 @@ def pp_adatas_unfiltered(adata_sc, adata_sp, genes=None, gene_to_lowercase = Tru
         update adata_sp by creating `uns` `training_genes` `overlap_genes` fields and creating `obs` `rna_count_based_density` & `uniform_density` field
     """
 
-    # remove all-zero-valued genes
+    # remove all-zero-valued genes <- part of the original source code, commented out
     #sc.pp.filter_genes(adata_sc, min_cells=1) code adapted
     #sc.pp.filter_genes(adata_sp, min_cells=1) code adapted
 
