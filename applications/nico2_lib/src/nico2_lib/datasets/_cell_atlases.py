@@ -36,7 +36,7 @@ def human_liver_cell_atlas(dir: Optional[str] = None) -> AnnData:
 
     anndata_path = dataset_path / f"{name}.h5ad"
     raw_zip_path = dataset_path / "download.zip"
-    raw_data_path = dataset_path / "raw_data"
+    raw_data_path = dataset_path / "rawData_human"
 
     url = "https://www.livercellatlas.org/data_files/toDownload/rawData_human.zip"
 
