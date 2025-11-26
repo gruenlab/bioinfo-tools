@@ -10,24 +10,43 @@ from anndata.typing import AnnData
 from nico2_lib.datasets._utils import download_from_url
 
 
-def load_samplecomp(table_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(table_path, sep="\t", index_col=0)
-    df.index = df.index.astype(str)
-    return df
+
+
+def _load_liver_cell_atlas_mtx_folder(folder: str) -> AnnData:
+    import pandas as pd
+    import scipy.io
+    from anndata import AnnData
+    folder = Path(folder)
+
+    mat = scipy.io.mmread(folder / "matrix.mtx.gz").T.tocsr()
+    barcodes = pd.read_csv(folder / "barcodes.tsv.gz", header=None)[0].astype(str)
+    features = pd.read_csv(folder / "features.tsv.gz", sep="\t", header=None)
+    if features.shape[1] >= 2:
+        var = pd.DataFrame({
+            "gene_id": features.iloc[:, 0].astype(str),
+            "gene_name": features.iloc[:, 1].astype(str),
+        })
+    else:
+        var = pd.DataFrame({
+            "gene_id": features.iloc[:, 0].astype(str),
+            "gene_name": features.iloc[:, 0].astype(str),
+        })
+
+    adata = AnnData(mat)
+    adata.obs.index = barcodes
+    adata.var = var
+    adata.var.index = var["gene_name"]
+
+    return adata
 
 def human_liver_cell_atlas(dir: Optional[str] = None) -> AnnData:
     """
     Load the Human Liver Cell Atlas dataset and return an AnnData object.
 
-    The function:
-        - checks if <dataset>/<name>.h5ad already exists
-        - if not, downloads rawData_human.zip as download.zip
-        - unzips into raw_data
-        - loads countTable_* folders (RNA + ADT)
-        - loads sampleComp_* files into obs
-        - creates and saves an AnnData object
+    Adds:
+        - annot_humanAll.csv (cell-level annotations)
+        merged into adata.obs via the 'cell' column.
     """
-
 
     data_dir = Path(dir) if dir else Path.cwd()
     name = "human_liver_cell_atlas"
@@ -39,6 +58,8 @@ def human_liver_cell_atlas(dir: Optional[str] = None) -> AnnData:
     raw_data_path = dataset_path / "rawData_human"
 
     url = "https://www.livercellatlas.org/data_files/toDownload/rawData_human.zip"
+    annotation_url = "https://www.livercellatlas.org/data_files/toDownload/annot_humanAll.csv"
+    annotation_path = dataset_path / "annot_humanAll.csv"
 
     if anndata_path.is_file():
         return ad.read_h5ad(anndata_path)
@@ -49,27 +70,20 @@ def human_liver_cell_atlas(dir: Optional[str] = None) -> AnnData:
             z.extractall(dataset_path)
         raw_zip_path.unlink(missing_ok=True)
 
-    count_folders = sorted(
-        f for f in raw_data_path.iterdir()
-        if f.is_dir() and (f / "matrix.mtx.gz").exists()
-    )
+    count_folder = raw_data_path / "countTable_human"
+    adata = _load_liver_cell_atlas_mtx_folder(count_folder)
 
-    adatas = [read_10x_mtx(f) for f in count_folders]
-
-    data = ad.concat(adatas, join="outer", axis=0)  # concat cells, align features by name
-
-    for t in raw_data_path.glob("sampleComp_*.txt"):
-        df = load_samplecomp(t)
-        intersect = data.obs_names.intersection(df.index)
-        if len(intersect) > 0:
-            colname = t.stem  # e.g. "sampleComp_humanAll"
-            tmp = df.loc[intersect]
-            for c in tmp.columns:
-                data.obs[f"{colname}_{c}"] = tmp[c]
-
-    data.write_h5ad(anndata_path)
+    download_from_url(annotation_url, annotation_path)
+    annot = pd.read_csv(annotation_path)
+    annot["cell"] = annot["cell"].astype(str)
+    annot = annot.set_index("cell")
+    common = adata.obs_names.intersection(annot.index)
+    adata = adata[common].copy()
+    adata.obs.index.name = "cell"
+    adata.obs = adata.obs.join(annot.loc[common], how="left")
+    adata.write_h5ad(anndata_path)
 
     if raw_data_path.exists():
         shutil.rmtree(raw_data_path)
 
-    return data
+    return adata
