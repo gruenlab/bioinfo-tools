@@ -1,7 +1,9 @@
+from abc import ABC
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
-import anndata as ad # type: ignore
-from anndata.typing import AnnData # type: ignore
+from typing import Dict, Literal, Optional
+import anndata as ad  # type: ignore
+from anndata.typing import AnnData  # type: ignore
 import pandas as pd
 import scipy.io
 
@@ -14,7 +16,6 @@ from nico2_lib.datasets._utils import (
 
 
 def _load_liver_cell_atlas_mtx_folder(folder: str) -> AnnData:
-
     path_folder = Path(folder)
     mat = scipy.io.mmread(path_folder / "matrix.mtx.gz").T.tocsr()
     barcodes = pd.read_csv(path_folder / "barcodes.tsv.gz", header=None)[0].astype(str)
@@ -72,3 +73,30 @@ def human_liver_cell_atlas(dir: Optional[str] = None) -> ad.AnnData:
     cleanup(raw_data_path)
 
     return adata
+
+
+brain_cell_atlas_key = Literal["Zeng-Aging-Mouse-10Xv3"]
+
+
+@dataclass
+class AllenBrainCellAtlasEntry:
+    expression_matrices_url: str
+    metadata_url: str
+
+
+ABC_DATASETS: Dict[brain_cell_atlas_key, AllenBrainCellAtlasEntry] = {
+    "Zeng-Aging-Mouse-10Xv3": AllenBrainCellAtlasEntry(
+        "https://allen-brain-cell-atlas.s3-us-west-2.amazonaws.com/expression_matrices/Zeng-Aging-Mouse-10Xv3/20241130/Zeng-Aging-Mouse-10Xv3-raw.h5ad",
+        "https://allen-brain-cell-atlas.s3.us-west-2.amazonaws.com/index.html#metadata/Zeng-Aging-Mouse-10Xv3/20250131/",
+    )
+}
+
+
+def allen_brain_cell_atlas(
+    id: brain_cell_atlas_key, dir: Optional[str] = None
+) -> ad.AnnData:
+    _, anndata_path = ensure_dataset_dir(id, dir)
+    if anndata_path.is_file():
+        return ad.read_h5ad(anndata_path)
+    download_file(ABC_DATASETS[id].expression_matrices_url, anndata_path)
+    return ad.read_h5ad(anndata_path)

@@ -5,27 +5,6 @@ import zipfile
 import requests
 
 
-def download_from_url(url: str, destination: Path) -> None:
-    """
-    Download a file from a URL to the given destination path.
-
-    Args:
-        url (str): URL to download from.
-        destination (Path): File path where the downloaded file will be saved.
-    """
-    import requests
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    with requests.get(url, stream=True) as r:
-        r.raise_for_status()
-        with open(destination, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-
-
-
 def github_url_to_raw(url: str) -> str:
     """
     Converts a GitHub file URL to its raw content URL.
@@ -37,16 +16,17 @@ def github_url_to_raw(url: str) -> str:
     if not url.startswith("https://github.com/"):
         raise ValueError("URL must start with 'https://github.com/'")
 
-    parts = url[len("https://github.com/"):].split("/")
-    
+    parts = url[len("https://github.com/") :].split("/")
+
     if len(parts) < 5 or parts[2] != "blob":
         raise ValueError("URL does not appear to be a valid GitHub file URL")
-    
+
     user, repo, _, branch = parts[:4]
     path = "/".join(parts[4:])
-    
+
     raw_url = f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}"
     return raw_url
+
 
 def download_file(url: str, dest: Path) -> None:
     """Download a file from a URL to a destination path."""
@@ -58,6 +38,7 @@ def download_file(url: str, dest: Path) -> None:
                 shutil.copyfileobj(r.raw, f)
     except Exception as e:
         raise RuntimeError(f"Failed to download file from {url}") from e
+
 
 def extract_zip(zip_path: Path, extract_to: Path, delete_zip: bool = True) -> None:
     """Extract a ZIP archive to a folder. Optionally delete the ZIP after extraction."""
@@ -71,7 +52,10 @@ def extract_zip(zip_path: Path, extract_to: Path, delete_zip: bool = True) -> No
         if delete_zip and zip_path.exists():
             zip_path.unlink()
 
-def download_and_extract(url: str, extract_to: Path, zip_name: str = "download.zip") -> None:
+
+def download_and_extract(
+    url: str, extract_to: Path, zip_name: str = "download.zip"
+) -> None:
     """Helper function: download a ZIP file from a URL and extract it."""
     zip_path = extract_to / zip_name
     download_file(url, zip_path)
@@ -85,6 +69,7 @@ def ensure_dataset_dir(name: str, dir: Optional[str] = None):
     dataset_path.mkdir(exist_ok=True, parents=True)
     anndata_path = dataset_path / f"{name}.h5ad"
     return dataset_path, anndata_path
+
 
 def cleanup(raw_data_path: Path) -> None:
     """Remove the raw data folder if it exists."""
