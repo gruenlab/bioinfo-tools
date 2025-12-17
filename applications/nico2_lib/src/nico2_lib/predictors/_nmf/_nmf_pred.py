@@ -46,7 +46,7 @@ class NmfPredictor:
         """
         if self.H_query is None or self.H_predicted is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
-
+        X = np.asarray(X, dtype=self.H_query.dtype)
         W_query, _, _ = non_negative_factorization(
             X=X,
             H=self.H_query,
