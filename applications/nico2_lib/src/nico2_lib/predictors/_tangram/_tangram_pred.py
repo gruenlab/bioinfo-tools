@@ -393,7 +393,7 @@ class TangramPredictor:
     adata_reference: Optional[AnnData] = None
     n_shared_features: Optional[int] = None
 
-    def fit(self, X: NDArray[number], y: NDArray[number])-> None:
+    def fit(self, X: NDArray[number], y: NDArray[number]):
         """
         Fits the Tangram predictor on the reference matrix.
 
@@ -407,6 +407,7 @@ class TangramPredictor:
         reference_matrix = np.concatenate([X, y], axis=1)
         self.n_shared_features = X.shape[1]
         self.adata_reference = AnnData(reference_matrix)
+        return self
 
     def predict(self, X: NDArray[number]) -> NDArray[number]:
         """
