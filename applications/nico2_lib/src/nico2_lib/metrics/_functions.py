@@ -34,12 +34,12 @@ def mae_metric(x: ArrayLike, y: ArrayLike) -> float:
     return float(np.mean(np.abs(x - y)))
 
 def explained_variance_metric_v2(x: ArrayLike, y: ArrayLike) -> Any:
-    if scipy.sparse.issparse(X_original):
-        X_original = X_original.toarray()
-    if scipy.sparse.issparse(X_reconstructed):
-        X_reconstructed = X_reconstructed.toarray()
-    mse = np.mean((X_original - X_reconstructed) ** 2)
-    total_variance = np.var(X_original)
+    if scipy.sparse.issparse(x):
+        x = x.toarray()
+    if scipy.sparse.issparse(y):
+        y = y.toarray()
+    mse = np.mean((x - y) ** 2)
+    total_variance = np.var(x)
     if total_variance == 0:
         return 0.0
     explained_var = 1 - (mse / total_variance)
