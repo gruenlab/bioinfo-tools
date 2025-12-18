@@ -17,7 +17,7 @@ class NmfPredictor:
         self,
         X: NDArray[number],
         y: NDArray[number],
-    ):
+    ) -> "NmfPredictor":
         """
         Fits the NMF basis on the reference matrix X.
         X is assumed to have shape (n_samples, n_shared + n_predicted).

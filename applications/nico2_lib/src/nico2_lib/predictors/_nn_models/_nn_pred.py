@@ -20,7 +20,7 @@ class VaePredictor:
     devices: Optional[int] = None
     trainer_kwargs: Optional[Dict[Any, Any]] = None
 
-    def fit(self, X: NDArray[number], y: NDArray[number]):
+    def fit(self, X: NDArray[number], y: NDArray[number]) -> "VaePredictor":
         dataset = TensorDataset(
             torch.from_numpy(X, dtype=float32), torch.from_numpy(y, dtype=float32)
         )

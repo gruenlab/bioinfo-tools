@@ -389,11 +389,10 @@ def project_genes_unfiltered(adata_map, adata_sc, cluster_label=None, scale=True
 class TangramPredictor:
     verbose: bool = False
 
-    # stored objects after "fit"
     adata_reference: Optional[AnnData] = None
     n_shared_features: Optional[int] = None
 
-    def fit(self, X: NDArray[number], y: NDArray[number]):
+    def fit(self, X: NDArray[number], y: NDArray[number]) -> "TangramPredictor":
         """
         Fits the Tangram predictor on the reference matrix.
 
