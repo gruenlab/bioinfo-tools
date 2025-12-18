@@ -15,9 +15,6 @@ from nico2_lib.predictors._nn_models._models import BaseVAE
 class VaePredictor:
     vae_cls: Type[BaseVAE]
 
-    # --- VAE hyperparameters ---
-    latent_features: int
-    lr: float = 1e-4
 
     # --- training ---
     batch_size: int = 64
@@ -27,6 +24,7 @@ class VaePredictor:
     trainer_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     # --- internal ---
+    vae_kwargs: Dict[str, Any] = field(default_factory=dict)
     vae: Optional[BaseVAE] = field(init=False, default=None)
     _fit_trainer: Optional[L.Trainer] = field(init=False, default=None)
     _fitted: bool = field(init=False, default=False)
@@ -41,8 +39,8 @@ class VaePredictor:
         self.vae = self.vae_cls(
             input_features=input_features,
             output_features=output_features,
-            latent_features=self.latent_features,
-            lr=self.lr,
+            **self.vae_kwargs
+
         )
 
         dataset = TensorDataset(
