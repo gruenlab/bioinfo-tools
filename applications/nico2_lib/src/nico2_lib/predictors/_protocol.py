@@ -3,12 +3,12 @@ from numpy import number
 from numpy.typing import NDArray
 
 
-class Predictor(Protocol):
+class PredictorProtocol(Protocol):
     def fit(
         self,
         X: NDArray[number],
         y: NDArray[number],
-    ) -> "Predictor": ...
+    ) -> "PredictorProtocol": ...
 
     def predict(
         self,
