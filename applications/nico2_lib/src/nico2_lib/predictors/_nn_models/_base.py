@@ -1,13 +1,18 @@
+from typing import Tuple
 import torch
 from torch import nn
 from torch.nn import functional as F
 import lightning as L
 
-def vae_loss_function(target, pred, mu_z, logvar_z):
+
+def vae_loss_function(
+    target: torch.Tensor, pred: torch.Tensor, mu_z: torch.Tensor, logvar_z: torch.Tensor
+) -> torch.Tensor:
     """MSE reconstruction + KL divergence."""
     recon_loss = F.mse_loss(pred, target, reduction="sum")
     kl_loss = -0.5 * torch.sum(1 + logvar_z - mu_z.pow(2) - logvar_z.exp())
     return recon_loss + kl_loss
+
 
 class BaseVAE(L.LightningModule):
     """Base VAE class for predicting output_features from input_features."""
@@ -15,12 +20,20 @@ class BaseVAE(L.LightningModule):
     encoder: nn.Module
     decoder: nn.Module
 
-    def __init__(self, input_features, output_features, latent_features, lr=1e-4):
+    def __init__(
+        self,
+        input_features: int,
+        output_features: int,
+        latent_features: int,
+        lr: float = 1e-4,
+    ):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
 
-    def forward(self, x, log_space=True):
+    def forward(
+        self, x: torch.Tensor, log_space: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass.
         If `log_space=True`, expects log1p-transformed inputs.
         If `log_space=False`, expects raw counts and applies log1p inside.

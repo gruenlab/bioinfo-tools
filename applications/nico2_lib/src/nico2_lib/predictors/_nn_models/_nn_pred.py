@@ -1,28 +1,53 @@
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Type
 
 import numpy as np
-from numpy import float32, number
+from numpy import number
 from numpy.typing import NDArray
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 import lightning as L
 
-from nico2_lib.predictors._nn_models._base import BaseVAE
+from nico2_lib.predictors._nn_models._models import BaseVAE
 
 
 @dataclass
 class VaePredictor:
-    vae: BaseVAE
+    vae_cls: Type[BaseVAE]
+
+    # --- VAE hyperparameters ---
+    latent_features: int
+    lr: float = 1e-4
+
+    # --- training ---
     batch_size: int = 64
     max_epochs: int = 200
     accelerator: str = "auto"
     devices: Optional[int] = None
-    trainer_kwargs: Optional[Dict[Any, Any]] = None
+    trainer_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    # --- internal ---
+    vae: Optional[BaseVAE] = field(init=False, default=None)
+    _fit_trainer: Optional[L.Trainer] = field(init=False, default=None)
+    _fitted: bool = field(init=False, default=False)
 
     def fit(self, X: NDArray[number], y: NDArray[number]) -> "VaePredictor":
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+
+        input_features = X.shape[1]
+        output_features = y.shape[1]
+
+        self.vae = self.vae_cls(
+            input_features=input_features,
+            output_features=output_features,
+            latent_features=self.latent_features,
+            lr=self.lr,
+        )
+
         dataset = TensorDataset(
-            torch.from_numpy(X, dtype=float32), torch.from_numpy(y, dtype=float32)
+            torch.from_numpy(X),
+            torch.from_numpy(y),
         )
         loader = DataLoader(
             dataset,
@@ -45,7 +70,7 @@ class VaePredictor:
         return self
 
     def predict(self, X: NDArray[number]) -> NDArray[number]:
-        if not self._fitted:
+        if not self._fitted or self.vae is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
 
         X = np.asarray(X, dtype=np.float32)

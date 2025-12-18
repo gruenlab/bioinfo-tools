@@ -1,5 +1,5 @@
 from ._nn import Decoder, LinearDecoder, VariationalEncoder, VariationalLinearEncoder
-from ._base import BaseVAE
+from nico2_lib.predictors._nn_models._base import BaseVAE
 
 
 class LVAE(BaseVAE):
@@ -11,7 +11,13 @@ class LVAE(BaseVAE):
 
     """
 
-    def __init__(self, input_features, output_features, latent_features=64, lr=1e-3):
+    def __init__(
+        self,
+        input_features: int,
+        output_features: int,
+        latent_features: int = 64,
+        lr: float = 1e-3,
+    ):
         super().__init__(input_features, output_features, latent_features, lr)
         self.encoder = VariationalLinearEncoder(input_features, latent_features)
         self.decoder = LinearDecoder(latent_features, output_features)
