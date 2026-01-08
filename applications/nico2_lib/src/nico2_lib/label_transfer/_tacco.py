@@ -5,7 +5,7 @@ from numpy.typing import NDArray
 from anndata.typing import AnnData  # type: ignore
 
 
-def annotate_best_labels(
+def label_transfer_tacco(
     adata: AnnData,
     reference: AnnData,
     annotation_key: str,
