@@ -36,8 +36,6 @@ class NmfPredictor:
             W, H, _ = non_negative_factorization(
                 X,
                 n_components=k,
-                init="nndsvda",
-                random_state=0,
             )
             X_hat = W @ H
             scores.append(self._explained_variance(X, X_hat))
