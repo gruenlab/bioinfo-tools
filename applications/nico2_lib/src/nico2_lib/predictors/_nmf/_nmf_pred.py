@@ -1,17 +1,55 @@
 from dataclasses import dataclass
-from typing import Optional
-from sklearn.decomposition import non_negative_factorization
+from typing import Literal, Optional, Union
+
 import numpy as np
-from numpy.typing import NDArray
+from kneed import KneeLocator
 from numpy import number
+from numpy.typing import NDArray
+from sklearn.decomposition import non_negative_factorization
 
 
 @dataclass
 class NmfPredictor:
-    n_components: Optional[int] = None
+    n_components: Optional[Union[int, Literal["auto"]]] = None
     H_query: Optional[NDArray[number]] = None
     H_predicted: Optional[NDArray[number]] = None
     n_shared_features: Optional[int] = None
+
+    def _explained_variance(
+        self,
+        X: NDArray[number],
+        X_reconstructed: NDArray[number],
+    ) -> float:
+        """R²-style explained variance."""
+        residual = np.linalg.norm(X - X_reconstructed) ** 2
+        total = np.linalg.norm(X - X.mean(axis=0)) ** 2
+        return 1.0 - residual / total
+
+    def _select_n_components(
+        self,
+        X: NDArray[number],
+        component_range=range(2, 11),
+    ) -> int:
+        scores = []
+
+        for k in component_range:
+            W, H, _ = non_negative_factorization(
+                X,
+                n_components=k,
+                init="nndsvda",
+                random_state=0,
+            )
+            X_hat = W @ H
+            scores.append(self._explained_variance(X, X_hat))
+
+        knee = KneeLocator(
+            list(component_range),
+            scores,
+            curve="concave",
+            direction="increasing",
+        )
+
+        return knee.knee or component_range[-1]
 
     def fit(
         self,
@@ -27,6 +65,9 @@ class NmfPredictor:
 
         reference_matrix = np.concatenate([X, y], axis=1)
         self.n_shared_features = X.shape[1]
+
+        if self.n_components is None or self.n_components == "auto":
+            self.n_components = self._select_n_components(X)
 
         _, H_ref, _ = non_negative_factorization(
             reference_matrix,
