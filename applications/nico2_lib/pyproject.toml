@@ -12,7 +12,6 @@ dependencies = [
     "scipy>=1.15.3",
     "spatialdata>=0.5.0",
     "spatialdata-io",
-    "tacco>=0.4.0.post1",
     "tangram-sc>=1.0.4",
     "torch>=2.9.1",
 ]
