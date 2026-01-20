@@ -1,15 +1,15 @@
 # import tacco as tc
-import pandas as pd
-import numpy as np
-from numpy.typing import NDArray
-from anndata.typing import AnnData  # type: ignore
+# import pandas as pd
+# import numpy as np
+# from numpy.typing import NDArray
+# from anndata.typing import AnnData  # type: ignore
 
 
-#def label_transfer_tacco(
+# def label_transfer_tacco(
 #    adata: AnnData,
 #    reference: AnnData,
 #    annotation_key: str,
-#) -> NDArray[np.str_]:
+# ) -> NDArray[np.str_]:
 #    """
 #    Minimal wrapper for tc.tl.annotate that returns numpy array of best-fit labels.
 #    Uses all tacco defaults.
