@@ -20,5 +20,13 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.uv.sources]
 spatialdata-io = { git = "https://github.com/scverse/spatialdata-io.git" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
