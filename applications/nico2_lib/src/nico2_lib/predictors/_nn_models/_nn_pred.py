@@ -1,20 +1,19 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Type
 
+import lightning as L
 import numpy as np
+import torch
 from numpy import number
 from numpy.typing import NDArray
-import torch
 from torch.utils.data import DataLoader, TensorDataset
-import lightning as L
 
-from nico2_lib.predictors._nn_models._models import BaseVAE
+from nico2_lib.predictors._nn_models._models import LDVAE, LEVAE, LVAE, VAE, BaseVAE
 
 
 @dataclass
 class VaePredictor:
     vae_cls: Type[BaseVAE]
-
 
     # --- training ---
     batch_size: int = 64
@@ -39,8 +38,7 @@ class VaePredictor:
         self.vae = self.vae_cls(
             input_features=input_features,
             output_features=output_features,
-            **self.vae_kwargs
-
+            **self.vae_kwargs,
         )
 
         dataset = TensorDataset(
@@ -80,3 +78,111 @@ class VaePredictor:
             preds = torch.expm1(mu_x).clamp(min=0)
 
         return preds.cpu().numpy()
+
+
+class LVAEPredictor(VaePredictor):
+    def __init__(
+        self,
+        latent_features: int = 64,
+        lr: float = 1e-3,
+        batch_size: int = 64,
+        max_epochs: int = 200,
+        accelerator: str = "auto",
+        devices: Optional[int] = None,
+        trainer_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            vae_cls=LVAE,
+            batch_size=batch_size,
+            max_epochs=max_epochs,
+            accelerator=accelerator,
+            devices=devices,
+            trainer_kwargs=trainer_kwargs or {},
+        )
+        self.vae_kwargs = {
+            "latent_features": latent_features,
+            "lr": lr,
+        }
+
+
+class LEVAEPredictor(VaePredictor):
+    def __init__(
+        self,
+        latent_features: int,
+        hidden_features_out: Optional[int] = None,
+        lr: float = 1e-4,
+        batch_size: int = 64,
+        max_epochs: int = 200,
+        accelerator: str = "auto",
+        devices: Optional[int] = None,
+        trainer_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            vae_cls=LEVAE,
+            batch_size=batch_size,
+            max_epochs=max_epochs,
+            accelerator=accelerator,
+            devices=devices,
+            trainer_kwargs=trainer_kwargs or {},
+        )
+        self.vae_kwargs = {
+            "latent_features": latent_features,
+            "hidden_features_out": hidden_features_out,
+            "lr": lr,
+        }
+
+
+class LDVAEPredictor(VaePredictor):
+    def __init__(
+        self,
+        latent_features: int,
+        hidden_features_in: Optional[int] = None,
+        lr: float = 1e-4,
+        batch_size: int = 64,
+        max_epochs: int = 200,
+        accelerator: str = "auto",
+        devices: Optional[int] = None,
+        trainer_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            vae_cls=LDVAE,
+            batch_size=batch_size,
+            max_epochs=max_epochs,
+            accelerator=accelerator,
+            devices=devices,
+            trainer_kwargs=trainer_kwargs or {},
+        )
+        self.vae_kwargs = {
+            "latent_features": latent_features,
+            "hidden_features_in": hidden_features_in,
+            "lr": lr,
+        }
+
+
+class VAEPredictor(VaePredictor):
+    def __init__(
+        self,
+        latent_features: int,
+        hidden_features_out: Optional[int] = None,
+        hidden_features_in: Optional[int] = None,
+        lr: float = 1e-4,
+        batch_size: int = 64,
+        max_epochs: int = 200,
+        accelerator: str = "auto",
+        devices: Optional[int] = None,
+        trainer_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            vae_cls=VAE,
+            batch_size=batch_size,
+            max_epochs=max_epochs,
+            accelerator=accelerator,
+            devices=devices,
+            trainer_kwargs=trainer_kwargs or {},
+        )
+        self.vae_kwargs = {
+            "latent_features": latent_features,
+            "hidden_features_out": hidden_features_out,
+            "hidden_features_in": hidden_features_in,
+            "lr": lr,
+        }
