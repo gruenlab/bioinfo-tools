@@ -76,7 +76,25 @@ def dominic_experiment_refactor_v1(
         kmeans_labels,
         nf: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Build initial NMF matrices from precomputed ranked gene arrays."""
+        """Build deterministic NMF initialization matrices from ranked genes.
+
+        Args:
+            rank_scores_array: Ranked gene scores (e.g., from Scanpy
+                ``rank_genes_groups``), where rows correspond to genes and
+                columns to clusters.
+            rank_names_array: Ranked gene names aligned with
+                ``rank_scores_array``; columns correspond to clusters.
+            expression_matrix: Gene-by-cell expression matrix used to size the
+                initialization matrices.
+            gene_index: Gene index used to align ranked gene names to the
+                expression matrix (typically ``AnnData.var.index``).
+            kmeans_labels: Cluster labels per cell used to seed ``H``.
+            nf: Number of NMF components.
+
+        Returns:
+            A tuple of ``(w_init, h_init)`` where ``w_init`` has shape
+            ``(n_genes, nf)`` and ``h_init`` has shape ``(nf, n_cells)``.
+        """
         w_init = np.zeros((expression_matrix.shape[0], nf), dtype=float)
         for i in range(nf):
             # Deterministic iteration over genes
@@ -123,12 +141,12 @@ def dominic_experiment_refactor_v1(
                 - nf: Selected number of components.
                 - labels: KMeans labels as a NumPy array of strings.
         """
-        n_obs, _ = embedding.shape
-        if n_obs < 1:
+        n_samples, _ = embedding.shape
+        if n_samples < 1:
             return 1, np.array([], dtype=str)
 
-        maxk = min(maxk, n_obs + 1)
-        mink = min(mink, n_obs)
+        max_clusters_exclusive = min(maxk, n_samples + 1)
+        min_clusters = min(mink, n_samples)
 
         def fit_kmeans(n_clusters: int) -> sk_cluster.KMeans:
             return sk_cluster.KMeans(n_clusters=n_clusters, random_state=seed).fit(
@@ -136,77 +154,89 @@ def dominic_experiment_refactor_v1(
             )
 
         if opt:
-            sse: List[sk_cluster.KMeans] = [
-                fit_kmeans(k).inertia_ for k in range(mink, maxk)
+            cluster_range = range(min_clusters, max_clusters_exclusive)
+            inertias: List[sk_cluster.KMeans] = [
+                fit_kmeans(k).inertia_ for k in cluster_range
             ]
 
-            kln = kn.KneeLocator(
-                range(mink, maxk), sse, curve="convex", direction="decreasing"
+            elbow_finder = kn.KneeLocator(
+                cluster_range, inertias, curve="convex", direction="decreasing"
             )
-            nf = max(kln.elbow, 2) if kln.elbow is not None else nf_init
+            elbow = elbow_finder.elbow
+            nf = max(elbow, 2) if elbow is not None else nf_init
         else:
             nf = nf_init
 
-        nf = min(nf, n_obs)
+        nf = min(nf, n_samples)
+
+        def labels_and_sizes(n_clusters: int) -> tuple[np.ndarray, List[int]]:
+            labels = fit_kmeans(n_clusters).labels_.astype(str)
+            ordered_labels = np.unique(labels)  # deterministic ordering
+            sizes = [np.sum(labels == label) for label in ordered_labels]
+            return labels, sizes
 
         # Iteratively reduce nf until clusters have at least 5 samples.
         while True:
-            labels = fit_kmeans(nf).labels_.astype(str)
-            ordered_labels = sorted(set(labels))
-            label_sizes = [
-                sum(labels == label) for label in ordered_labels
-            ]  # deterministic ordering
+            labels, label_sizes = labels_and_sizes(nf)
             if min(label_sizes) >= 5 or nf <= 1:
                 break
             nf -= 1
 
         return nf, labels
 
-    SP = []
-    PE = []
+    spearman_scores = []
+    pearson_scores = []
 
-    # Deterministic iteration over clusters
-    for ict in sorted(set(ad.obs["cluster"])):
-        adr = ad[ad.obs["cluster"] == ict].copy()
-        sc.pp.filter_genes(adr, min_counts=1)
-        sc.pp.normalize_total(adr)
-        sc.pp.log1p(adr)
-        sc.tl.pca(adr)
 
-        df = adr.X.transpose()
-        shared_genes_mask_sp = np.isin(
-            adr.var.index.to_list(), ad_sp.var.index.to_list()
+    def preprocess(adata: AnnData) -> AnnData:
+        adata = sc.pp.filter_genes(adata, min_counts=1, copy=True)
+        adata = sc.pp.normalize_total(adata, copy=True)
+        adata = sc.pp.log1p(adata, copy=True)
+        adata = sc.tl.pca(adata, copy=True)
+        return adata
+
+    for cluster_id in sorted(set(ad.obs["cluster"])):
+        cluster_ad = ad[ad.obs["cluster"] == cluster_id].copy()
+        cluster_ad = preprocess(cluster_ad)
+
+        expression_matrix = cluster_ad.X.transpose()
+        shared_spatial_genes_mask = np.isin(
+            cluster_ad.var.index.to_list(), ad_sp.var.index.to_list()
         )
-        shared_genes_mask = np.isin(adr.var.index.to_list(), ad.var.index.to_list())
-
-        nf, labels = find_components(
-            adr.obsm["X_pca"], 1, 10, opt=opt_nf, nf_init=nf_init
+        shared_genes_mask = np.isin(
+            cluster_ad.var.index.to_list(), ad.var.index.to_list()
         )
-        adr.obs["kmeans"] = labels
+
+        nf, kmeans_labels = find_components(
+            cluster_ad.obsm["X_pca"], 1, 10, opt=opt_nf, nf_init=nf_init
+        )
+        cluster_ad.obs["kmeans"] = kmeans_labels
 
         if not init:
             nf = nf_init
 
-        print(ict, "Optimal nf:", nf)
+        print(cluster_id, "Optimal nf:", nf)
 
         if init:
-            lab_size = [sum(labels == l) for l in sorted(set(labels))]
-            print(ict, "Cluster sizes:", lab_size)
-            sc.tl.rank_genes_groups(adr, "kmeans")
+            cluster_sizes = [
+                sum(kmeans_labels == l) for l in sorted(set(kmeans_labels))
+            ]
+            print(cluster_id, "Cluster sizes:", cluster_sizes)
+            cluster_ad = sc.tl.rank_genes_groups(cluster_ad, "kmeans", copy=True)
 
             Winit, Hinit = init_nmf_matrices(
                 rank_scores_array=np.array(
-                    adr.uns["rank_genes_groups"]["scores"].tolist()
+                    cluster_ad.uns["rank_genes_groups"]["scores"].tolist()
                 ),
                 rank_names_array=np.array(
-                    adr.uns["rank_genes_groups"]["names"].tolist()
+                    cluster_ad.uns["rank_genes_groups"]["names"].tolist()
                 ),
-                expression_matrix=adr.X.transpose(),
-                gene_index=adr.var.index,
-                kmeans_labels=adr.obs["kmeans"],
+                expression_matrix=cluster_ad.X.transpose(),
+                gene_index=cluster_ad.var.index,
+                kmeans_labels=cluster_ad.obs["kmeans"],
                 nf=nf,
             )
-            modelH = sk_decomposition.NMF(
+            nmf_model_rna = sk_decomposition.NMF(
                 n_components=nf,
                 init="custom",
                 alpha_W=0,
@@ -214,7 +244,7 @@ def dominic_experiment_refactor_v1(
                 l1_ratio=1.0,
                 random_state=seed,
             )
-            modelHsp = sk_decomposition.NMF(
+            nmf_model_spatial = sk_decomposition.NMF(
                 n_components=nf,
                 init="custom",
                 alpha_W=0,
@@ -222,67 +252,79 @@ def dominic_experiment_refactor_v1(
                 l1_ratio=1.0,
                 random_state=seed,
             )
-            W = modelH.fit_transform(
-                df[shared_genes_mask, :],
+            rna_w = nmf_model_rna.fit_transform(
+                expression_matrix[shared_genes_mask, :],
                 W=Winit[shared_genes_mask, :].astype("float32"),
                 H=Hinit.astype("float32"),
             )
-            Wsp = modelHsp.fit_transform(
-                df[shared_genes_mask_sp, :],
-                W=Winit[shared_genes_mask_sp, :].astype("float32"),
+            spatial_w = nmf_model_spatial.fit_transform(
+                expression_matrix[shared_spatial_genes_mask, :],
+                W=Winit[shared_spatial_genes_mask, :].astype("float32"),
                 H=Hinit.astype("float32"),
             )
         else:
-            modelH = sk_decomposition.NMF(
+            nmf_model_rna = sk_decomposition.NMF(
                 n_components=nf, alpha_W=0, alpha_H=0, l1_ratio=1.0, random_state=seed
             )
-            modelHsp = sk_decomposition.NMF(
+            nmf_model_spatial = sk_decomposition.NMF(
                 n_components=nf, alpha_W=0, alpha_H=0, l1_ratio=1.0, random_state=seed
             )
-            W = modelH.fit_transform(df[shared_genes_mask, :])
-            Wsp = modelHsp.fit_transform(df[shared_genes_mask_sp, :])
+            rna_w = nmf_model_rna.fit_transform(expression_matrix[shared_genes_mask, :])
+            spatial_w = nmf_model_spatial.fit_transform(
+                expression_matrix[shared_spatial_genes_mask, :]
+            )
 
-        mask = np.isin(adr.var.index.to_list(), ad_sp.var.index.to_list())
-        genes = adr.var.index[mask].to_list()
-        spr = ad_sp[ad_sp.obs["cluster"] == ict, genes]
-        v = spr.X.transpose()
+        shared_spatial_mask = np.isin(
+            cluster_ad.var.index.to_list(), ad_sp.var.index.to_list()
+        )
+        shared_spatial_genes = cluster_ad.var.index[shared_spatial_mask].to_list()
+        spatial_cluster = ad_sp[
+            ad_sp.obs["cluster"] == cluster_id, shared_spatial_genes
+        ]
+        spatial_expression = spatial_cluster.X.transpose()
+        rna_shared_w = rna_w[shared_spatial_genes_mask, :]
 
-        sp = []
-        pe = []
+        cluster_spearman = []
+        cluster_pearson = []
 
         # Deterministic gene sampling using NumPy RNG
-        for tr in range(gene_samples):
-            subidx = rng.choice(
-                np.arange(1, Wsp.shape[0]), Wsp.shape[0] - test_genes, replace=False
+        for _ in range(gene_samples):
+            train_gene_idx = rng.choice(
+                np.arange(1, spatial_w.shape[0]),
+                spatial_w.shape[0] - test_genes,
+                replace=False,
             )
-            compidx = np.setdiff1d(
-                np.arange(Wsp.shape[0]), subidx
+            test_gene_idx = np.setdiff1d(
+                np.arange(spatial_w.shape[0]), train_gene_idx
             )  # deterministic complement
 
-            vl = v[subidx, :]
-            w_sample = W[shared_genes_mask_sp, :][subidx, :]
-            h = np.ones((W.shape[1], vl.shape[1]))
+            train_w = rna_shared_w[train_gene_idx, :]
+            h_est = np.ones((rna_shared_w.shape[1], spatial_expression.shape[1]))
 
-            for i in range(max_iter_nmf):
-                h *= (w_sample.T @ vl) / (
-                    w_sample.T @ w_sample @ h + 1e-8
+            for _ in range(max_iter_nmf):
+                h_est *= (train_w.T @ spatial_expression[train_gene_idx, :]) / (
+                    train_w.T @ train_w @ h_est + 1e-8
                 )  # avoid divide-by-zero
 
-            v1 = W[shared_genes_mask_sp, :][compidx, :] @ h
+            predicted_expression = rna_shared_w[test_gene_idx, :] @ h_est
 
-            for k in range(v1.shape[1]):
-                x = np.nan_to_num(v1)[:, k]
-                y = _to_1d_dense(v[compidx, k])
-                if np.max(y) == 0:
+            for cell_idx in range(predicted_expression.shape[1]):
+                predicted_vector = np.nan_to_num(predicted_expression)[:, cell_idx]
+                observed_vector = _to_1d_dense(
+                    spatial_expression[test_gene_idx, cell_idx]
+                )
+                if np.max(observed_vector) == 0:
                     continue
-                sp_val = spearmanr(x, y)[0]
-                pe_val = pearsonr(x, y)[0]
-                sp.append(sp_val)
-                pe.append(pe_val)
-                SP.append(sp_val)
-                PE.append(pe_val)
+                sp_val = spearmanr(predicted_vector, observed_vector)[0]
+                pe_val = pearsonr(predicted_vector, observed_vector)[0]
+                cluster_spearman.append(sp_val)
+                cluster_pearson.append(pe_val)
+                spearman_scores.append(sp_val)
+                pearson_scores.append(pe_val)
 
-        print(ict, "Spearman median:", statistics.median(sp))
-        print(ict, "Pearson median:", statistics.median(pe), end="\n")
+        print(cluster_id, "Spearman median:", statistics.median(cluster_spearman))
+        print(
+            cluster_id, "Pearson median:", statistics.median(cluster_pearson), end="\n"
+        )
 
-    return SP, PE
+    return spearman_scores, pearson_scores
