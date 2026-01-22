@@ -1,7 +1,9 @@
 import random
 import statistics
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Protocol, Tuple
 
+import anndata as ad
 import kneed as kn
 import numpy as np
 import pandas as pd
@@ -12,6 +14,12 @@ from numpy.typing import NDArray
 from scipy.stats import pearsonr, spearmanr
 from sklearn import cluster as sk_cluster
 from sklearn import decomposition as sk_decomposition
+
+
+def _to_dense(values) -> np.ndarray:
+    if hasattr(values, "toarray"):
+        values = values.toarray()
+    return values
 
 
 def _to_1d_dense(values) -> np.ndarray:
@@ -78,7 +86,7 @@ def _init_nmf_matrices(
 # Helper: deterministic component finder
 # -----------------------------
 def _find_components(
-    embedding: NDArray[number],
+    adata: AnnData,
     mink: int = 1,
     maxk: int = 10,
     opt: bool = True,
@@ -105,6 +113,7 @@ def _find_components(
         tuple[int, np.ndarray]: ``(nf, labels)`` where ``labels`` is a string
         array of shape ``(n_samples,)``.
     """
+    embedding = adata.obsm["X_pca"]
     n_samples, _ = embedding.shape
     if n_samples < 1:
         return 1, np.array([], dtype=str)
@@ -149,9 +158,9 @@ def _find_components(
     return nf, labels
 
 
-def _preprocess_cluster(ad: AnnData, cluster_id) -> AnnData:
+def _preprocess_cluster(adata: AnnData, cluster_id) -> AnnData:
     """Subset a cluster and apply standard preprocessing."""
-    cluster_ad = ad[ad.obs["cluster"] == cluster_id].copy()
+    cluster_ad = adata[adata.obs["cluster"] == cluster_id].copy()
     cluster_ad = sc.pp.filter_genes(cluster_ad, min_counts=1, copy=True)
     cluster_ad = sc.pp.normalize_total(cluster_ad, copy=True)
     cluster_ad = sc.pp.log1p(cluster_ad, copy=True)
@@ -160,35 +169,21 @@ def _preprocess_cluster(ad: AnnData, cluster_id) -> AnnData:
 
 
 def _shared_gene_masks(
-    cluster_ad: AnnData, ad_sp: AnnData, ad: AnnData
+    cluster_ad: AnnData, ad_sp: AnnData, adata: AnnData
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build masks for shared genes with spatial and RNA datasets."""
     shared_spatial_genes_mask = np.isin(
         cluster_ad.var.index.to_list(), ad_sp.var.index.to_list()
     )
-    shared_genes_mask = np.isin(cluster_ad.var.index.to_list(), ad.var.index.to_list())
-    return shared_spatial_genes_mask, shared_genes_mask
-
-
-def _select_components(
-    cluster_ad: AnnData, opt_nf: bool, nf_init: int, seed: int
-) -> tuple[int, np.ndarray]:
-    """Choose component count and kmeans labels for a cluster."""
-    return _find_components(
-        cluster_ad.obsm["X_pca"], 1, 10, opt=opt_nf, nf_init=nf_init, seed=seed
+    shared_genes_mask = np.isin(
+        cluster_ad.var.index.to_list(), adata.var.index.to_list()
     )
-
-
-def _cluster_sizes_from_labels(kmeans_labels: np.ndarray) -> List[int]:
-    """Summarize cluster sizes for deterministic initialization."""
-    return [sum(kmeans_labels == label) for label in sorted(set(kmeans_labels))]
+    return shared_spatial_genes_mask, shared_genes_mask
 
 
 def _build_nmf_initialization(
     cluster_ad: AnnData,
-    expression_matrix: NDArray[number],
     nf: int,
-    kmeans_labels: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run ranking and build deterministic NMF initialization matrices."""
     ranked_ad = sc.tl.rank_genes_groups(cluster_ad, "kmeans", copy=True)
@@ -197,7 +192,7 @@ def _build_nmf_initialization(
             ranked_ad.uns["rank_genes_groups"]["scores"].tolist()
         ),
         rank_names_array=np.array(ranked_ad.uns["rank_genes_groups"]["names"].tolist()),
-        expression_matrix=expression_matrix,
+        expression_matrix=_to_dense(cluster_ad.X).transpose(),
         gene_index=ranked_ad.var.index,
         kmeans_labels=ranked_ad.obs["kmeans"],
         nf=nf,
@@ -215,31 +210,30 @@ def _fit_nmf_models(
     h_init: Optional[NDArray[number]] = None,
 ) -> tuple[NDArray[number], NDArray[number]]:
     """Fit RNA and spatial NMF models, optionally with deterministic init."""
+    expression_matrix = expression_matrix.transpose()
     if init:
         if w_init is None or h_init is None:
             raise ValueError("w_init and h_init are required when init is True.")
-        nmf_model_rna = sk_decomposition.NMF(
+        rna_w = sk_decomposition.NMF(
             n_components=nf,
             init="custom",
             alpha_W=0,
             alpha_H=0,
             l1_ratio=1.0,
             random_state=seed,
-        )
-        nmf_model_spatial = sk_decomposition.NMF(
-            n_components=nf,
-            init="custom",
-            alpha_W=0,
-            alpha_H=0,
-            l1_ratio=1.0,
-            random_state=seed,
-        )
-        rna_w = nmf_model_rna.fit_transform(
+        ).fit_transform(
             expression_matrix[shared_genes_mask, :],
             W=w_init[shared_genes_mask, :].astype("float32"),
             H=h_init.astype("float32"),
         )
-        spatial_w = nmf_model_spatial.fit_transform(
+        spatial_w = sk_decomposition.NMF(
+            n_components=nf,
+            init="custom",
+            alpha_W=0,
+            alpha_H=0,
+            l1_ratio=1.0,
+            random_state=seed,
+        ).fit_transform(
             expression_matrix[shared_spatial_genes_mask, :],
             W=w_init[shared_spatial_genes_mask, :].astype("float32"),
             H=h_init.astype("float32"),
@@ -344,32 +338,32 @@ def _collect_correlations(
 
 
 def dominic_experiment_refactor_v1(
-    ad_sp: AnnData,
-    ad: AnnData,
+    query: AnnData,
+    reference: AnnData,
     seed: int = 42,
-    init=True,
-    opt_nf=True,
-    nf_init=3,
-    test_genes=20,
-    max_iter_nmf=100,
-    gene_samples=10,
+    pre_initialize: bool = True,
+    optimize_number_of_components: bool = True,
+    default_n_components: int = 3,
+    test_genes: int = 20,
+    max_iter_nmf: int = 100,
+    gene_samples: int = 10,
 ) -> Tuple[List[float], List[float]]:
     """Run the Dominic NMF-based spatial prediction experiment.
 
-    This routine iterates over clusters in the scRNA-seq AnnData, fits NMF
-    models with deterministic initialization, and evaluates prediction quality
-    on spatial data using Spearman and Pearson correlations.
+    This routine iterates over scRNA-seq clusters from ``reference``, fits NMF
+    models (optionally with deterministic initialization), and evaluates
+    prediction quality on ``query`` using Spearman and Pearson correlations.
 
     Args:
-        ad_sp (AnnData): Spatial AnnData with gene expression and cluster labels.
-        ad (AnnData): scRNA-seq AnnData with gene expression and cluster labels.
+        query (AnnData): Spatial AnnData with gene expression and cluster labels.
+        reference (AnnData): scRNA-seq AnnData with gene expression and cluster labels.
         seed (int): Random seed for deterministic behavior across NumPy and
             Python RNGs.
-        init (bool): Whether to use custom deterministic NMF initialization.
-        opt_nf (bool): Whether to optimize the number of NMF components via
-            elbow detection.
-        nf_init (int): Default number of NMF components when optimization is disabled
-            or fails to find an elbow.
+        pre_initialize (bool): Whether to use custom deterministic NMF initialization.
+        optimize_number_of_components (bool): Whether to optimize the number of NMF
+            components via elbow detection.
+        default_n_components (int): Default number of NMF components when optimization
+            is disabled or fails to find an elbow.
         test_genes (int): Number of genes held out for each prediction test.
         max_iter_nmf (int): Number of multiplicative update iterations for
             estimating ``H``.
@@ -395,49 +389,43 @@ def dominic_experiment_refactor_v1(
     spearman_scores = []
     pearson_scores = []
 
-    for cluster_id in sorted(set(ad.obs["cluster"])):
-        cluster_ad = _preprocess_cluster(ad, cluster_id)
-        expression_matrix = cluster_ad.X.transpose()
+    for cluster_id in sorted(set(reference.obs["cluster"])):
+        cluster_ad = _preprocess_cluster(reference, cluster_id)
         shared_spatial_genes_mask, shared_genes_mask = _shared_gene_masks(
-            cluster_ad, ad_sp, ad
+            cluster_ad, query, reference
         )
 
-        nf, kmeans_labels = _select_components(cluster_ad, opt_nf, nf_init, seed)
+        nf, kmeans_labels = _find_components(
+            cluster_ad, 1, 10, optimize_number_of_components, default_n_components, seed
+        )
         cluster_ad.obs["kmeans"] = kmeans_labels
 
-        if not init:
-            nf = nf_init
+        if not pre_initialize:
+            nf = default_n_components
 
-        cluster_sizes: List[int] = []
-        if init:
-            cluster_sizes = _cluster_sizes_from_labels(kmeans_labels)
-            w_init, h_init = _build_nmf_initialization(
-                cluster_ad, expression_matrix, nf, kmeans_labels
-            )
+        if pre_initialize:
+            w_init, h_init = _build_nmf_initialization(cluster_ad, nf)
         else:
             w_init = None
             h_init = None
 
         rna_w, spatial_w = _fit_nmf_models(
-            expression_matrix=expression_matrix,
+            expression_matrix=cluster_ad.X,
             shared_genes_mask=shared_genes_mask,
             shared_spatial_genes_mask=shared_spatial_genes_mask,
             nf=nf,
             seed=seed,
-            init=init,
+            init=pre_initialize,
             w_init=w_init,
             h_init=h_init,
         )
 
         spatial_expression = _extract_spatial_expression(
-            ad_sp, cluster_id, cluster_ad, shared_spatial_genes_mask
+            query, cluster_id, cluster_ad, shared_spatial_genes_mask
         )
         rna_shared_w = rna_w[shared_spatial_genes_mask, :]
 
         print(cluster_id, "Optimal nf:", nf)
-
-        if init:
-            print(cluster_id, "Cluster sizes:", cluster_sizes)
 
         cluster_spearman: List[float] = []
         cluster_pearson: List[float] = []
