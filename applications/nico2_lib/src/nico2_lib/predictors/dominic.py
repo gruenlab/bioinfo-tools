@@ -168,19 +168,6 @@ def _preprocess_cluster(adata: AnnData, cluster_id) -> AnnData:
     return cluster_ad
 
 
-def _shared_gene_masks(
-    cluster_ad: AnnData, ad_sp: AnnData, adata: AnnData
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build masks for shared genes with spatial and RNA datasets."""
-    shared_spatial_genes_mask = np.isin(
-        cluster_ad.var.index.to_list(), ad_sp.var.index.to_list()
-    )
-    shared_genes_mask = np.isin(
-        cluster_ad.var.index.to_list(), adata.var.index.to_list()
-    )
-    return shared_spatial_genes_mask, shared_genes_mask
-
-
 def _build_nmf_initialization(
     cluster_ad: AnnData,
     nf: int,
@@ -201,67 +188,65 @@ def _build_nmf_initialization(
 
 def _fit_nmf_models(
     expression_matrix: NDArray[number],
-    shared_genes_mask: np.ndarray,
-    shared_spatial_genes_mask: np.ndarray,
+    cluster_genes_in_reference_mask: np.ndarray,
+    cluster_genes_in_query_mask: np.ndarray,
     nf: int,
     seed: int,
-    init: bool,
-    w_init: Optional[NDArray[number]] = None,
-    h_init: Optional[NDArray[number]] = None,
+    init_matrices: Optional[Tuple[NDArray[number], NDArray[number]]] = None,
 ) -> tuple[NDArray[number], NDArray[number]]:
     """Fit RNA and spatial NMF models, optionally with deterministic init."""
     expression_matrix = expression_matrix.transpose()
-    if init:
-        if w_init is None or h_init is None:
-            raise ValueError("w_init and h_init are required when init is True.")
+    expression_matrix_reference = expression_matrix[cluster_genes_in_reference_mask, :]
+    expression_matrix_query = expression_matrix[cluster_genes_in_query_mask, :]
+    if init_matrices is not None:
+        w_init, h_init = init_matrices
+        w_init_reference = w_init[cluster_genes_in_reference_mask, :].astype("float32")
+        w_init_query = w_init[cluster_genes_in_query_mask, :].astype("float32")
+        h_init = h_init.astype("float32")
+        init = "custom"
         rna_w = sk_decomposition.NMF(
             n_components=nf,
-            init="custom",
+            init=init,
             alpha_W=0,
             alpha_H=0,
             l1_ratio=1.0,
             random_state=seed,
-        ).fit_transform(
-            expression_matrix[shared_genes_mask, :],
-            W=w_init[shared_genes_mask, :].astype("float32"),
-            H=h_init.astype("float32"),
-        )
+        ).fit_transform(expression_matrix_reference, W=w_init_reference, H=h_init)
         spatial_w = sk_decomposition.NMF(
             n_components=nf,
-            init="custom",
+            init=init,
             alpha_W=0,
             alpha_H=0,
             l1_ratio=1.0,
             random_state=seed,
-        ).fit_transform(
-            expression_matrix[shared_spatial_genes_mask, :],
-            W=w_init[shared_spatial_genes_mask, :].astype("float32"),
-            H=h_init.astype("float32"),
-        )
+        ).fit_transform(expression_matrix_query, W=w_init_query, H=h_init)
     else:
+        init = None
+        w_init_query = None
+        h_init = None
         nmf_model_rna = sk_decomposition.NMF(
-            n_components=nf, alpha_W=0, alpha_H=0, l1_ratio=1.0, random_state=seed
+            n_components=nf,
+            init=init,
+            alpha_W=0,
+            alpha_H=0,
+            l1_ratio=1.0,
+            random_state=seed,
         )
         nmf_model_spatial = sk_decomposition.NMF(
-            n_components=nf, alpha_W=0, alpha_H=0, l1_ratio=1.0, random_state=seed
+            n_components=nf,
+            init=init,
+            alpha_W=0,
+            alpha_H=0,
+            l1_ratio=1.0,
+            random_state=seed,
         )
-        rna_w = nmf_model_rna.fit_transform(expression_matrix[shared_genes_mask, :])
+        rna_w = nmf_model_rna.fit_transform(
+            expression_matrix_reference, W=w_init_query, H=h_init
+        )
         spatial_w = nmf_model_spatial.fit_transform(
-            expression_matrix[shared_spatial_genes_mask, :]
+            expression_matrix_query, W=w_init_query, H=h_init
         )
     return rna_w, spatial_w
-
-
-def _extract_spatial_expression(
-    ad_sp: AnnData,
-    cluster_id,
-    cluster_ad: AnnData,
-    shared_spatial_genes_mask: np.ndarray,
-) -> NDArray[number]:
-    """Extract spatial expression for shared genes in a cluster."""
-    shared_spatial_genes = cluster_ad.var.index[shared_spatial_genes_mask].to_list()
-    spatial_cluster = ad_sp[ad_sp.obs["cluster"] == cluster_id, shared_spatial_genes]
-    return spatial_cluster.X.transpose()
 
 
 def _predict_expression_nmf(
@@ -390,42 +375,49 @@ def dominic_experiment_refactor_v1(
     pearson_scores = []
 
     for cluster_id in sorted(set(reference.obs["cluster"])):
-        cluster_ad = _preprocess_cluster(reference, cluster_id)
-        shared_spatial_genes_mask, shared_genes_mask = _shared_gene_masks(
-            cluster_ad, query, reference
-        )
-
-        nf, kmeans_labels = _find_components(
-            cluster_ad, 1, 10, optimize_number_of_components, default_n_components, seed
-        )
-        cluster_ad.obs["kmeans"] = kmeans_labels
-
-        if not pre_initialize:
-            nf = default_n_components
+        reference_cluster = _preprocess_cluster(reference, cluster_id)
 
         if pre_initialize:
-            w_init, h_init = _build_nmf_initialization(cluster_ad, nf)
+            n_components, kmeans_labels = _find_components(
+                adata=reference_cluster,
+                mink=1,
+                maxk=10,
+                opt=optimize_number_of_components,
+                nf_init=default_n_components,
+                seed=seed,
+            )
+            reference_cluster.obs["kmeans"] = kmeans_labels
+            init_matrices = _build_nmf_initialization(reference_cluster, n_components)
+
         else:
-            w_init = None
-            h_init = None
+            n_components = default_n_components
+            init_matrices = None
+
+        cluster_genes_in_query_mask = np.isin(
+            reference_cluster.var.index.to_list(), query.var.index.to_list()
+        )
+        cluster_genes_in_reference_mask = np.isin(
+            reference_cluster.var.index.to_list(), reference.var.index.to_list()
+        )
 
         rna_w, spatial_w = _fit_nmf_models(
-            expression_matrix=cluster_ad.X,
-            shared_genes_mask=shared_genes_mask,
-            shared_spatial_genes_mask=shared_spatial_genes_mask,
-            nf=nf,
+            expression_matrix=reference_cluster.X,
+            cluster_genes_in_reference_mask=cluster_genes_in_reference_mask,
+            cluster_genes_in_query_mask=cluster_genes_in_query_mask,
+            nf=n_components,
             seed=seed,
-            init=pre_initialize,
-            w_init=w_init,
-            h_init=h_init,
+            init_matrices=init_matrices,
         )
 
-        spatial_expression = _extract_spatial_expression(
-            query, cluster_id, cluster_ad, shared_spatial_genes_mask
+        shared_spatial_genes = np.intersect1d(
+            reference_cluster.var_names, query.var_names
         )
-        rna_shared_w = rna_w[shared_spatial_genes_mask, :]
+        spatial_expression = query[
+            query.obs["cluster"] == cluster_id, shared_spatial_genes
+        ].X.transpose()
+        rna_shared_w = rna_w[cluster_genes_in_query_mask, :]
 
-        print(cluster_id, "Optimal nf:", nf)
+        print(cluster_id, "Optimal nf:", n_components)
 
         cluster_spearman: List[float] = []
         cluster_pearson: List[float] = []
