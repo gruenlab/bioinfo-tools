@@ -22,6 +22,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+log_cli = true
+log_cli_level = "INFO"
 
 [tool.uv.sources]
 spatialdata-io = { git = "https://github.com/scverse/spatialdata-io.git" }
