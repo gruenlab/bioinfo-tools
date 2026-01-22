@@ -67,43 +67,33 @@ def dominic_experiment_refactor_v1(
     # -----------------------------
     # Helper: deterministic NMF initialization
     # -----------------------------
+
     def init_nmf_matrices(
-        adata: AnnData, nf: int, ngenes: int
+        rank_scores_array: NDArray[number],
+        rank_names_array: NDArray[number],
+        expression_matrix: NDArray[number],
+        gene_index,
+        kmeans_labels,
+        nf: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Initialize NMF W/H matrices deterministically from ranked genes.
-
-        Args:
-            adata: AnnData with a "kmeans" cluster annotation in `obs`.
-            nf: Number of NMF components.
-            ngenes: Number of top-ranked genes to consider.
-
-        Returns:
-            A tuple containing:
-                - Winit: Initialized W matrix of shape (n_genes, nf).
-                - Hinit: Initialized H matrix of shape (nf, n_cells).
-        """
-        sc.tl.rank_genes_groups(adata, "kmeans")
-        gs = adata.uns["rank_genes_groups"]["scores"]
-        gn = adata.uns["rank_genes_groups"]["names"]
-        gsa = np.array(gs.tolist())
-        gna = np.array(gn.tolist())
-        df = adata.X.transpose()
-
-        Winit = np.zeros((df.shape[0], nf), dtype=float)
+        """Build initial NMF matrices from precomputed ranked gene arrays."""
+        w_init = np.zeros((expression_matrix.shape[0], nf), dtype=float)
         for i in range(nf):
             # Deterministic iteration over genes
-            gsd = pd.DataFrame(gsa.transpose(), columns=gna[:, i])
-            Winit[:, i] = gsd[adata.var.index].iloc[i]
-            Winit[Winit[:, i] < 0, i] = 0.1
-            Winit[:, i] += 0.01
+            scores_df = pd.DataFrame(
+                rank_scores_array.transpose(), columns=rank_names_array[:, i]
+            )
+            w_init[:, i] = scores_df[gene_index].iloc[i]
+            w_init[w_init[:, i] < 0, i] = 0.1
+            w_init[:, i] += 0.01
 
-        Hinit = np.zeros((nf, df.shape[1]), dtype=float)
+        h_init = np.zeros((nf, expression_matrix.shape[1]), dtype=float)
         for i in range(nf):
-            mask = adata.obs["kmeans"].astype("float") == i
-            Hinit[i, mask] = 1
-            Hinit[i, ~mask] = 0.1
+            cluster_mask = np.asarray(kmeans_labels, dtype=float) == i
+            h_init[i, cluster_mask] = 1
+            h_init[i, ~cluster_mask] = 0.1
 
-        return Winit, Hinit
+        return w_init, h_init
 
     # -----------------------------
     # Helper: deterministic component finder
@@ -115,13 +105,13 @@ def dominic_experiment_refactor_v1(
         opt: bool = True,
         nf_init: int = 3,
     ) -> tuple[int, np.ndarray]:
-        """Choose a component count and KMeans labels for an AnnData object.
+        """Choose a component count and KMeans labels for an embedding.
 
         Uses an elbow heuristic on KMeans SSE when `opt` is True and then enforces
         a minimum cluster size by reducing the component count as needed.
 
         Args:
-            adata: AnnData with PCA embedding stored in `obsm["X_pca"]`.
+            embedding: PCA embedding array.
             mink: Minimum number of clusters to try.
             maxk: Maximum number of clusters to try (exclusive).
             opt: Whether to optimize the component count using the elbow method.
@@ -133,21 +123,22 @@ def dominic_experiment_refactor_v1(
                 - nf: Selected number of components.
                 - labels: KMeans labels as a NumPy array of strings.
         """
-        # n_samples = adata.obsm["X_pca"].shape[0]
-        n_samples, _ = embedding.shape
-        if n_samples < 1:
+        n_obs, _ = embedding.shape
+        if n_obs < 1:
             return 1, np.array([], dtype=str)
 
-        maxk = min(maxk, n_samples + 1)
-        mink = min(mink, n_samples)
+        maxk = min(maxk, n_obs + 1)
+        mink = min(mink, n_obs)
+
+        def fit_kmeans(n_clusters: int) -> sk_cluster.KMeans:
+            return sk_cluster.KMeans(n_clusters=n_clusters, random_state=seed).fit(
+                embedding
+            )
 
         if opt:
-            sse = []
-            for k in range(mink, maxk):
-                kmeans = sk_cluster.KMeans(n_clusters=k, random_state=seed).fit(
-                    embedding
-                )
-                sse.append(kmeans.inertia_)
+            sse: List[sk_cluster.KMeans] = [
+                fit_kmeans(k).inertia_ for k in range(mink, maxk)
+            ]
 
             kln = kn.KneeLocator(
                 range(mink, maxk), sse, curve="convex", direction="decreasing"
@@ -156,16 +147,16 @@ def dominic_experiment_refactor_v1(
         else:
             nf = nf_init
 
-        nf = min(nf, n_samples)
+        nf = min(nf, n_obs)
 
-        # Iteratively reduce nf until clusters have at least 5 samples
+        # Iteratively reduce nf until clusters have at least 5 samples.
         while True:
-            kmeans = sk_cluster.KMeans(n_clusters=nf, random_state=seed).fit(embedding)
-            labels = kmeans.labels_.astype(str)
-            lab_size = [
-                sum(labels == l) for l in sorted(set(labels))
+            labels = fit_kmeans(nf).labels_.astype(str)
+            ordered_labels = sorted(set(labels))
+            label_sizes = [
+                sum(labels == label) for label in ordered_labels
             ]  # deterministic ordering
-            if min(lab_size) >= 5 or nf <= 1:
+            if min(label_sizes) >= 5 or nf <= 1:
                 break
             nf -= 1
 
@@ -201,7 +192,20 @@ def dominic_experiment_refactor_v1(
         if init:
             lab_size = [sum(labels == l) for l in sorted(set(labels))]
             print(ict, "Cluster sizes:", lab_size)
-            Winit, Hinit = init_nmf_matrices(adr, nf, 50)
+            sc.tl.rank_genes_groups(adr, "kmeans")
+
+            Winit, Hinit = init_nmf_matrices(
+                rank_scores_array=np.array(
+                    adr.uns["rank_genes_groups"]["scores"].tolist()
+                ),
+                rank_names_array=np.array(
+                    adr.uns["rank_genes_groups"]["names"].tolist()
+                ),
+                expression_matrix=adr.X.transpose(),
+                gene_index=adr.var.index,
+                kmeans_labels=adr.obs["kmeans"],
+                nf=nf,
+            )
             modelH = sk_decomposition.NMF(
                 n_components=nf,
                 init="custom",
