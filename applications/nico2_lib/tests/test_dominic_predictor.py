@@ -294,4 +294,6 @@ def test_refactor_equality():
     sp, pe = dominic_experiment(ad.copy(), ad_sp.copy())
     sp2, pe2 = dominic_experiment_refactor_v1(ad.copy(), ad_sp.copy())
     assert sp == sp2
+    assert sp != pe
     assert pe == pe2
+    assert sp2 != pe2
