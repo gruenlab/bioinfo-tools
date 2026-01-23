@@ -179,7 +179,7 @@ def dominic_experiment(
         adr = ad[ad.obs["cluster"] == ict].copy()
         sc.pp.filter_genes(adr, min_counts=1)
         sc.pp.normalize_total(adr)
-        sc.pp.log1p(adr)
+        # sc.pp.log1p(adr)
         sc.tl.pca(adr)
 
         df = adr.X.transpose()
