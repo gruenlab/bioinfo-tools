@@ -27,13 +27,20 @@ class VaePredictor:
     vae: Optional[BaseVAE] = field(init=False, default=None)
     _fit_trainer: Optional[L.Trainer] = field(init=False, default=None)
     _fitted: bool = field(init=False, default=False)
+    _input_features: Optional[int] = field(init=False, default=None)
+    _y_features: Optional[int] = field(init=False, default=None)
 
     def fit(self, X: NDArray[number], y: NDArray[number]) -> "VaePredictor":
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
 
         input_features = X.shape[1]
-        output_features = y.shape[1]
+        y_features = y.shape[1]
+        target = np.concatenate([X, y], axis=1)
+        output_features = target.shape[1]
+
+        self._input_features = input_features
+        self._y_features = y_features
 
         self.vae = self.vae_cls(
             input_features=input_features,
@@ -43,7 +50,7 @@ class VaePredictor:
 
         dataset = TensorDataset(
             torch.from_numpy(X),
-            torch.from_numpy(y),
+            torch.from_numpy(target),
         )
         loader = DataLoader(
             dataset,
@@ -77,7 +84,12 @@ class VaePredictor:
             mu_x, _, _ = self.vae(x_tensor, log_space=False)
             preds = torch.expm1(mu_x).clamp(min=0)
 
-        return preds.cpu().numpy()
+        if self._input_features is None or self._y_features is None:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+
+        y_start = self._input_features
+        y_end = y_start + self._y_features
+        return preds[:, y_start:y_end].cpu().numpy()
 
 
 class LVAEPredictor(VaePredictor):
