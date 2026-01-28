@@ -50,7 +50,7 @@ def _init_nmf_matrices(
 
     Args:
         rank_scores_array (np.ndarray): Ranked gene scores (e.g., from Scanpy
-            ``rank_genes_groups``) with rows as genes and columns as clusters.
+            ``rank_genes_groups``) arranged as ``(n_genes, n_clusters)``.
         rank_names_array (np.ndarray): Ranked gene names aligned with
             ``rank_scores_array``; columns correspond to clusters.
         expression_matrix (np.ndarray): Gene-by-cell matrix used for sizing
@@ -94,14 +94,15 @@ def _find_components(
     nf_init: int = 3,
     seed: int = 42,
 ) -> tuple[int, np.ndarray]:
-    """Choose a component count and KMeans labels for an embedding.
+    """Choose a component count and KMeans labels from ``adata.obsm["X_pca"]``.
 
-    Uses an elbow heuristic on KMeans SSE when ``opt`` is True, then enforces
-    a minimum cluster size by reducing the component count as needed.
+    Uses an elbow heuristic on KMeans inertia when ``opt`` is True, then
+    enforces a minimum cluster size (>=5) by reducing the component count as
+    needed.
 
     Args:
-        embedding (np.ndarray): PCA embedding array of shape
-            ``(n_samples, n_components)``.
+        adata (AnnData): AnnData with PCA embedding stored in
+            ``adata.obsm["X_pca"]``.
         mink (int): Minimum number of clusters to try.
         maxk (int): Maximum number of clusters to try (exclusive).
         opt (bool): Whether to optimize the component count using the elbow
@@ -163,7 +164,21 @@ def _build_nmf_initialization(
     cluster_ad: AnnData,
     nf: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run ranking and build deterministic NMF initialization matrices."""
+    """Rank genes per KMeans cluster and build NMF initialization matrices.
+
+    Expects ``cluster_ad.obs["kmeans"]`` to exist and uses Scanpy's
+    ``rank_genes_groups`` on that label to construct deterministic ``W`` and
+    ``H`` factors.
+
+    Args:
+        cluster_ad (AnnData): Clustered AnnData with ``kmeans`` labels and
+            expression in ``.X``.
+        nf (int): Number of NMF components.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: ``(w_init, h_init)`` initialization
+        matrices for NMF.
+    """
     ranked_ad = sc.tl.rank_genes_groups(cluster_ad, "kmeans", copy=True)
     rank_scores_array = np.array(ranked_ad.uns["rank_genes_groups"]["scores"].tolist())
     rank_names_array = np.array(ranked_ad.uns["rank_genes_groups"]["names"].tolist())
@@ -211,8 +226,8 @@ def _fit_nmf_model(
     Returns:
         np.ndarray: ``rna_w`` factor matrix from the fitted RNA NMF model. The
         matrix has shape ``(n_selected_genes, nf)`` and contains non-negative
-        weights for the NMF components; ``n_selected_genes`` is the number of
-        Length of ``cluster_genes_in_reference_idx``.
+        weights for the NMF components; ``n_selected_genes`` equals
+        ``len(cluster_genes_in_reference_idx)``.
     """
     expression_matrix = expression_matrix.transpose()
     expression_matrix_reference = expression_matrix[cluster_genes_in_reference_idx, :]
@@ -310,34 +325,81 @@ def _collect_correlations(
     return cluster_spearman, cluster_pearson
 
 
-def _fit(
-    X: NDArray[number], y: NDArray[number]
-) -> Callable[[NDArray[number]], NDArray[number]]:
-    expression_matrix = np.concat([X, y])
-    rna_w = _fit_nmf_model(
-        expression_matrix=expression_matrix,
-        cluster_genes_in_reference_idx=cluster_genes_in_reference_idx,
-        nf=n_components,
-        seed=seed,
-        init_matrices=init_matrices,
-    )
+PredictExpressionFn = Callable[[NDArray[number], NDArray[number]], NDArray[number]]
+NmfPredictorFn = Callable[
+    [AnnData, NDArray[number], NDArray[number], NDArray[number]],
+    Tuple[PredictExpressionFn, int],
+]
 
-    def _predict(X: NDArray[number]) -> NDArray[number]: ...
 
-    return _predict
+def make_nmf_predictor(
+    pre_initialize: bool = True,
+    optimize_number_of_components: bool = True,
+    default_n_components: int = 3,
+    max_iter_nmf: int = 100,
+    seed: int = 42,
+) -> NmfPredictorFn:
+    """Create a predictor factory for the Dominic NMF experiment.
+
+    The returned function fits NMF for a reference cluster and returns a
+    prediction callable plus the chosen component count.
+    """
+
+    def nmf_predictor(
+        adata: AnnData,
+        cluster_genes_in_reference_idx: NDArray[number],
+        cluster_genes_in_query_idx: NDArray[number],
+        spatial_expression: NDArray[number],
+    ) -> Tuple[PredictExpressionFn, int]:
+        if pre_initialize:
+            n_components, kmeans_labels = _find_components(
+                adata=adata,
+                mink=1,
+                maxk=10,
+                opt=optimize_number_of_components,
+                nf_init=default_n_components,
+                seed=seed,
+            )
+            adata.obs["kmeans"] = kmeans_labels
+            init_matrices = _build_nmf_initialization(adata, n_components)
+        else:
+            n_components = default_n_components
+            init_matrices = None
+
+        rna_w = _fit_nmf_model(
+            expression_matrix=adata.X,
+            cluster_genes_in_reference_idx=cluster_genes_in_reference_idx,
+            nf=n_components,
+            seed=seed,
+            init_matrices=init_matrices,
+        )
+        rna_shared_w_query = rna_w[cluster_genes_in_query_idx, :]
+
+        def predict_expression(
+            train_gene_idx: NDArray[number],
+            test_gene_idx: NDArray[number],
+        ) -> NDArray[number]:
+            return _predict_expression_nmf(
+                rna_shared_w_query,
+                spatial_expression,
+                train_gene_idx,
+                test_gene_idx,
+                max_iter_nmf,
+            )
+
+        return predict_expression, n_components
+
+    return nmf_predictor
 
 
 def dominic_experiment_refactor_v1(
     query: AnnData,
     reference: AnnData,
     seed: int = 42,
-    pre_initialize: bool = True,
-    optimize_number_of_components: bool = True,
     preprocessing_steps: Optional[List[Callable[[AnnData], None]]] = None,
-    default_n_components: int = 3,
     test_genes: int = 20,
-    max_iter_nmf: int = 100,
     gene_samples: int = 10,
+    nmf_predictor: Optional[NmfPredictorFn] = None,
 ) -> Tuple[List[float], List[float]]:
     """Run the Dominic NMF-based spatial prediction experiment.
 
@@ -347,18 +409,19 @@ def dominic_experiment_refactor_v1(
 
     Args:
         query (AnnData): Spatial AnnData with gene expression and cluster labels.
-        reference (AnnData): scRNA-seq AnnData with gene expression and cluster labels.
+        reference (AnnData): scRNA-seq AnnData with gene expression and cluster
+            labels.
         seed (int): Random seed for deterministic behavior across NumPy and
             Python RNGs.
-        pre_initialize (bool): Whether to use custom deterministic NMF initialization.
-        optimize_number_of_components (bool): Whether to optimize the number of NMF
-            components via elbow detection.
-        default_n_components (int): Default number of NMF components when optimization
-            is disabled or fails to find an elbow.
+        preprocessing_steps (Optional[List[Callable[[AnnData], None]]]): Optional
+            preprocessing functions applied to each reference cluster. When
+            ``None``, defaults to filtering genes, total-count normalization,
+            and PCA.
         test_genes (int): Number of genes held out for each prediction test.
-        max_iter_nmf (int): Number of multiplicative update iterations for
-            estimating ``H``.
         gene_samples (int): Number of random gene-subsampling trials per cluster.
+        nmf_predictor (Optional[NmfPredictorFn]): Optional NMF predictor returned
+            by ``make_nmf_predictor``. When ``None``, the default predictor is
+            created with the legacy defaults and ``seed``.
 
     Returns:
         tuple[list[float], list[float]]: ``(SP, PE)`` lists of Spearman and
@@ -378,6 +441,7 @@ def dominic_experiment_refactor_v1(
         sc.pp.normalize_total,
         sc.tl.pca,
     ]
+    nmf_predictor = nmf_predictor or make_nmf_predictor(seed=seed)
     spearman_scores = []
     pearson_scores = []
     query_var_names = query.var_names
@@ -391,23 +455,7 @@ def dominic_experiment_refactor_v1(
 
         cluster_var_names = reference_cluster.var_names
 
-        # Phase 2: compute n_components/init_matrices (pre_initialize branch)
-        if pre_initialize:
-            n_components, kmeans_labels = _find_components(
-                adata=reference_cluster,
-                mink=1,
-                maxk=10,
-                opt=optimize_number_of_components,
-                nf_init=default_n_components,
-                seed=seed,
-            )
-            reference_cluster.obs["kmeans"] = kmeans_labels
-            init_matrices = _build_nmf_initialization(reference_cluster, n_components)
-        else:
-            n_components = default_n_components
-            init_matrices = None
-
-        # Phase 3: build gene indexers/shared genes
+        # Phase 2: build gene indexers/shared genes
         cluster_genes_in_query_idx = np.flatnonzero(
             np.isin(cluster_var_names, query_var_names)
         )
@@ -419,19 +467,17 @@ def dominic_experiment_refactor_v1(
             query.obs["cluster"] == cluster_id, shared_spatial_genes
         ].X.transpose()
 
-        # Phase 4: fit NMF
-        rna_w = _fit_nmf_model(
-            expression_matrix=reference_cluster.X,
+        # Phase 3: fit NMF + get predictor
+        predict_expression, n_components = nmf_predictor(
+            adata=reference_cluster,
             cluster_genes_in_reference_idx=cluster_genes_in_reference_idx,
-            nf=n_components,
-            seed=seed,
-            init_matrices=init_matrices,
+            cluster_genes_in_query_idx=cluster_genes_in_query_idx,
+            spatial_expression=spatial_expression,
         )
-        rna_shared_w_query = rna_w[cluster_genes_in_query_idx, :]
 
         print(cluster_id, "Optimal nf:", n_components)
 
-        # Phase 5: run sampling/prediction loop
+        # Phase 4: run sampling/prediction loop
         cluster_spearman: List[float] = []
         cluster_pearson: List[float] = []
         gene_indices = np.arange(shared_spatial_genes.size)
@@ -445,12 +491,9 @@ def dominic_experiment_refactor_v1(
             )
             test_gene_idx = np.setdiff1d(gene_indices, train_gene_idx)
 
-            predicted_expression = _predict_expression_nmf(
-                rna_shared_w_query,  # np.ndarray [n_cells, n_shared_genes], RNA expression for shared genes used to project query cells.
-                spatial_expression,  # np.ndarray [n_cells, n_spatial_genes], spatially measured expression to align factors.
-                train_gene_idx,  # np.ndarray [n_train_genes], indices of shared genes used for NMF training.
-                test_gene_idx,  # np.ndarray [n_test_genes], indices of genes to predict in the NMF space.
-                max_iter_nmf,  # int, max NMF iterations controlling convergence for expression prediction.
+            predicted_expression = predict_expression(
+                train_gene_idx,
+                test_gene_idx,
             )
             sp_vals, pe_vals = _collect_correlations(
                 predicted_expression, spatial_expression, test_gene_idx
@@ -458,7 +501,7 @@ def dominic_experiment_refactor_v1(
             cluster_spearman.extend(sp_vals)
             cluster_pearson.extend(pe_vals)
 
-        # Phase 6: aggregate scores + prints
+        # Phase 5: aggregate scores + prints
         spearman_scores.extend(cluster_spearman)
         pearson_scores.extend(cluster_pearson)
 
