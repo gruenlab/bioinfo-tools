@@ -1,6 +1,7 @@
 import random
 import statistics
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, List, Optional, Protocol, Tuple
 
 import anndata as ad
@@ -158,16 +159,6 @@ def _find_components(
     return nf, labels
 
 
-def _preprocess_cluster(adata: AnnData, cluster_id) -> AnnData:
-    """Subset a cluster and apply standard preprocessing."""
-    cluster_ad = adata[adata.obs["cluster"] == cluster_id].copy()
-    cluster_ad = sc.pp.filter_genes(cluster_ad, min_counts=1, copy=True)
-    cluster_ad = sc.pp.normalize_total(cluster_ad, copy=True)
-    # cluster_ad = sc.pp.log1p(cluster_ad, copy=True)
-    cluster_ad = sc.tl.pca(cluster_ad, copy=True)
-    return cluster_ad
-
-
 def _build_nmf_initialization(
     cluster_ad: AnnData,
     nf: int,
@@ -190,60 +181,49 @@ def _build_nmf_initialization(
     )
 
 
-def _fit_nmf_models(
+def _fit_nmf_model(
     expression_matrix: NDArray[number],
-    cluster_genes_in_reference_mask: np.ndarray,
-    cluster_genes_in_query_mask: np.ndarray,
+    cluster_genes_in_reference_idx: np.ndarray,
     nf: int,
     seed: int,
     init_matrices: Optional[Tuple[NDArray[number], NDArray[number]]] = None,
-) -> tuple[NDArray[number], NDArray[number]]:
-    """Fit paired RNA and spatial NMF models on aligned gene subsets.
+) -> NDArray[number]:
+    """Fit an RNA NMF model on a masked subset of genes.
 
-    This fits two NMF models using shared settings. If ``init_matrices`` is
+    This fits one NMF model using shared settings. If ``init_matrices`` is
     provided, the model uses deterministic initialization with the provided
     ``W`` and ``H`` factors; otherwise, initialization is left to scikit-learn.
-    The function is used to obtain comparable component weights for the
-    reference (RNA) and query (spatial) gene sets by fitting separate NMF
-    models with the same number of components and (optionally) a shared ``H``
-    initialization.
+    The function returns the component weights for the reference (RNA) genes
+    selected by ``cluster_genes_in_reference_idx``.
 
     Args:
         expression_matrix (np.ndarray): Gene expression matrix. The matrix is
             transposed internally before fitting NMF.
-        cluster_genes_in_reference_mask (np.ndarray): Boolean mask selecting
-            genes used for the reference (RNA) model. Shape: ``(n_genes,)``.
-            True entries select rows from the transposed ``expression_matrix``.
-        cluster_genes_in_query_mask (np.ndarray): Boolean mask selecting genes
-            used for the query (spatial) model. Shape: ``(n_genes,)``. True
-            entries select rows from the transposed ``expression_matrix``.
+        cluster_genes_in_reference_idx (np.ndarray): Integer indices selecting
+            genes used for the reference (RNA) model. Shape: ``(n_selected,)``.
+            Indices select rows from the transposed ``expression_matrix``.
         nf (int): Number of NMF components to fit.
         seed (int): Random seed for NMF initialization.
         init_matrices (Optional[Tuple[np.ndarray, np.ndarray]]): Optional
             ``(W, H)`` initialization matrices for deterministic NMF. ``W`` is
-            subset by the provided gene masks and ``H`` is shared across both
-            models.
+            subset by the provided gene indices and ``H`` is shared across fits.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]: ``(rna_w, spatial_w)`` factor matrices
-        from the fitted RNA and spatial NMF models, respectively. Each matrix
-        has shape ``(n_selected_genes, nf)`` and contains non-negative weights
-        for the NMF components; ``n_selected_genes`` is the number of True
-        values in the corresponding mask.
+        np.ndarray: ``rna_w`` factor matrix from the fitted RNA NMF model. The
+        matrix has shape ``(n_selected_genes, nf)`` and contains non-negative
+        weights for the NMF components; ``n_selected_genes`` is the number of
+        Length of ``cluster_genes_in_reference_idx``.
     """
     expression_matrix = expression_matrix.transpose()
-    expression_matrix_reference = expression_matrix[cluster_genes_in_reference_mask, :]
-    expression_matrix_query = expression_matrix[cluster_genes_in_query_mask, :]
+    expression_matrix_reference = expression_matrix[cluster_genes_in_reference_idx, :]
     if init_matrices is not None:
         w_init, h_init = init_matrices
-        w_init_reference = w_init[cluster_genes_in_reference_mask, :].astype("float32")
-        w_init_query = w_init[cluster_genes_in_query_mask, :].astype("float32")
+        w_init_reference = w_init[cluster_genes_in_reference_idx, :].astype("float32")
         h_init = h_init.astype("float32")
         init = "custom"
     else:
         init = None
         w_init_reference = None
-        w_init_query = None
         h_init = None
     rna_w = sk_decomposition.NMF(
         n_components=nf,
@@ -253,15 +233,8 @@ def _fit_nmf_models(
         l1_ratio=1.0,
         random_state=seed,
     ).fit_transform(expression_matrix_reference, W=w_init_reference, H=h_init)
-    spatial_w = sk_decomposition.NMF(
-        n_components=nf,
-        init=init,
-        alpha_W=0,
-        alpha_H=0,
-        l1_ratio=1.0,
-        random_state=seed,
-    ).fit_transform(expression_matrix_query, W=w_init_query, H=h_init)
-    return rna_w, spatial_w
+
+    return rna_w
 
 
 def _predict_expression_nmf(
@@ -341,10 +314,9 @@ def _fit(
     X: NDArray[number], y: NDArray[number]
 ) -> Callable[[NDArray[number]], NDArray[number]]:
     expression_matrix = np.concat([X, y])
-    rna_w, spatial_w = _fit_nmf_models(
+    rna_w = _fit_nmf_model(
         expression_matrix=expression_matrix,
-        cluster_genes_in_reference_mask=cluster_genes_in_reference_mask,
-        cluster_genes_in_query_mask=cluster_genes_in_query_mask,
+        cluster_genes_in_reference_idx=cluster_genes_in_reference_idx,
         nf=n_components,
         seed=seed,
         init_matrices=init_matrices,
@@ -361,6 +333,7 @@ def dominic_experiment_refactor_v1(
     seed: int = 42,
     pre_initialize: bool = True,
     optimize_number_of_components: bool = True,
+    preprocessing_steps: Optional[List[Callable[[AnnData], None]]] = None,
     default_n_components: int = 3,
     test_genes: int = 20,
     max_iter_nmf: int = 100,
@@ -400,19 +373,22 @@ def dominic_experiment_refactor_v1(
     random.seed(seed)  # Seed Python's random
     np.random.seed(seed)  # Seed NumPy legacy functions
 
-    # -----------------------------
-    # Helper: deterministic NMF initialization
-    # -----------------------------
-
+    preprocessing_steps = preprocessing_steps or [
+        partial(sc.pp.filter_genes, min_counts=1),
+        sc.pp.normalize_total,
+        sc.tl.pca,
+    ]
     spearman_scores = []
     pearson_scores = []
-
     query_var_names = query.var_names
     reference_var_names = reference.var_names
 
     for cluster_id in sorted(set(reference.obs["cluster"])):
         # Phase 1: preprocess cluster
-        reference_cluster = _preprocess_cluster(reference, cluster_id)
+        reference_cluster = reference[reference.obs["cluster"] == cluster_id].copy()
+        for step in preprocessing_steps:
+            step(reference_cluster)
+
         cluster_var_names = reference_cluster.var_names
 
         # Phase 2: compute n_components/init_matrices (pre_initialize branch)
@@ -431,10 +407,12 @@ def dominic_experiment_refactor_v1(
             n_components = default_n_components
             init_matrices = None
 
-        # Phase 3: build gene masks/shared genes
-        cluster_genes_in_query_mask = np.isin(cluster_var_names, query_var_names)
-        cluster_genes_in_reference_mask = np.isin(
-            cluster_var_names, reference_var_names
+        # Phase 3: build gene indexers/shared genes
+        cluster_genes_in_query_idx = np.flatnonzero(
+            np.isin(cluster_var_names, query_var_names)
+        )
+        cluster_genes_in_reference_idx = np.flatnonzero(
+            np.isin(cluster_var_names, reference_var_names)
         )
         shared_spatial_genes = np.intersect1d(cluster_var_names, query_var_names)
         spatial_expression = query[
@@ -442,28 +420,27 @@ def dominic_experiment_refactor_v1(
         ].X.transpose()
 
         # Phase 4: fit NMF
-        rna_w, spatial_w = _fit_nmf_models(
+        rna_w = _fit_nmf_model(
             expression_matrix=reference_cluster.X,
-            cluster_genes_in_reference_mask=cluster_genes_in_reference_mask,
-            cluster_genes_in_query_mask=cluster_genes_in_query_mask,
+            cluster_genes_in_reference_idx=cluster_genes_in_reference_idx,
             nf=n_components,
             seed=seed,
             init_matrices=init_matrices,
         )
-        rna_shared_w_query = rna_w[cluster_genes_in_query_mask, :]
+        rna_shared_w_query = rna_w[cluster_genes_in_query_idx, :]
 
         print(cluster_id, "Optimal nf:", n_components)
 
         # Phase 5: run sampling/prediction loop
         cluster_spearman: List[float] = []
         cluster_pearson: List[float] = []
-        gene_indices = np.arange(spatial_w.shape[0])
+        gene_indices = np.arange(shared_spatial_genes.size)
         gene_sample_space = gene_indices[1:]
 
         for _ in range(gene_samples):
             train_gene_idx = rng.choice(
                 gene_sample_space,
-                spatial_w.shape[0] - test_genes,
+                shared_spatial_genes.size - test_genes,
                 replace=False,
             )
             test_gene_idx = np.setdiff1d(gene_indices, train_gene_idx)
