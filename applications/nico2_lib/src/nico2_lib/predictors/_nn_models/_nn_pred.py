@@ -209,10 +209,10 @@ class VaePredictorN:
     hidden_features_out: int
     hidden_features_in: int
     lr: float = 1e-4
-    transform: Tuple[
-        Callable[[NDArray[number]], NDArray[number]],
-        Callable[[NDArray[number]], NDArray[number]],
-    ] = (lambda x: log1p(x), lambda x: exp(clip(x, min=0)))
+    counts_transform: Callable[[NDArray[number]], NDArray[number]] = lambda x: log1p(x)
+    counts_inverse_transform: Callable[[NDArray[number]], NDArray[number]] = (
+        lambda x: exp(clip(x, min=0))
+    )
     dataloader_kwargs: Dict[str, Any] = field(default_factory=dict)
     trainer_kwargs: Dict[str, Any] = field(default_factory=dict)
 
@@ -227,73 +227,128 @@ class VaePredictorN:
         }
     )
 
+    @property
     def _merged_dataloader_kwargs(self) -> Dict[str, Any]:
         return {**self._default_dataloader_kwargs, **self.dataloader_kwargs}
 
+    @property
     def _merged_trainer_kwargs(self) -> Dict[str, Any]:
         return {**self._default_trainer_kwargs, **self.trainer_kwargs}
 
-    def _build_encoder(self, n_features: int) -> VariationalEncoder:
-        return VariationalEncoder(
+    def _fit_vae(
+        self,
+        encoder: VariationalEncoder,
+        decoder: Decoder,
+        X: NDArray[number],
+        *,
+        lr: float,
+        counts_transform: Callable[[NDArray[number]], NDArray[number]],
+        dataloader_kwargs: Dict[str, Any],
+        trainer_kwargs: Dict[str, Any],
+    ) -> None:
+        X = np.asarray(counts_transform(X), dtype=np.float32)
+        model = BaseVAE(encoder, decoder, lr=lr)
+        dataset = TensorDataset(torch.from_numpy(X))
+        loader = DataLoader(dataset, **dataloader_kwargs)
+        trainer = L.Trainer(**trainer_kwargs)
+        trainer.fit(model, train_dataloaders=loader)
+
+    def _copy_decoder_for_query(
+        self,
+        decoder: Decoder,
+        indexer: NDArray[intp],
+        *,
+        latent_features: int,
+        hidden_features_out: int,
+    ) -> Decoder:
+        decoder_query = Decoder(
+            latent_features=latent_features,
+            out_features=len(indexer),
+            hidden_features=hidden_features_out,
+        )
+        with torch.no_grad():
+            decoder_query.hidden.weight.copy_(decoder.hidden.weight)
+            decoder_query.hidden.bias.copy_(decoder.hidden.bias)
+            decoder_query.mu_out.weight.copy_(
+                decoder.mu_out.weight[torch.from_numpy(indexer)]
+            )
+            decoder_query.mu_out.bias.copy_(
+                decoder.mu_out.bias[torch.from_numpy(indexer)]
+            )
+        return decoder_query
+
+    def _freeze_decoder_query(self, decoder_query: Decoder) -> None:
+        for param in decoder_query.parameters():
+            param.requires_grad = False
+
+    def _predict_with_ref_decoder(
+        self,
+        X: NDArray[number],
+        *,
+        encoder_query: VariationalEncoder,
+        decoder_ref: Decoder,
+        lr: float,
+        counts_transform: Callable[[NDArray[number]], NDArray[number]],
+        counts_inverse_transform: Callable[[NDArray[number]], NDArray[number]],
+    ) -> NDArray[number]:
+        predictor_model = BaseVAE(encoder=encoder_query, decoder=decoder_ref, lr=lr)
+        X = np.asarray(counts_transform(X), dtype=np.float32)
+        pred = predictor_model.predict_step(torch.from_numpy(X), 0)
+        pred = pred.detach().cpu().numpy()
+        return counts_inverse_transform(pred)
+
+    def fit(self, X: NDArray[number]) -> "VaePredictorN":
+        _, n_features = X.shape
+        self.encoder_ref = VariationalEncoder(
             in_features=n_features,
             latent_features=self.latent_features,
             hidden_features=self.hidden_features_in,
         )
-
-    def _build_decoder(self, n_features: int) -> Decoder:
-        return Decoder(
+        self.decoder_ref = Decoder(
             latent_features=self.latent_features,
             out_features=n_features,
             hidden_features=self.hidden_features_out,
         )
-
-    def _fit_vae(
-        self, encoder: VariationalEncoder, decoder: Decoder, X: NDArray[number]
-    ) -> None:
-        X = np.asarray(self.transform[0](X), dtype=np.float32)
-        model = BaseVAE(encoder, decoder, lr=self.lr)
-        dataset = TensorDataset(torch.from_numpy(X))
-        loader = DataLoader(dataset, **self._merged_dataloader_kwargs())
-        trainer = L.Trainer(**self._merged_trainer_kwargs())
-        trainer.fit(model, train_dataloaders=loader)
-
-    def _copy_decoder_for_query(self, indexer: NDArray[intp]) -> None:
-        with torch.no_grad():
-            self.decoder_query.hidden.weight.copy_(self.decoder_ref.hidden.weight)
-            self.decoder_query.hidden.bias.copy_(self.decoder_ref.hidden.bias)
-            self.decoder_query.mu_out.weight.copy_(
-                self.decoder_ref.mu_out.weight[torch.from_numpy(indexer)]
-            )
-            self.decoder_query.mu_out.bias.copy_(
-                self.decoder_ref.mu_out.bias[torch.from_numpy(indexer)]
-            )
-
-    def _freeze_decoder_query(self) -> None:
-        for param in self.decoder_query.parameters():
-            param.requires_grad = False
-
-    def _predict_with_ref_decoder(self, X: NDArray[number]) -> NDArray[number]:
-        predictor_model = BaseVAE(
-            encoder=self.encoder_query, decoder=self.decoder_ref, lr=self.lr
+        self._fit_vae(
+            self.encoder_ref,
+            self.decoder_ref,
+            X,
+            lr=self.lr,
+            counts_transform=self.counts_transform,
+            dataloader_kwargs=self._merged_dataloader_kwargs,
+            trainer_kwargs=self._merged_trainer_kwargs,
         )
-        X = np.asarray(self.transform[0](X), dtype=np.float32)
-        pred = predictor_model.predict_step(torch.from_numpy(X), 0)
-        pred = pred.detach().cpu().numpy()
-        return self.transform[1](pred)
-
-    def fit(self, X: NDArray[number]) -> "VaePredictorN":
-        _, n_features = X.shape
-        self.encoder_ref = self._build_encoder(n_features)
-        self.decoder_ref = self._build_decoder(n_features)
-        self._fit_vae(self.encoder_ref, self.decoder_ref, X)
         return self
 
     def predict(self, X: NDArray[number], indexer: NDArray[intp]) -> NDArray[number]:
         _, n_features = X.shape
-        self.encoder_query = self._build_encoder(n_features)
-        self.decoder_query = self._build_decoder(n_features)
-        self._copy_decoder_for_query(indexer)
-        self._freeze_decoder_query()
-        self._fit_vae(self.encoder_query, self.decoder_query, X)
-        res = self._predict_with_ref_decoder(X)
+        self.encoder_query = VariationalEncoder(
+            in_features=n_features,
+            latent_features=self.latent_features,
+            hidden_features=self.hidden_features_in,
+        )
+        self.decoder_query = self._copy_decoder_for_query(
+            self.decoder_ref,
+            indexer,
+            latent_features=self.latent_features,
+            hidden_features_out=self.hidden_features_out,
+        )
+        self._freeze_decoder_query(self.decoder_query)
+        self._fit_vae(
+            self.encoder_query,
+            self.decoder_query,
+            X,
+            lr=self.lr,
+            counts_transform=self.counts_transform,
+            dataloader_kwargs=self._merged_dataloader_kwargs,
+            trainer_kwargs=self._merged_trainer_kwargs,
+        )
+        res = self._predict_with_ref_decoder(
+            X,
+            encoder_query=self.encoder_query,
+            decoder_ref=self.decoder_ref,
+            lr=self.lr,
+            counts_transform=self.counts_transform,
+            counts_inverse_transform=self.counts_inverse_transform,
+        )
         return res
