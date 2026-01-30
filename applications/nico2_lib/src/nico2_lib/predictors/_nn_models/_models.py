@@ -1,5 +1,6 @@
-from ._nn import Decoder, LinearDecoder, VariationalEncoder, VariationalLinearEncoder
 from nico2_lib.predictors._nn_models._base import BaseVAE
+
+from ._nn import Decoder, LinearDecoder, VariationalEncoder, VariationalLinearEncoder
 
 
 class LVAE(BaseVAE):
@@ -15,8 +16,8 @@ class LVAE(BaseVAE):
         self,
         input_features: int,
         output_features: int,
-        latent_features: int = 64,
-        lr: float = 1e-3,
+        latent_features: int,
+        lr: float,
     ):
         super().__init__(input_features, output_features, latent_features, lr)
         self.encoder = VariationalLinearEncoder(input_features, latent_features)
@@ -28,11 +29,11 @@ class LEVAE(BaseVAE):
 
     def __init__(
         self,
-        input_features,
-        output_features,
-        latent_features,
-        hidden_features_out=None,
-        lr=1e-4,
+        input_features: int,
+        output_features: int,
+        latent_features: int,
+        hidden_features_out: int,
+        lr: float,
     ):
         super().__init__(input_features, output_features, latent_features, lr)
         self.encoder = VariationalLinearEncoder(input_features, latent_features)
@@ -44,11 +45,11 @@ class LDVAE(BaseVAE):
 
     def __init__(
         self,
-        input_features,
-        output_features,
-        latent_features,
-        hidden_features_in=None,
-        lr=1e-4,
+        input_features: int,
+        output_features: int,
+        latent_features: int,
+        hidden_features_in: int,
+        lr: float,
     ):
         super().__init__(input_features, output_features, latent_features, lr)
         self.encoder = VariationalEncoder(
@@ -62,15 +63,16 @@ class VAE(BaseVAE):
 
     def __init__(
         self,
-        input_features,
-        output_features,
-        latent_features,
-        hidden_features_out=None,
-        hidden_features_in=None,
-        lr=1e-4,
+        input_features: int,
+        output_features: int,
+        latent_features: int,
+        hidden_features_out: int,
+        hidden_features_in: int,
+        lr: float,
     ):
         super().__init__(input_features, output_features, latent_features, lr)
         self.encoder = VariationalEncoder(
             input_features, latent_features, hidden_features_in
         )
         self.decoder = Decoder(latent_features, output_features, hidden_features_out)
+        

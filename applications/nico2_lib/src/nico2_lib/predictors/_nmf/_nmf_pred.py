@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal, Optional, Union
+from typing import Literal, Optional, Sequence, Union
 
 import numpy as np
 from kneed import KneeLocator
@@ -95,3 +95,47 @@ class NmfPredictor:
 
         predicted = W_query @ self.H_predicted
         return predicted
+
+
+@dataclass
+class NmfPredictorN:
+    """NMF-based predictor using ProtocolN (fit on X, predict all fit-time features)."""
+
+    n_components: Optional[Union[int, Literal["auto"]]] = None
+    seed: int = 0
+    solver: Literal["cd", "mu"] = "cd"
+    h_query: Optional[NDArray[number]] = None
+    H_predicted: Optional[NDArray[number]] = None
+    n_shared_features: Optional[int] = None
+
+    def fit(self, X: NDArray[number]) -> "NmfPredictorN":
+        """Fit NMF on X to learn the reference component matrix.
+
+        Args:
+            X: Feature matrix used for fitting, shape (n_samples, n_features_fit).
+
+        Returns:
+            The fitted predictor instance.
+        """
+        _, self.h_reference, _ = non_negative_factorization(
+            X, n_components=self.n_components, solver=self.solver
+        )
+        return self
+
+    def predict(self, X: NDArray[number], indexer: NDArray[np.intp]) -> NDArray[number]:
+        """Predict all fit-time features using X and a feature index map.
+
+        Args:
+            X: Feature matrix for prediction, shape (n_samples, n_features_pred).
+            indexer: Sequence or array of indices, length n_features_fit, where
+                each value points to the corresponding feature column in X.
+
+        Returns:
+            Predicted outputs containing all fit-time features in the original
+            fit order, shape (n_samples, n_features_fit).
+        """
+        h_query = self.h_reference[:, indexer]
+        w_query, _, _ = non_negative_factorization(
+            X=X, H=h_query, init="custom", update_H=False
+        )
+        return w_query @ self.h_reference
