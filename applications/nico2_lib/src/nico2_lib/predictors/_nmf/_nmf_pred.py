@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Optional, Sequence, Union
 
 import numpy as np
@@ -97,15 +97,14 @@ class NmfPredictor:
         return predicted
 
 
-@dataclass
+@dataclass(frozen=True)
 class NmfPredictorN:
     """NMF-based predictor using ProtocolN (fit on X, predict all fit-time features)."""
 
     n_components: Optional[Union[int, Literal["auto"]]] = None
     seed: int = 0
     solver: Literal["cd", "mu"] = "cd"
-    h_query: Optional[NDArray[number]] = None
-    H_predicted: Optional[NDArray[number]] = None
+    h_reference: Optional[NDArray[number]] = None
     n_shared_features: Optional[int] = None
 
     def fit(self, X: NDArray[number]) -> "NmfPredictorN":
@@ -117,10 +116,10 @@ class NmfPredictorN:
         Returns:
             The fitted predictor instance.
         """
-        _, self.h_reference, _ = non_negative_factorization(
+        _, h_reference, _ = non_negative_factorization(
             X, n_components=self.n_components, solver=self.solver
         )
-        return self
+        return replace(self, h_reference=h_reference)
 
     def predict(self, X: NDArray[number], indexer: NDArray[np.intp]) -> NDArray[number]:
         """Predict all fit-time features using X and a feature index map.
@@ -134,8 +133,8 @@ class NmfPredictorN:
             Predicted outputs containing all fit-time features in the original
             fit order, shape (n_samples, n_features_fit).
         """
-        h_query = self.h_reference[:, indexer]
+        assert self.h_reference is not None
         w_query, _, _ = non_negative_factorization(
-            X=X, H=h_query, init="custom", update_H=False
+            X=X, H=self.h_reference[:, indexer], init="custom", update_H=False
         )
         return w_query @ self.h_reference
