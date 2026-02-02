@@ -1,17 +1,22 @@
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, Optional, Tuple, Type
+from typing import Any, Callable, ClassVar, Dict, Optional, Tuple, Type, Union
 
 import lightning as L
 import numpy as np
 import torch
 from numpy import clip, exp, intp, log1p, number
 from numpy.typing import NDArray
-from pandas._libs.tslibs.dtypes import NpyDatetimeUnit
+from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from nico2_lib.predictors._nn_models._models import LDVAE, LEVAE, LVAE, VAE, BaseVAE
 
-from ._nn import Decoder, LinearDecoder, VariationalEncoder, VariationalLinearEncoder
+from ._nn import (
+    LinearDecoder,
+    LinearVariationalEncoder,
+    NonLinearDecoder,
+    NonLinearVariationalEncoder,
+)
 
 
 @dataclass
@@ -203,33 +208,30 @@ class VAEPredictor(BaseVaePredictor):
         }
 
 
-@dataclass(frozen=True)
-class VaePredictorN:
-    latent_features: int
-    hidden_features_out: int
-    hidden_features_in: int
-    lr: float = 1e-4
+EncoderType = Union[NonLinearVariationalEncoder, LinearVariationalEncoder]
+DecoderType = Union[NonLinearDecoder, LinearDecoder]
+
+
+@dataclass(frozen=True, kw_only=True)
+class BaseVaePredictorN:
     counts_transform: Callable[[NDArray[number]], NDArray[number]] = lambda x: log1p(x)
     counts_inverse_transform: Callable[[NDArray[number]], NDArray[number]] = (
         lambda x: exp(clip(x, min=0))
     )
     dataloader_kwargs: Dict[str, Any] = field(default_factory=dict)
     trainer_kwargs: Dict[str, Any] = field(default_factory=dict)
-    encoder_ref: Optional["VariationalEncoder"] = None
-    decoder_ref: Optional["Decoder"] = None
-    encoder_query: Optional["VariationalEncoder"] = None
-    decoder_query: Optional["Decoder"] = None
+    encoder_ref: Optional[EncoderType] = None
+    decoder_ref: Optional[DecoderType] = None
 
-    _default_dataloader_kwargs: Dict[str, Any] = field(
-        default_factory=lambda: {"batch_size": 64, "shuffle": True}
-    )
-    _default_trainer_kwargs: Dict[str, Any] = field(
-        default_factory=lambda: {
-            "max_epochs": 200,
-            "enable_checkpointing": False,
-            "logger": False,
-        }
-    )
+    _default_dataloader_kwargs: ClassVar[Dict[str, Any]] = {
+        "batch_size": 64,
+        "shuffle": True,
+    }
+    _default_trainer_kwargs: ClassVar[Dict[str, Any]] = {
+        "max_epochs": 200,
+        "enable_checkpointing": False,
+        "logger": False,
+    }
 
     @property
     def _merged_dataloader_kwargs(self) -> Dict[str, Any]:
@@ -241,8 +243,8 @@ class VaePredictorN:
 
     def _fit_vae(
         self,
-        encoder: VariationalEncoder,
-        decoder: Decoder,
+        encoder: EncoderType,
+        decoder: DecoderType,
         X: NDArray[number],
         *,
         lr: float,
@@ -257,31 +259,7 @@ class VaePredictorN:
         trainer = L.Trainer(**trainer_kwargs)
         trainer.fit(model, train_dataloaders=loader)
 
-    def _copy_decoder_for_query(
-        self,
-        decoder: Decoder,
-        indexer: NDArray[intp],
-        *,
-        latent_features: int,
-        hidden_features_out: int,
-    ) -> Decoder:
-        decoder_query = Decoder(
-            latent_features=latent_features,
-            out_features=len(indexer),
-            hidden_features=hidden_features_out,
-        )
-        with torch.no_grad():
-            decoder_query.hidden.weight.copy_(decoder.hidden.weight)
-            decoder_query.hidden.bias.copy_(decoder.hidden.bias)
-            decoder_query.mu_out.weight.copy_(
-                decoder.mu_out.weight[torch.from_numpy(indexer)]
-            )
-            decoder_query.mu_out.bias.copy_(
-                decoder.mu_out.bias[torch.from_numpy(indexer)]
-            )
-        return decoder_query
-
-    def _freeze_decoder_query(self, decoder_query: Decoder) -> None:
+    def _freeze_module(self, decoder_query: nn.Module) -> None:
         for param in decoder_query.parameters():
             param.requires_grad = False
 
@@ -289,22 +267,31 @@ class VaePredictorN:
         self,
         X: NDArray[number],
         *,
-        encoder: VariationalEncoder,
-        decoder: Decoder,
+        encoder: EncoderType,
+        decoder: DecoderType,
+        lr: float,
     ) -> NDArray[number]:
-        model = BaseVAE(encoder=encoder, decoder=decoder, lr=self.lr)
+        model = BaseVAE(encoder=encoder, decoder=decoder, lr=lr)
         pred = model.predict_step(torch.from_numpy(X), 0)
         pred = pred.detach().cpu().numpy()
         return pred
 
+
+@dataclass(frozen=True)
+class VaePredictorN(BaseVaePredictorN):
+    latent_features: int
+    hidden_features_out: int
+    hidden_features_in: int
+    lr: float = 1e-4
+
     def fit(self, X: NDArray[number]) -> "VaePredictorN":
         _, n_features = X.shape
-        encoder_ref = VariationalEncoder(
+        encoder_ref = NonLinearVariationalEncoder(
             in_features=n_features,
             latent_features=self.latent_features,
             hidden_features=self.hidden_features_in,
         )
-        decoder_ref = Decoder(
+        decoder_ref = NonLinearDecoder(
             latent_features=self.latent_features,
             out_features=n_features,
             hidden_features=self.hidden_features_out,
@@ -318,25 +305,25 @@ class VaePredictorN:
             dataloader_kwargs=self._merged_dataloader_kwargs,
             trainer_kwargs=self._merged_trainer_kwargs,
         )
-        return replace(self, encoder_ref=encoder_ref, decoder_ref=decoder_ref)
+        return replace(
+            self,
+            encoder_ref=encoder_ref,
+            decoder_ref=decoder_ref,
+        )
 
     def predict(self, X: NDArray[number], indexer: NDArray[intp]) -> NDArray[number]:
         _, n_features = X.shape
         if self.decoder_ref is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
 
-        encoder_query = VariationalEncoder(
+        encoder_query = NonLinearVariationalEncoder(
             in_features=n_features,
             latent_features=self.latent_features,
             hidden_features=self.hidden_features_in,
         )
-        decoder_query = self._copy_decoder_for_query(
-            self.decoder_ref,
-            indexer,
-            latent_features=self.latent_features,
-            hidden_features_out=self.hidden_features_out,
-        )
-        self._freeze_decoder_query(decoder_query)
+
+        decoder_query = self.decoder_ref.return_slice(indexer)
+        self._freeze_module(decoder_query)
         self._fit_vae(
             encoder_query,
             decoder_query,
@@ -348,101 +335,19 @@ class VaePredictorN:
         )
         X = np.asarray(self.counts_transform(X), dtype=np.float32)
         res = self._forward(
-            X,
-            encoder=encoder_query,
-            decoder=self.decoder_ref,
+            X, encoder=encoder_query, decoder=self.decoder_ref, lr=self.lr
         )
         return self.counts_inverse_transform(res)
 
 
 @dataclass(frozen=True)
-class LvaePredictorN:
+class LVaePredictorN(BaseVaePredictorN):
     latent_features: int
     lr: float = 1e-4
-    counts_transform: Callable[[NDArray[number]], NDArray[number]] = lambda x: log1p(x)
-    counts_inverse_transform: Callable[[NDArray[number]], NDArray[number]] = (
-        lambda x: exp(clip(x, min=0))
-    )
-    dataloader_kwargs: Dict[str, Any] = field(default_factory=dict)
-    trainer_kwargs: Dict[str, Any] = field(default_factory=dict)
-    encoder_ref: Optional["VariationalLinearEncoder"] = None
-    decoder_ref: Optional["LinearDecoder"] = None
-    encoder_query: Optional["VariationalLinearEncoder"] = None
-    decoder_query: Optional["LinearDecoder"] = None
 
-    _default_dataloader_kwargs: Dict[str, Any] = field(
-        default_factory=lambda: {"batch_size": 64, "shuffle": True}
-    )
-    _default_trainer_kwargs: Dict[str, Any] = field(
-        default_factory=lambda: {
-            "max_epochs": 200,
-            "enable_checkpointing": False,
-            "logger": False,
-        }
-    )
-
-    @property
-    def _merged_dataloader_kwargs(self) -> Dict[str, Any]:
-        return {**self._default_dataloader_kwargs, **self.dataloader_kwargs}
-
-    @property
-    def _merged_trainer_kwargs(self) -> Dict[str, Any]:
-        return {**self._default_trainer_kwargs, **self.trainer_kwargs}
-
-    def _fit_vae(
-        self,
-        encoder: VariationalLinearEncoder,
-        decoder: LinearDecoder,
-        X: NDArray[number],
-        *,
-        lr: float,
-        counts_transform: Callable[[NDArray[number]], NDArray[number]],
-        dataloader_kwargs: Dict[str, Any],
-        trainer_kwargs: Dict[str, Any],
-    ) -> None:
-        X = np.asarray(counts_transform(X), dtype=np.float32)
-        model = BaseVAE(encoder, decoder, lr=lr)
-        dataset = TensorDataset(torch.from_numpy(X))
-        loader = DataLoader(dataset, **dataloader_kwargs)
-        trainer = L.Trainer(**trainer_kwargs)
-        trainer.fit(model, train_dataloaders=loader)
-
-    def _copy_decoder_for_query(
-        self,
-        decoder: LinearDecoder,
-        indexer: NDArray[intp],
-        *,
-        latent_features: int,
-    ) -> LinearDecoder:
-        decoder_query = LinearDecoder(
-            latent_features=latent_features,
-            out_features=len(indexer),
-        )
-        with torch.no_grad():
-            decoder_query.mu_out.weight.copy_(
-                decoder.mu_out.weight[torch.from_numpy(indexer)]
-            )
-        return decoder_query
-
-    def _freeze_decoder_query(self, decoder_query: LinearDecoder) -> None:
-        for param in decoder_query.parameters():
-            param.requires_grad = False
-
-    def _forward(
-        self,
-        X: NDArray[number],
-        *,
-        encoder: VariationalLinearEncoder,
-        decoder: LinearDecoder,
-    ) -> NDArray[number]:
-        model = BaseVAE(encoder=encoder, decoder=decoder, lr=self.lr)
-        pred = model.predict_step(torch.from_numpy(X), 0)
-        pred = pred.detach().cpu().numpy()
-        return pred
-
-    def fit(self, X: NDArray[number]) -> "LvaePredictorN":
+    def fit(self, X: NDArray[number]) -> "LVaePredictorN":
         _, n_features = X.shape
-        encoder_ref = VariationalLinearEncoder(
+        encoder_ref = LinearVariationalEncoder(
             in_features=n_features,
             latent_features=self.latent_features,
         )
@@ -459,23 +364,23 @@ class LvaePredictorN:
             dataloader_kwargs=self._merged_dataloader_kwargs,
             trainer_kwargs=self._merged_trainer_kwargs,
         )
-        return replace(self, encoder_ref=encoder_ref, decoder_ref=decoder_ref)
+        return replace(
+            self,
+            encoder_ref=encoder_ref,
+            decoder_ref=decoder_ref,
+        )
 
     def predict(self, X: NDArray[number], indexer: NDArray[intp]) -> NDArray[number]:
         _, n_features = X.shape
         if self.decoder_ref is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
 
-        encoder_query = VariationalLinearEncoder(
+        encoder_query = LinearVariationalEncoder(
             in_features=n_features,
             latent_features=self.latent_features,
         )
-        decoder_query = self._copy_decoder_for_query(
-            self.decoder_ref,
-            indexer,
-            latent_features=self.latent_features,
-        )
-        self._freeze_decoder_query(decoder_query)
+        decoder_query = self.decoder_ref.return_slice(indexer)
+        self._freeze_module(decoder_query)
         self._fit_vae(
             encoder_query,
             decoder_query,
@@ -487,8 +392,125 @@ class LvaePredictorN:
         )
         X = np.asarray(self.counts_transform(X), dtype=np.float32)
         res = self._forward(
+            X, encoder=encoder_query, decoder=self.decoder_ref, lr=self.lr
+        )
+        return self.counts_inverse_transform(res)
+
+
+@dataclass(frozen=True)
+class LeVaePredictorN(BaseVaePredictorN):
+    latent_features: int
+    hidden_features_out: int
+    lr: float = 1e-4
+
+    def fit(self, X: NDArray[number]) -> "LeVaePredictorN":
+        _, n_features = X.shape
+        encoder_ref = LinearVariationalEncoder(
+            in_features=n_features,
+            latent_features=self.latent_features,
+        )
+        decoder_ref = NonLinearDecoder(
+            latent_features=self.latent_features,
+            out_features=n_features,
+            hidden_features=self.hidden_features_out,
+        )
+        self._fit_vae(
+            encoder_ref,
+            decoder_ref,
             X,
-            encoder=encoder_query,
-            decoder=self.decoder_ref,
+            lr=self.lr,
+            counts_transform=self.counts_transform,
+            dataloader_kwargs=self._merged_dataloader_kwargs,
+            trainer_kwargs=self._merged_trainer_kwargs,
+        )
+        return replace(
+            self,
+            encoder_ref=encoder_ref,
+            decoder_ref=decoder_ref,
+        )
+
+    def predict(self, X: NDArray[number], indexer: NDArray[intp]) -> NDArray[number]:
+        _, n_features = X.shape
+        if self.decoder_ref is None:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+
+        encoder_query = LinearVariationalEncoder(
+            in_features=n_features,
+            latent_features=self.latent_features,
+        )
+        decoder_query = self.decoder_ref.return_slice(indexer)
+        self._freeze_module(decoder_query)
+        self._fit_vae(
+            encoder_query,
+            decoder_query,
+            X,
+            lr=self.lr,
+            counts_transform=self.counts_transform,
+            dataloader_kwargs=self._merged_dataloader_kwargs,
+            trainer_kwargs=self._merged_trainer_kwargs,
+        )
+        X = np.asarray(self.counts_transform(X), dtype=np.float32)
+        res = self._forward(
+            X, encoder=encoder_query, decoder=self.decoder_ref, lr=self.lr
+        )
+        return self.counts_inverse_transform(res)
+
+
+@dataclass(frozen=True)
+class LdVaePredictorN(BaseVaePredictorN):
+    latent_features: int
+    hidden_features_in: int
+    lr: float = 1e-4
+
+    def fit(self, X: NDArray[number]) -> "LdVaePredictorN":
+        _, n_features = X.shape
+        encoder_ref = NonLinearVariationalEncoder(
+            in_features=n_features,
+            latent_features=self.latent_features,
+            hidden_features=self.hidden_features_in,
+        )
+        decoder_ref = LinearDecoder(
+            latent_features=self.latent_features,
+            out_features=n_features,
+        )
+        self._fit_vae(
+            encoder_ref,
+            decoder_ref,
+            X,
+            lr=self.lr,
+            counts_transform=self.counts_transform,
+            dataloader_kwargs=self._merged_dataloader_kwargs,
+            trainer_kwargs=self._merged_trainer_kwargs,
+        )
+        return replace(
+            self,
+            encoder_ref=encoder_ref,
+            decoder_ref=decoder_ref,
+        )
+
+    def predict(self, X: NDArray[number], indexer: NDArray[intp]) -> NDArray[number]:
+        _, n_features = X.shape
+        if self.decoder_ref is None:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+
+        encoder_query = NonLinearVariationalEncoder(
+            in_features=n_features,
+            latent_features=self.latent_features,
+            hidden_features=self.hidden_features_in,
+        )
+        decoder_query = self.decoder_ref.return_slice(indexer)
+        self._freeze_module(decoder_query)
+        self._fit_vae(
+            encoder_query,
+            decoder_query,
+            X,
+            lr=self.lr,
+            counts_transform=self.counts_transform,
+            dataloader_kwargs=self._merged_dataloader_kwargs,
+            trainer_kwargs=self._merged_trainer_kwargs,
+        )
+        X = np.asarray(self.counts_transform(X), dtype=np.float32)
+        res = self._forward(
+            X, encoder=encoder_query, decoder=self.decoder_ref, lr=self.lr
         )
         return self.counts_inverse_transform(res)

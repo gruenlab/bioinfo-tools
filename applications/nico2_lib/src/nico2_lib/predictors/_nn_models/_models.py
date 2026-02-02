@@ -1,6 +1,6 @@
 from nico2_lib.predictors._nn_models._base import BaseVAE
 
-from ._nn import Decoder, LinearDecoder, VariationalEncoder, VariationalLinearEncoder
+from ._nn import NonLinearDecoder, LinearDecoder, NonLinearVariationalEncoder, LinearVariationalEncoder
 
 
 class LVAE(BaseVAE):
@@ -20,7 +20,7 @@ class LVAE(BaseVAE):
         lr: float,
     ):
         super().__init__(input_features, output_features, latent_features, lr)
-        self.encoder = VariationalLinearEncoder(input_features, latent_features)
+        self.encoder = LinearVariationalEncoder(input_features, latent_features)
         self.decoder = LinearDecoder(latent_features, output_features)
 
 
@@ -36,8 +36,8 @@ class LEVAE(BaseVAE):
         lr: float,
     ):
         super().__init__(input_features, output_features, latent_features, lr)
-        self.encoder = VariationalLinearEncoder(input_features, latent_features)
-        self.decoder = Decoder(latent_features, output_features, hidden_features_out)
+        self.encoder = LinearVariationalEncoder(input_features, latent_features)
+        self.decoder = NonLinearDecoder(latent_features, output_features, hidden_features_out)
 
 
 class LDVAE(BaseVAE):
@@ -52,7 +52,7 @@ class LDVAE(BaseVAE):
         lr: float,
     ):
         super().__init__(input_features, output_features, latent_features, lr)
-        self.encoder = VariationalEncoder(
+        self.encoder = NonLinearVariationalEncoder(
             input_features, latent_features, hidden_features_in
         )
         self.decoder = LinearDecoder(latent_features, output_features)
@@ -71,8 +71,8 @@ class VAE(BaseVAE):
         lr: float,
     ):
         super().__init__(input_features, output_features, latent_features, lr)
-        self.encoder = VariationalEncoder(
+        self.encoder = NonLinearVariationalEncoder(
             input_features, latent_features, hidden_features_in
         )
-        self.decoder = Decoder(latent_features, output_features, hidden_features_out)
+        self.decoder = NonLinearDecoder(latent_features, output_features, hidden_features_out)
         
