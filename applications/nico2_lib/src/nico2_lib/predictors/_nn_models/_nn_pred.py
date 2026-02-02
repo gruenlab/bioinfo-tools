@@ -353,3 +353,142 @@ class VaePredictorN:
             decoder=self.decoder_ref,
         )
         return self.counts_inverse_transform(res)
+
+
+@dataclass(frozen=True)
+class LvaePredictorN:
+    latent_features: int
+    lr: float = 1e-4
+    counts_transform: Callable[[NDArray[number]], NDArray[number]] = lambda x: log1p(x)
+    counts_inverse_transform: Callable[[NDArray[number]], NDArray[number]] = (
+        lambda x: exp(clip(x, min=0))
+    )
+    dataloader_kwargs: Dict[str, Any] = field(default_factory=dict)
+    trainer_kwargs: Dict[str, Any] = field(default_factory=dict)
+    encoder_ref: Optional["VariationalLinearEncoder"] = None
+    decoder_ref: Optional["LinearDecoder"] = None
+    encoder_query: Optional["VariationalLinearEncoder"] = None
+    decoder_query: Optional["LinearDecoder"] = None
+
+    _default_dataloader_kwargs: Dict[str, Any] = field(
+        default_factory=lambda: {"batch_size": 64, "shuffle": True}
+    )
+    _default_trainer_kwargs: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "max_epochs": 200,
+            "enable_checkpointing": False,
+            "logger": False,
+        }
+    )
+
+    @property
+    def _merged_dataloader_kwargs(self) -> Dict[str, Any]:
+        return {**self._default_dataloader_kwargs, **self.dataloader_kwargs}
+
+    @property
+    def _merged_trainer_kwargs(self) -> Dict[str, Any]:
+        return {**self._default_trainer_kwargs, **self.trainer_kwargs}
+
+    def _fit_vae(
+        self,
+        encoder: VariationalLinearEncoder,
+        decoder: LinearDecoder,
+        X: NDArray[number],
+        *,
+        lr: float,
+        counts_transform: Callable[[NDArray[number]], NDArray[number]],
+        dataloader_kwargs: Dict[str, Any],
+        trainer_kwargs: Dict[str, Any],
+    ) -> None:
+        X = np.asarray(counts_transform(X), dtype=np.float32)
+        model = BaseVAE(encoder, decoder, lr=lr)
+        dataset = TensorDataset(torch.from_numpy(X))
+        loader = DataLoader(dataset, **dataloader_kwargs)
+        trainer = L.Trainer(**trainer_kwargs)
+        trainer.fit(model, train_dataloaders=loader)
+
+    def _copy_decoder_for_query(
+        self,
+        decoder: LinearDecoder,
+        indexer: NDArray[intp],
+        *,
+        latent_features: int,
+    ) -> LinearDecoder:
+        decoder_query = LinearDecoder(
+            latent_features=latent_features,
+            out_features=len(indexer),
+        )
+        with torch.no_grad():
+            decoder_query.mu_out.weight.copy_(
+                decoder.mu_out.weight[torch.from_numpy(indexer)]
+            )
+        return decoder_query
+
+    def _freeze_decoder_query(self, decoder_query: LinearDecoder) -> None:
+        for param in decoder_query.parameters():
+            param.requires_grad = False
+
+    def _forward(
+        self,
+        X: NDArray[number],
+        *,
+        encoder: VariationalLinearEncoder,
+        decoder: LinearDecoder,
+    ) -> NDArray[number]:
+        model = BaseVAE(encoder=encoder, decoder=decoder, lr=self.lr)
+        pred = model.predict_step(torch.from_numpy(X), 0)
+        pred = pred.detach().cpu().numpy()
+        return pred
+
+    def fit(self, X: NDArray[number]) -> "LvaePredictorN":
+        _, n_features = X.shape
+        encoder_ref = VariationalLinearEncoder(
+            in_features=n_features,
+            latent_features=self.latent_features,
+        )
+        decoder_ref = LinearDecoder(
+            latent_features=self.latent_features,
+            out_features=n_features,
+        )
+        self._fit_vae(
+            encoder_ref,
+            decoder_ref,
+            X,
+            lr=self.lr,
+            counts_transform=self.counts_transform,
+            dataloader_kwargs=self._merged_dataloader_kwargs,
+            trainer_kwargs=self._merged_trainer_kwargs,
+        )
+        return replace(self, encoder_ref=encoder_ref, decoder_ref=decoder_ref)
+
+    def predict(self, X: NDArray[number], indexer: NDArray[intp]) -> NDArray[number]:
+        _, n_features = X.shape
+        if self.decoder_ref is None:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+
+        encoder_query = VariationalLinearEncoder(
+            in_features=n_features,
+            latent_features=self.latent_features,
+        )
+        decoder_query = self._copy_decoder_for_query(
+            self.decoder_ref,
+            indexer,
+            latent_features=self.latent_features,
+        )
+        self._freeze_decoder_query(decoder_query)
+        self._fit_vae(
+            encoder_query,
+            decoder_query,
+            X,
+            lr=self.lr,
+            counts_transform=self.counts_transform,
+            dataloader_kwargs=self._merged_dataloader_kwargs,
+            trainer_kwargs=self._merged_trainer_kwargs,
+        )
+        X = np.asarray(self.counts_transform(X), dtype=np.float32)
+        res = self._forward(
+            X,
+            encoder=encoder_query,
+            decoder=self.decoder_ref,
+        )
+        return self.counts_inverse_transform(res)
