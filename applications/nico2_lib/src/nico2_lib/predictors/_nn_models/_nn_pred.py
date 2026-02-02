@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
 import lightning as L
@@ -203,7 +203,7 @@ class VAEPredictor(BaseVaePredictor):
         }
 
 
-@dataclass
+@dataclass(frozen=True)
 class VaePredictorN:
     latent_features: int
     hidden_features_out: int
@@ -215,6 +215,10 @@ class VaePredictorN:
     )
     dataloader_kwargs: Dict[str, Any] = field(default_factory=dict)
     trainer_kwargs: Dict[str, Any] = field(default_factory=dict)
+    encoder_ref: Optional["VariationalEncoder"] = None
+    decoder_ref: Optional["Decoder"] = None
+    encoder_query: Optional["VariationalEncoder"] = None
+    decoder_query: Optional["Decoder"] = None
 
     _default_dataloader_kwargs: Dict[str, Any] = field(
         default_factory=lambda: {"batch_size": 64, "shuffle": True}
@@ -299,44 +303,47 @@ class VaePredictorN:
 
     def fit(self, X: NDArray[number]) -> "VaePredictorN":
         _, n_features = X.shape
-        self.encoder_ref = VariationalEncoder(
+        encoder_ref = VariationalEncoder(
             in_features=n_features,
             latent_features=self.latent_features,
             hidden_features=self.hidden_features_in,
         )
-        self.decoder_ref = Decoder(
+        decoder_ref = Decoder(
             latent_features=self.latent_features,
             out_features=n_features,
             hidden_features=self.hidden_features_out,
         )
         self._fit_vae(
-            self.encoder_ref,
-            self.decoder_ref,
+            encoder_ref,
+            decoder_ref,
             X,
             lr=self.lr,
             counts_transform=self.counts_transform,
             dataloader_kwargs=self._merged_dataloader_kwargs,
             trainer_kwargs=self._merged_trainer_kwargs,
         )
-        return self
+        return replace(self, encoder_ref=encoder_ref, decoder_ref=decoder_ref)
 
     def predict(self, X: NDArray[number], indexer: NDArray[intp]) -> NDArray[number]:
         _, n_features = X.shape
-        self.encoder_query = VariationalEncoder(
+        if self.decoder_ref is None:
+            raise RuntimeError("Model not fitted. Call fit() first.")
+        
+        encoder_query = VariationalEncoder(
             in_features=n_features,
             latent_features=self.latent_features,
             hidden_features=self.hidden_features_in,
         )
-        self.decoder_query = self._copy_decoder_for_query(
+        decoder_query = self._copy_decoder_for_query(
             self.decoder_ref,
             indexer,
             latent_features=self.latent_features,
             hidden_features_out=self.hidden_features_out,
         )
-        self._freeze_decoder_query(self.decoder_query)
+        self._freeze_decoder_query(decoder_query)
         self._fit_vae(
-            self.encoder_query,
-            self.decoder_query,
+            encoder_query,
+            decoder_query,
             X,
             lr=self.lr,
             counts_transform=self.counts_transform,
@@ -345,7 +352,7 @@ class VaePredictorN:
         )
         res = self._predict_with_ref_decoder(
             X,
-            encoder_query=self.encoder_query,
+            encoder_query=encoder_query,
             decoder_ref=self.decoder_ref,
             lr=self.lr,
             counts_transform=self.counts_transform,
