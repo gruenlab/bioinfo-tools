@@ -10,4 +10,4 @@ wheels/
 .venv
 data
 .DS_Store
-*test*
+*test.*
