@@ -285,21 +285,17 @@ class VaePredictorN:
         for param in decoder_query.parameters():
             param.requires_grad = False
 
-    def _predict_with_ref_decoder(
+    def _forward(
         self,
         X: NDArray[number],
         *,
-        encoder_query: VariationalEncoder,
-        decoder_ref: Decoder,
-        lr: float,
-        counts_transform: Callable[[NDArray[number]], NDArray[number]],
-        counts_inverse_transform: Callable[[NDArray[number]], NDArray[number]],
+        encoder: VariationalEncoder,
+        decoder: Decoder,
     ) -> NDArray[number]:
-        predictor_model = BaseVAE(encoder=encoder_query, decoder=decoder_ref, lr=lr)
-        X = np.asarray(counts_transform(X), dtype=np.float32)
-        pred = predictor_model.predict_step(torch.from_numpy(X), 0)
+        model = BaseVAE(encoder=encoder, decoder=decoder, lr=self.lr)
+        pred = model.predict_step(torch.from_numpy(X), 0)
         pred = pred.detach().cpu().numpy()
-        return counts_inverse_transform(pred)
+        return pred
 
     def fit(self, X: NDArray[number]) -> "VaePredictorN":
         _, n_features = X.shape
@@ -328,7 +324,7 @@ class VaePredictorN:
         _, n_features = X.shape
         if self.decoder_ref is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
-        
+
         encoder_query = VariationalEncoder(
             in_features=n_features,
             latent_features=self.latent_features,
@@ -350,12 +346,10 @@ class VaePredictorN:
             dataloader_kwargs=self._merged_dataloader_kwargs,
             trainer_kwargs=self._merged_trainer_kwargs,
         )
-        res = self._predict_with_ref_decoder(
+        X = np.asarray(self.counts_transform(X), dtype=np.float32)
+        res = self._forward(
             X,
-            encoder_query=encoder_query,
-            decoder_ref=self.decoder_ref,
-            lr=self.lr,
-            counts_transform=self.counts_transform,
-            counts_inverse_transform=self.counts_inverse_transform,
+            encoder=encoder_query,
+            decoder=self.decoder_ref,
         )
-        return res
+        return self.counts_inverse_transform(res)
