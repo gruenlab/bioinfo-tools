@@ -1,78 +1,97 @@
+from collections.abc import Callable
+
 from nico2_lib.predictors._nn_models._base import BaseVAE
+from nico2_lib.predictors._nn_models._nn import (
+    LinearDecoder,
+    LinearVariationalEncoder,
+    NonLinearDecoder,
+    NonLinearVariationalEncoder,
+)
 
-from ._nn import NonLinearDecoder, LinearDecoder, NonLinearVariationalEncoder, LinearVariationalEncoder
 
+def fully_linear_vae(latent_features: int, lr: float) -> Callable[[int], BaseVAE]:
+    """Return a factory for a fully linear VAE.
 
-class LVAE(BaseVAE):
+    Args:
+        latent_features: Number of latent dimensions for the encoder/decoder.
+        lr: Learning rate for the VAE optimizer.
+
+    Returns:
+        Callable that builds a `BaseVAE` given the input/output feature count.
     """
-    Linear encoder + linear decoder
-    optuna best params per dataset:
-        human_lung: {'latent_features': 16, 'lr': 0.001} # latent features 64 just as good
-        h_embryo_11d: {'latent_features': 128, 'lr': 0.001} # latent_features 64 just as good
 
-    """
-
-    def __init__(
-        self,
-        input_features: int,
-        output_features: int,
-        latent_features: int,
-        lr: float,
-    ):
-        super().__init__(input_features, output_features, latent_features, lr)
-        self.encoder = LinearVariationalEncoder(input_features, latent_features)
-        self.decoder = LinearDecoder(latent_features, output_features)
-
-
-class LEVAE(BaseVAE):
-    """Linear encoder + nonlinear decoder"""
-
-    def __init__(
-        self,
-        input_features: int,
-        output_features: int,
-        latent_features: int,
-        hidden_features_out: int,
-        lr: float,
-    ):
-        super().__init__(input_features, output_features, latent_features, lr)
-        self.encoder = LinearVariationalEncoder(input_features, latent_features)
-        self.decoder = NonLinearDecoder(latent_features, output_features, hidden_features_out)
-
-
-class LDVAE(BaseVAE):
-    """Nonlinear encoder + linear decoder"""
-
-    def __init__(
-        self,
-        input_features: int,
-        output_features: int,
-        latent_features: int,
-        hidden_features_in: int,
-        lr: float,
-    ):
-        super().__init__(input_features, output_features, latent_features, lr)
-        self.encoder = NonLinearVariationalEncoder(
-            input_features, latent_features, hidden_features_in
+    def build(n_features: int) -> BaseVAE:
+        encoder = LinearVariationalEncoder(
+            in_features=n_features,
+            latent_features=latent_features,
         )
-        self.decoder = LinearDecoder(latent_features, output_features)
-
-
-class VAE(BaseVAE):
-    """Nonlinear encoder + nonlinear decoder"""
-
-    def __init__(
-        self,
-        input_features: int,
-        output_features: int,
-        latent_features: int,
-        hidden_features_out: int,
-        hidden_features_in: int,
-        lr: float,
-    ):
-        super().__init__(input_features, output_features, latent_features, lr)
-        self.encoder = NonLinearVariationalEncoder(
-            input_features, latent_features, hidden_features_in
+        decoder = LinearDecoder(
+            latent_features=latent_features,
+            out_features=n_features,
         )
-        self.decoder = NonLinearDecoder(latent_features, output_features, hidden_features_out)
-        
+        return BaseVAE(encoder=encoder, decoder=decoder, lr=lr)
+
+    return build
+
+
+def linearily_encoded_vae(
+    latent_features: int, hidden_features: int, lr: float
+) -> Callable[[int], BaseVAE]:
+    """Return a factory for a linear-encoder / nonlinear-decoder VAE."""
+
+    def build(n_features: int) -> BaseVAE:
+        encoder = LinearVariationalEncoder(
+            in_features=n_features,
+            latent_features=latent_features,
+        )
+        decoder = NonLinearDecoder(
+            latent_features=latent_features,
+            out_features=n_features,
+            hidden_features=hidden_features,
+        )
+        return BaseVAE(encoder=encoder, decoder=decoder, lr=lr)
+
+    return build
+
+
+def linearily_decoded_vae(
+    latent_features: int, hidden_features: int, lr: float
+) -> Callable[[int], BaseVAE]:
+    """Return a factory for a nonlinear-encoder / linear-decoder VAE."""
+
+    def build(n_features: int) -> BaseVAE:
+        encoder = NonLinearVariationalEncoder(
+            in_features=n_features,
+            latent_features=latent_features,
+            hidden_features=hidden_features,
+        )
+        decoder = LinearDecoder(
+            latent_features=latent_features,
+            out_features=n_features,
+        )
+        return BaseVAE(encoder=encoder, decoder=decoder, lr=lr)
+
+    return build
+
+
+def fully_nonlinear_vae(
+    latent_features: int, hidden_features: int, lr: float
+) -> Callable[[int], BaseVAE]:
+    """Return a factory for a fully nonlinear VAE."""
+
+    def build(n_features: int) -> BaseVAE:
+        encoder = NonLinearVariationalEncoder(
+            in_features=n_features,
+            latent_features=latent_features,
+            hidden_features=hidden_features,
+        )
+        decoder = NonLinearDecoder(
+            latent_features=latent_features,
+            out_features=n_features,
+            hidden_features=hidden_features,
+        )
+        return BaseVAE(encoder=encoder, decoder=decoder, lr=lr)
+
+    return build
+    
+

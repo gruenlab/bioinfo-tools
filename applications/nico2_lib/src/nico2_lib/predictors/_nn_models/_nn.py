@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn, relu
@@ -103,3 +103,7 @@ class NonLinearDecoder(nn.Module):
             decoder.mu_out.weight.copy_(self.mu_out.weight[torch.from_numpy(indexer)])
             decoder.mu_out.bias.copy_(self.mu_out.bias[torch.from_numpy(indexer)])
         return decoder
+
+
+Encoder = Union[LinearVariationalEncoder, NonLinearVariationalEncoder]
+Decoder = Union[LinearDecoder, NonLinearDecoder]

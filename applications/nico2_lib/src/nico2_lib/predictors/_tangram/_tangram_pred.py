@@ -1,29 +1,30 @@
 """
 This file contains some functions copied from the original tangram source code. This had to be done to change the behaviour around non expressed genes.
 For the purpose of benchmarking the entire count matrix of shared genes between a query and reference dataset is reconstructed
-However the functions pp_adatas, map_cells_to_space and project genes from the original tangram source code either filter 
+However the functions pp_adatas, map_cells_to_space and project genes from the original tangram source code either filter
 zero count genes or raise an Error when it encounters them. This behaviour was adjusted in the copied functions.
 The concrete changes can be found via ctrl/cmd + f "code adapted"
 """
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import numpy as np
 import pandas as pd
-from tangram import mapping_utils as mu
-from tangram import utils as ut
-from tangram import mapping_optimizer as mo
-from numpy.typing import NDArray
-from numpy import number
-from anndata import AnnData
 import scanpy as sc
+import torch
+from anndata import AnnData
+from numpy import number
+from numpy.typing import NDArray
 from scipy.sparse.csc import csc_matrix
 from scipy.sparse.csr import csr_matrix
-import torch
+from tangram import mapping_optimizer as mo
+from tangram import mapping_utils as mu
+from tangram import utils as ut
 
-def pp_adatas_unfiltered(adata_sc, adata_sp, genes=None, gene_to_lowercase = True):
+
+def pp_adatas_unfiltered(adata_sc, adata_sp, genes=None, gene_to_lowercase=True):
     """
     Pre-process AnnDatas so that they can be mapped. Specifically:
     - Remove genes that all entries are zero
@@ -34,20 +35,20 @@ def pp_adatas_unfiltered(adata_sc, adata_sp, genes=None, gene_to_lowercase = Tru
         adata_sc (AnnData): single cell data
         adata_sp (AnnData): spatial expression data
         genes (List): Optional. List of genes to use. If `None`, all genes are used.
-    
+
     Returns:
-        update adata_sc by creating `uns` `training_genes` `overlap_genes` fields 
+        update adata_sc by creating `uns` `training_genes` `overlap_genes` fields
         update adata_sp by creating `uns` `training_genes` `overlap_genes` fields and creating `obs` `rna_count_based_density` & `uniform_density` field
     """
 
     # remove all-zero-valued genes <- part of the original source code, commented out
-    #sc.pp.filter_genes(adata_sc, min_cells=1) code adapted
-    #sc.pp.filter_genes(adata_sp, min_cells=1) code adapted
+    # sc.pp.filter_genes(adata_sc, min_cells=1) code adapted
+    # sc.pp.filter_genes(adata_sp, min_cells=1) code adapted
 
     if genes is None:
         # Use all genes
         genes = adata_sc.var.index
-               
+
     # put all var index to lower case to align
     if gene_to_lowercase:
         adata_sc.var.index = [g.lower() for g in adata_sc.var.index]
@@ -56,7 +57,6 @@ def pp_adatas_unfiltered(adata_sc, adata_sp, genes=None, gene_to_lowercase = Tru
 
     adata_sc.var_names_make_unique()
     adata_sp.var_names_make_unique()
-    
 
     # Refine `marker_genes` so that they are shared by both adatas
     genes = list(set(genes) & set(adata_sc.var.index) & set(adata_sp.var.index))
@@ -90,10 +90,13 @@ def pp_adatas_unfiltered(adata_sc, adata_sp, genes=None, gene_to_lowercase = Tru
 
     # Calculate rna_count_based density prior as % of rna molecule count
     rna_count_per_spot = np.array(adata_sp.X.sum(axis=1)).squeeze()
-    adata_sp.obs["rna_count_based_density"] = rna_count_per_spot / np.sum(rna_count_per_spot)
+    adata_sp.obs["rna_count_based_density"] = rna_count_per_spot / np.sum(
+        rna_count_per_spot
+    )
     logging.info(
         f"rna count based density prior is calculated and saved in `obs``rna_count_based_density` of the spatial Anndata."
     )
+
 
 def map_cells_to_space(
     adata_sc,
@@ -114,11 +117,11 @@ def map_cells_to_space(
     target_count=None,
     random_state=None,
     verbose=True,
-    density_prior='rna_count_based',
+    density_prior="rna_count_based",
 ):
     """
     Map single cell data (`adata_sc`) on spatial data (`adata_sp`).
-    
+
     Args:
         adata_sc (AnnData): single cell data
         adata_sp (AnnData): gene spatial data
@@ -199,16 +202,22 @@ def map_cells_to_space(
     logging.info("Allocate tensors for mapping.")
     # Allocate tensors (AnnData matrix can be sparse or not)
 
-    if isinstance(adata_sc.X, csc_matrix) or isinstance(adata_sc.X, csr_matrix): # type: ignore
-        S = np.array(adata_sc[:, training_genes].X.toarray(), dtype="float32",) # type: ignore
+    if isinstance(adata_sc.X, csc_matrix) or isinstance(adata_sc.X, csr_matrix):  # type: ignore
+        S = np.array(
+            adata_sc[:, training_genes].X.toarray(),
+            dtype="float32",
+        )  # type: ignore
     elif isinstance(adata_sc.X, np.ndarray):
-        S = np.array(adata_sc[:, training_genes].X.toarray(), dtype="float32",) # type: ignore
+        S = np.array(
+            adata_sc[:, training_genes].X.toarray(),
+            dtype="float32",
+        )  # type: ignore
     else:
         X_type = type(adata_sc.X)
         logging.error("AnnData X has unrecognized type: {}".format(X_type))
         raise NotImplementedError
 
-    if isinstance(adata_sp.X, csc_matrix) or isinstance(adata_sp.X, csr_matrix): # type: ignore
+    if isinstance(adata_sp.X, csc_matrix) or isinstance(adata_sp.X, csr_matrix):  # type: ignore
         G = np.array(adata_sp[:, training_genes].X.toarray(), dtype="float32")
     elif isinstance(adata_sp.X, np.ndarray):
         G = np.array(adata_sp[:, training_genes].X, dtype="float32")
@@ -217,7 +226,7 @@ def map_cells_to_space(
         logging.error("AnnData X has unrecognized type: {}".format(X_type))
         raise NotImplementedError
 
-    #if not S.any(axis=0).all() or not G.any(axis=0).all(): code adapted
+    # if not S.any(axis=0).all() or not G.any(axis=0).all(): code adapted
     #    raise ValueError("Genes with all zero values detected. Run `pp_adatas()`.") code adapted
 
     d_source = None
@@ -272,13 +281,20 @@ def map_cells_to_space(
             )
         )
         mapper = mo.Mapper(
-            S=S, G=G, d=d, device=device, random_state=random_state, **hyperparameters, # type: ignore
+            S=S,
+            G=G,
+            d=d,
+            device=device,
+            random_state=random_state,
+            **hyperparameters,  # type: ignore
         )
 
         # TODO `train` should return the loss function
 
         mapping_matrix, training_history = mapper.train(
-            learning_rate=learning_rate, num_epochs=num_epochs, print_each=print_each, # type: ignore
+            learning_rate=learning_rate,
+            num_epochs=num_epochs,
+            print_each=print_each,  # type: ignore
         )
 
     # constrained mode
@@ -300,11 +316,18 @@ def map_cells_to_space(
         )
 
         mapper = mo.MapperConstrained(
-            S=S, G=G, d=d, device=device, random_state=random_state, **hyperparameters, # type: ignore
+            S=S,
+            G=G,
+            d=d,
+            device=device,
+            random_state=random_state,
+            **hyperparameters,  # type: ignore
         )
 
         mapping_matrix, F_out, training_history = mapper.train(
-            learning_rate=learning_rate, num_epochs=num_epochs, print_each=print_each, # type: ignore
+            learning_rate=learning_rate,
+            num_epochs=num_epochs,
+            print_each=print_each,  # type: ignore
         )
 
     logging.info("Saving results..")
@@ -318,7 +341,7 @@ def map_cells_to_space(
         adata_map.obs["F_out"] = F_out
 
     # Annotate cosine similarity of each training gene
-    G_predicted = adata_map.X.T @ S # type: ignore
+    G_predicted = adata_map.X.T @ S  # type: ignore
     cos_sims = []
     for v1, v2 in zip(G.T, G_predicted.T):
         norm_sq = np.linalg.norm(v1) * np.linalg.norm(v2)
@@ -346,6 +369,7 @@ def map_cells_to_space(
 
     return adata_map
 
+
 def project_genes_unfiltered(adata_map, adata_sc, cluster_label=None, scale=True):
     """
     Transfer gene expression from the single cell onto space.
@@ -367,7 +391,7 @@ def project_genes_unfiltered(adata_map, adata_sc, cluster_label=None, scale=True
     adata_sc.var_names_make_unique()
 
     # remove all-zero-valued genes
-    #sc.pp.filter_genes(adata_sc, min_cells=1) code adapted
+    # sc.pp.filter_genes(adata_sc, min_cells=1) code adapted
 
     if cluster_label:
         adata_sc = mu.adata_to_cluster_expression(adata_sc, cluster_label, scale=scale)
@@ -375,7 +399,7 @@ def project_genes_unfiltered(adata_map, adata_sc, cluster_label=None, scale=True
     if not adata_map.obs.index.equals(adata_sc.obs.index):
         raise ValueError("The two AnnDatas need to have same `obs` index.")
     if hasattr(adata_sc.X, "toarray"):
-        adata_sc.X = adata_sc.X.toarray() # type: ignore
+        adata_sc.X = adata_sc.X.toarray()  # type: ignore
     X_space = adata_map.X.T @ adata_sc.X
     adata_ge = sc.AnnData(
         X=X_space, obs=adata_map.var, var=adata_sc.var, uns=adata_sc.uns
@@ -385,50 +409,36 @@ def project_genes_unfiltered(adata_map, adata_sc, cluster_label=None, scale=True
     return adata_ge
 
 
-@dataclass
-class TangramPredictor:
+@dataclass(frozen=True)
+class TangramPredictorN:
+    """Tangram predictor using ProtocolN (fit on X, predict all fit-time features)."""
+
     verbose: bool = False
-
     adata_reference: Optional[AnnData] = None
-    n_shared_features: Optional[int] = None
 
-    def fit(self, X: NDArray[number], y: NDArray[number]) -> "TangramPredictor":
-        """
-        Fits the Tangram predictor on the reference matrix.
+    def fit(self, X: NDArray[number]) -> "TangramPredictorN":
+        """Fits the Tangram predictor on the reference matrix X only."""
+        reference_matrix = np.asarray(X)
+        return replace(self, adata_reference=AnnData(reference_matrix))
 
-        Parameters
-        ----------
-        X : ndarray
-            Shared features (or full reference if y is None).
-        y : ndarray, optional
-            Predicted features. If provided, concatenates X and y.
-        """
-        reference_matrix = np.concatenate([X, y], axis=1)
-        self.n_shared_features = X.shape[1]
-        self.adata_reference = AnnData(reference_matrix)
-        return self
+    def predict(self, X: NDArray[number], indexer: NDArray[np.intp]) -> NDArray[number]:
+        """Predicts all fit-time features for the query matrix X."""
 
-    def predict(self, X: NDArray[number]) -> NDArray[number]:
-        """
-        Predicts the missing / non-shared features for the query matrix X.
-        """
-        if self.adata_reference is None or self.n_shared_features is None:
-            raise RuntimeError("Model not fitted. Call fit() first.")
+        assert self.adata_reference
 
-        adata_query = AnnData(X)
         adata_reference = self.adata_reference.copy()
+        X_query = X[:, indexer]
+        adata_query = AnnData(X_query)
+        adata_query.var_names = list(adata_reference.var_names)
 
         pp_adatas_unfiltered(adata_reference, adata_query)
 
         ad_map = map_cells_to_space(
             adata_sc=adata_reference,
             adata_sp=adata_query,
-            verbose=self.verbose
+            verbose=self.verbose,
         )
 
         ad_ge = project_genes_unfiltered(ad_map, adata_reference)
-        assert isinstance(ad_ge.X, np.ndarray)
 
-        predicted = ad_ge.X[:, self.n_shared_features:]
-
-        return predicted
+        return ad_ge.X, ad_map.X
