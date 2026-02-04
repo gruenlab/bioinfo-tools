@@ -15,6 +15,7 @@ class LinearVariationalEncoder(nn.Module):
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         mu = self.fc_mu(x)
         logvar = self.fc_logvar(x)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         if self.training:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
@@ -42,6 +43,7 @@ class NonLinearVariationalEncoder(nn.Module):
         h = relu(self.hidden(x))
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         if self.training:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)

@@ -1,7 +1,6 @@
 from typing import Any, Dict, List, Tuple
 
 import lightning as L
-from nico2_lib.predictors._nn_models._nn import Decoder, Encoder
 import numpy as np
 import torch
 from numpy import number
@@ -9,13 +8,15 @@ from numpy.typing import NDArray
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
+from nico2_lib.predictors._nn_models._nn import Decoder, Encoder
+
 
 def vae_loss_function(
     target: torch.Tensor, pred: torch.Tensor, mu_z: torch.Tensor, logvar_z: torch.Tensor
 ) -> torch.Tensor:
     """MSE reconstruction + KL divergence."""
-    recon_loss = F.mse_loss(pred, target, reduction="sum")
-    kl_loss = -0.5 * torch.sum(1 + logvar_z - mu_z.pow(2) - logvar_z.exp())
+    recon_loss = F.mse_loss(pred, target, reduction="mean")
+    kl_loss = -0.5 * torch.mean(1 + logvar_z - mu_z.pow(2) - logvar_z.exp())
     return recon_loss + kl_loss
 
 
@@ -63,7 +64,8 @@ class BaseVAE(L.LightningModule):
         self, batch: torch.Tensor, batch_idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return model outputs transformed back to raw count space."""
-        z, mu_x, _, _ = self.forward(batch)
+        _, z, _  = self.encoder(batch)
+        mu_x = self.decoder(z)
         return z, mu_x
 
     def configure_optimizers(self) -> torch.optim.Optimizer:

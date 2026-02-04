@@ -27,6 +27,7 @@ class VaePredictor:
         "max_epochs": 200,
         "enable_checkpointing": False,
         "logger": False,
+        "gradient_clip_val": 1.0,
     }
 
     @property
