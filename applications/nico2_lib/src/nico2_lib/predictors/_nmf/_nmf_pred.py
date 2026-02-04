@@ -8,7 +8,7 @@ from sklearn.decomposition import non_negative_factorization
 
 
 @dataclass(frozen=True)
-class NmfPredictorN:
+class NmfPredictor:
     """NMF-based predictor using ProtocolN (fit on X, predict all fit-time features)."""
 
     n_components: Optional[Union[int, Literal["auto"]]] = None
@@ -18,7 +18,7 @@ class NmfPredictorN:
     n_shared_features: Optional[int] = None
     ref_embedding: Optional[NDArray[number]] = None
 
-    def fit(self, X: NDArray[number]) -> "NmfPredictorN":
+    def fit(self, X: NDArray[number]) -> "NmfPredictor":
         """Fit NMF on X to learn the reference component matrix.
 
         Args:

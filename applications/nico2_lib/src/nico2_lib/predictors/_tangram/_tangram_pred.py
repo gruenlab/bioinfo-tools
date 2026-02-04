@@ -410,13 +410,13 @@ def project_genes_unfiltered(adata_map, adata_sc, cluster_label=None, scale=True
 
 
 @dataclass(frozen=True)
-class TangramPredictorN:
+class TangramPredictor:
     """Tangram predictor using ProtocolN (fit on X, predict all fit-time features)."""
 
     verbose: bool = False
     adata_reference: Optional[AnnData] = None
 
-    def fit(self, X: NDArray[number]) -> "TangramPredictorN":
+    def fit(self, X: NDArray[number]) -> "TangramPredictor":
         """Fits the Tangram predictor on the reference matrix X only."""
         reference_matrix = np.asarray(X)
         return replace(self, adata_reference=AnnData(reference_matrix))

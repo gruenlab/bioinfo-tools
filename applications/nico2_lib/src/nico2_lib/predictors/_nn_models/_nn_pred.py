@@ -13,7 +13,7 @@ VaeConstructor = Callable[[int], BaseVAE]
 
 
 @dataclass(frozen=True, kw_only=True)
-class VaePredictorN:
+class VaePredictor:
     model_constructor: VaeConstructor
     dataloader_kwargs: Dict[str, Any] = field(default_factory=dict)
     trainer_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -53,7 +53,7 @@ class VaePredictorN:
         embedding, prediction = model.predict_step(torch.from_numpy(X), 0)
         return embedding.detach().cpu().numpy(), prediction.detach().cpu().numpy()
 
-    def fit(self, X: NDArray[number]) -> "VaePredictorN":
+    def fit(self, X: NDArray[number]) -> "VaePredictor":
         _, n_features = X.shape
         model_ref = self.model_constructor(n_features)
         model_ref.fit_vae(
