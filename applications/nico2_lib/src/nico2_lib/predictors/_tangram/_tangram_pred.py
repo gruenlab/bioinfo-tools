@@ -15,13 +15,13 @@ import pandas as pd
 import scanpy as sc
 import torch
 from anndata import AnnData
-from numpy import number
-from numpy.typing import NDArray
 from scipy.sparse.csc import csc_matrix
 from scipy.sparse.csr import csr_matrix
 from tangram import mapping_optimizer as mo
 from tangram import mapping_utils as mu
 from tangram import utils as ut
+
+from nico2_lib.typing import IndexArray, NumericArray
 
 
 def pp_adatas_unfiltered(adata_sc, adata_sp, genes=None, gene_to_lowercase=True):
@@ -85,7 +85,7 @@ def pp_adatas_unfiltered(adata_sc, adata_sp, genes=None, gene_to_lowercase=True)
     # Calculate uniform density prior as 1/number_of_spots
     adata_sp.obs["uniform_density"] = np.ones(adata_sp.X.shape[0]) / adata_sp.X.shape[0]
     logging.info(
-        f"uniform based density prior is calculated and saved in `obs``uniform_density` of the spatial Anndata."
+        "uniform based density prior is calculated and saved in `obs``uniform_density` of the spatial Anndata."
     )
 
     # Calculate rna_count_based density prior as % of rna molecule count
@@ -94,7 +94,7 @@ def pp_adatas_unfiltered(adata_sc, adata_sp, genes=None, gene_to_lowercase=True)
         rna_count_per_spot
     )
     logging.info(
-        f"rna count based density prior is calculated and saved in `obs``rna_count_based_density` of the spatial Anndata."
+        "rna count based density prior is calculated and saved in `obs``rna_count_based_density` of the spatial Anndata."
     )
 
 
@@ -416,29 +416,29 @@ class TangramPredictor:
     verbose: bool = False
     adata_reference: Optional[AnnData] = None
 
-    def fit(self, X: NDArray[number]) -> "TangramPredictor":
+    def fit(self, X: NumericArray) -> "TangramPredictor":
         """Fits the Tangram predictor on the reference matrix X only."""
         reference_matrix = np.asarray(X)
         return replace(self, adata_reference=AnnData(reference_matrix))
 
-    def predict(self, X: NDArray[number], indexer: NDArray[np.intp]) -> NDArray[number]:
+    def predict(
+        self, X: NumericArray, indexer: IndexArray
+    ) -> tuple[NumericArray, NumericArray]:
         """Predicts all fit-time features for the query matrix X."""
 
         assert self.adata_reference
 
-        adata_reference = self.adata_reference.copy()
-        X_query = X[:, indexer]
-        adata_query = AnnData(X_query)
-        adata_query.var_names = list(adata_reference.var_names)
+        adata_query = AnnData(X)
+        adata_query.var_names = list(self.adata_reference[:, indexer].var_names)
 
-        pp_adatas_unfiltered(adata_reference, adata_query)
+        pp_adatas_unfiltered(self.adata_reference, adata_query)
 
         ad_map = map_cells_to_space(
-            adata_sc=adata_reference,
+            adata_sc=self.adata_reference,
             adata_sp=adata_query,
             verbose=self.verbose,
         )
 
-        ad_ge = project_genes_unfiltered(ad_map, adata_reference)
+        ad_ge = project_genes_unfiltered(ad_map, self.adata_reference)
 
         return ad_ge.X, ad_map.X

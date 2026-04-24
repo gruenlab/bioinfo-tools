@@ -1,3 +1,4 @@
+from nico2_lib.typing import NumericArray, IndexArray
 from dataclasses import dataclass
 from typing import Optional
 
@@ -8,11 +9,7 @@ import scanpy as sc
 import sklearn as sk
 import torch
 from anndata.typing import AnnData
-from numpy import intp, number
-from numpy.typing import NDArray
-from scvi import REGISTRY_KEYS
 from torch.distributions import NegativeBinomial
-
 from nico2_lib.predictors._scvi._scvi import SCVI
 
 
@@ -21,7 +18,7 @@ class ScviPredictor:
     n_factors: Optional[int] = None
     adata_reference: Optional[AnnData] = None
 
-    def fit(self, X: NDArray[number]) -> "ScviPredictor":
+    def fit(self, X: NumericArray) -> "ScviPredictor":
         adata_reference = ad.AnnData(X)
         if self.n_factors is None:
             adata_reference, n_factors = _find_components(adata_reference)
@@ -30,8 +27,8 @@ class ScviPredictor:
         return ScviPredictor(n_factors=n_factors, adata_reference=adata_reference)
 
     def predict(
-        self, X: NDArray[number], indexer: NDArray[intp]
-    ) -> tuple[NDArray[number], NDArray[number]]:
+        self, X: NumericArray, indexer: IndexArray
+    ) -> tuple[NumericArray, NumericArray]:
         if self.adata_reference is None or self.n_factors is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
 
@@ -71,10 +68,10 @@ class ScviPredictor:
 
 
 def _validate_indexer(
-    indexer: NDArray[intp],
+    indexer: IndexArray,
     n_reference_features: int,
     n_query_features: int,
-) -> NDArray[intp]:
+) -> IndexArray:
     indexer_arr = np.asarray(indexer)
 
     if indexer_arr.ndim != 1:
@@ -99,7 +96,7 @@ def _validate_indexer(
     return indexer_int
 
 
-def _train_scvi(adata: AnnData, indexer: NDArray[intp], n_factors: int) -> SCVI:
+def _train_scvi(adata: AnnData, indexer: IndexArray, n_factors: int) -> SCVI:
     SCVI.setup_anndata(adata)
     model = SCVI(
         adata=adata,
@@ -113,7 +110,7 @@ def _train_scvi(adata: AnnData, indexer: NDArray[intp], n_factors: int) -> SCVI:
 
 
 def _build_query_anndata(
-    X: NDArray[number], indexer: NDArray[intp], adata_reference: AnnData
+    X: NumericArray, indexer: IndexArray, adata_reference: AnnData
 ) -> AnnData:
     n_query_cells = X.shape[0]
     n_reference_features = adata_reference.n_vars
@@ -127,7 +124,7 @@ def _build_query_anndata(
 @torch.inference_mode()
 def _get_reconstruction_and_embeddings(
     model: SCVI, adata_query: AnnData
-) -> tuple[NDArray[number], NDArray[number]]:
+) -> tuple[NumericArray, NumericArray]:
     if model.is_trained_ is False:
         raise RuntimeError("Please train the model first.")
 
@@ -157,7 +154,7 @@ def _get_reconstruction_and_embeddings(
     return reconstructed_counts, latent_embeddings
 
 
-def _to_dense_array(X: object) -> NDArray[number]:
+def _to_dense_array(X: object) -> NumericArray:
     toarray = getattr(X, "toarray", None)
     if callable(toarray):
         return np.asarray(toarray())
@@ -165,7 +162,7 @@ def _to_dense_array(X: object) -> NDArray[number]:
 
 
 def _get_global_scaling_factor(
-    adata_reference: AnnData, indexer: NDArray[intp]
+    adata_reference: AnnData, indexer: IndexArray
 ) -> float:
     reference_counts = _to_dense_array(adata_reference.X).astype(np.float64, copy=False)
     reference_total = reference_counts.sum(axis=1)

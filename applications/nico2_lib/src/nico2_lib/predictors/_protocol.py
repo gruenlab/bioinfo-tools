@@ -1,8 +1,6 @@
 from typing import Protocol
 
-from numpy import intp, number
-from numpy.typing import NDArray
-
+from nico2_lib.typing import IndexArray, NumericArray
 
 
 class PredictorProtocol(Protocol):
@@ -14,10 +12,9 @@ class PredictorProtocol(Protocol):
       feature indices; return all fit-time features in their original order.
     """
 
-    def fit(
-        self,
-        X: NDArray[number],
-    ) -> "PredictorProtocol":
+    embedding_size: int | None
+
+    def fit(self, X: NumericArray) -> "PredictorProtocol":
         """Fits a model using X only.
 
         Args:
@@ -30,10 +27,8 @@ class PredictorProtocol(Protocol):
         ...
 
     def predict(
-        self,
-        X: NDArray[number],
-        indexer: NDArray[intp],
-    ) -> NDArray[number]:
+        self, X: NumericArray, indexer: IndexArray
+    ) -> tuple[NumericArray, NumericArray]:
         """Predicts all fit-time features using X and a feature index map.
 
         Args:

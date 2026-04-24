@@ -1,24 +1,54 @@
 from dataclasses import dataclass, replace
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal
 
 import numpy as np
-from numpy import number
-from numpy.typing import NDArray
+import pandas as pd
+import scanpy as sc
+from sklearn.cluster import KMeans
 from sklearn.decomposition import non_negative_factorization
+
+from nico2_lib.typing import IndexArray, NumericArray
+
+
+def init_nmf_matrices(
+    X: NumericArray,
+    n_components: int,
+) -> tuple[NumericArray, NumericArray]:
+    labels = KMeans(n_clusters=n_components).fit_predict(X)
+    adata = sc.AnnData(X)
+    adata.obs["kmeans"] = labels
+    sc.tl.rank_genes_groups(adata, "kmeans")
+    groups_scores = adata.uns["rank_genes_groups"]["scores"]
+    groups_names = adata.uns["rank_genes_groups"]["names"]
+    gsa = np.array(groups_scores.tolist())
+    gna = np.array(groups_names.tolist())
+    df = adata.X.transpose()  # type: ignore
+    w_init = np.zeros((df.shape[0], n_components), dtype=float)
+    for i in range(n_components):
+        gsd = pd.DataFrame(gsa.transpose(), columns=gna[:, i])
+        w_init[:, i] = gsd[adata.var.index].iloc[i]
+        w_init[w_init[:, i] < 0, i] = 0.1
+        w_init[:, i] = w_init[:, i] + 0.01
+    h_init = np.zeros((n_components, df.shape[1]), dtype=float)
+    for i in range(n_components):
+        h_init[i, adata.obs["kmeans"].astype("float") == i] = 1
+        h_init[i, adata.obs["kmeans"].astype("float") != i] = 0.1
+    return w_init, h_init
 
 
 @dataclass(frozen=True)
 class NmfPredictor:
     """NMF-based predictor using ProtocolN (fit on X, predict all fit-time features)."""
 
-    n_components: Optional[Union[int, Literal["auto"]]] = None
+    embedding_size: int | None = None
+    pre_init: bool = False
     seed: int = 0
     solver: Literal["cd", "mu"] = "cd"
-    h_reference: Optional[NDArray[number]] = None
-    n_shared_features: Optional[int] = None
-    ref_embedding: Optional[NDArray[number]] = None
+    h_reference: NumericArray | None = None
+    n_shared_features: int | None = None
+    ref_embedding: NumericArray | None = None
 
-    def fit(self, X: NDArray[number]) -> "NmfPredictor":
+    def fit(self, X: NumericArray) -> "NmfPredictor":
         """Fit NMF on X to learn the reference component matrix.
 
         Args:
@@ -27,14 +57,21 @@ class NmfPredictor:
         Returns:
             The fitted predictor instance.
         """
+        w_init, h_init = (
+            init_nmf_matrices(X, self.n_components) if self.pre_init else (None, None)
+        )
         w_reference, h_reference, _ = non_negative_factorization(
-            X, n_components=self.n_components, solver=self.solver
+            X,
+            n_components=self.n_components,  # type: ignore
+            solver=self.solver,
+            W=w_init,
+            H=h_init,
         )
         return replace(self, h_reference=h_reference, ref_embedding=w_reference)
 
     def predict(
-        self, X: NDArray[number], indexer: NDArray[np.intp]
-    ) -> Tuple[NDArray[number], NDArray[number]]:
+        self, X: NumericArray, indexer: IndexArray
+    ) -> tuple[NumericArray, NumericArray]:
         """Predict all fit-time features using X and a feature index map.
 
         Args:
