@@ -1,4 +1,4 @@
-from nico2_lib.typing import NumericArray, IndexArray
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Optional
 
@@ -10,57 +10,66 @@ import sklearn as sk
 import torch
 from anndata.typing import AnnData
 from torch.distributions import NegativeBinomial
+
 from nico2_lib.predictors._scvi._scvi import SCVI
+from nico2_lib.predictors.utils import preprocess_counts
+from nico2_lib.typing import IndexArray, NumericArray
 
 
 @dataclass(frozen=True)
 class ScviPredictor:
     n_factors: Optional[int] = None
-    adata_reference: Optional[AnnData] = None
+    preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
+    _adata_reference: Optional[AnnData] = None
 
-    def fit(self, X: NumericArray) -> "ScviPredictor":
-        adata_reference = ad.AnnData(X)
+    def fit(self, x: NumericArray) -> "ScviPredictor":
+        x = preprocess_counts(x, pipeline=self.preprocessing_steps)
+        adata_reference = ad.AnnData(x)
         if self.n_factors is None:
             adata_reference, n_factors = _find_components(adata_reference)
         else:
             n_factors = self.n_factors
-        return ScviPredictor(n_factors=n_factors, adata_reference=adata_reference)
+        return ScviPredictor(n_factors=n_factors, _adata_reference=adata_reference)
 
     def predict(
-        self, X: NumericArray, indexer: IndexArray
+        self, x: NumericArray, indexer: IndexArray
     ) -> tuple[NumericArray, NumericArray]:
-        if self.adata_reference is None or self.n_factors is None:
+        if self._adata_reference is None or self.n_factors is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
 
-        X_arr = np.asarray(X, dtype=np.float32)
-        if X_arr.ndim != 2:
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim != 2:
             raise ValueError("X must be a 2D array.")
+        x = preprocess_counts(x, pipeline=self.preprocessing_steps)
 
-        n_query_features = X_arr.shape[1]
-        n_reference_features = self.adata_reference.n_vars
+        n_query_features = x.shape[1]
+        n_reference_features = self._adata_reference.n_vars
         indexer_valid = _validate_indexer(
             indexer=indexer,
             n_reference_features=n_reference_features,
             n_query_features=n_query_features,
         )
 
-        adata_reference = self.adata_reference.copy()
         model = _train_scvi(
-            adata=adata_reference,
+            adata=self._adata_reference.copy(),
             indexer=indexer_valid,
             n_factors=self.n_factors,
         )
 
         adata_query = _build_query_anndata(
-            X=X_arr,
+            X=x,
             indexer=indexer_valid,
-            adata_reference=self.adata_reference,
+            adata_reference=self._adata_reference,
         )
         predicted_counts, embeddings = _get_reconstruction_and_embeddings(
-            model=model, adata_query=adata_query
+            model=model,
+            adata_query=adata_query,
         )
 
-        scale = _get_global_scaling_factor(self.adata_reference, indexer_valid)
+        scale = _get_global_scaling_factor(
+            self._adata_reference,
+            indexer_valid,
+        )
         predicted_counts = predicted_counts * scale
         predicted_counts = np.nan_to_num(predicted_counts)
         embeddings = np.nan_to_num(embeddings)
@@ -161,9 +170,7 @@ def _to_dense_array(X: object) -> NumericArray:
     return np.asarray(X)
 
 
-def _get_global_scaling_factor(
-    adata_reference: AnnData, indexer: IndexArray
-) -> float:
+def _get_global_scaling_factor(adata_reference: AnnData, indexer: IndexArray) -> float:
     reference_counts = _to_dense_array(adata_reference.X).astype(np.float64, copy=False)
     reference_total = reference_counts.sum(axis=1)
     reference_subset = reference_counts[:, indexer].sum(axis=1)

@@ -7,6 +7,7 @@ The concrete changes can be found via ctrl/cmd + f "code adapted"
 """
 
 import logging
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -21,6 +22,7 @@ from tangram import mapping_optimizer as mo
 from tangram import mapping_utils as mu
 from tangram import utils as ut
 
+from nico2_lib.predictors.utils import preprocess_counts
 from nico2_lib.typing import IndexArray, NumericArray
 
 
@@ -413,22 +415,25 @@ def project_genes_unfiltered(adata_map, adata_sc, cluster_label=None, scale=True
 class TangramPredictor:
     """Tangram predictor using ProtocolN (fit on X, predict all fit-time features)."""
 
+    preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
     verbose: bool = False
     adata_reference: Optional[AnnData] = None
 
-    def fit(self, X: NumericArray) -> "TangramPredictor":
+    def fit(self, x: NumericArray) -> "TangramPredictor":
         """Fits the Tangram predictor on the reference matrix X only."""
-        reference_matrix = np.asarray(X)
-        return replace(self, adata_reference=AnnData(reference_matrix))
+        x = np.asarray(x)
+        x = preprocess_counts(x, pipeline=self.preprocessing_steps)
+        return replace(self, adata_reference=AnnData(x))
 
     def predict(
-        self, X: NumericArray, indexer: IndexArray
+        self, x: NumericArray, indexer: IndexArray
     ) -> tuple[NumericArray, NumericArray]:
         """Predicts all fit-time features for the query matrix X."""
 
         assert self.adata_reference
 
-        adata_query = AnnData(X)
+        x = preprocess_counts(x, pipeline=self.preprocessing_steps)
+        adata_query = AnnData(x)
         adata_query.var_names = list(self.adata_reference[:, indexer].var_names)
 
         pp_adatas_unfiltered(self.adata_reference, adata_query)

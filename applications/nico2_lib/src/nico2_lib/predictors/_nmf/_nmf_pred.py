@@ -1,3 +1,4 @@
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -7,6 +8,7 @@ import scanpy as sc
 from sklearn.cluster import KMeans
 from sklearn.decomposition import non_negative_factorization
 
+from nico2_lib.predictors.utils import preprocess_counts
 from nico2_lib.typing import IndexArray, NumericArray
 
 
@@ -41,6 +43,7 @@ class NmfPredictor:
     """NMF-based predictor using ProtocolN (fit on X, predict all fit-time features)."""
 
     embedding_size: int | None = None
+    preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
     pre_init: bool = False
     seed: int = 0
     solver: Literal["cd", "mu"] = "cd"
@@ -48,7 +51,7 @@ class NmfPredictor:
     n_shared_features: int | None = None
     ref_embedding: NumericArray | None = None
 
-    def fit(self, X: NumericArray) -> "NmfPredictor":
+    def fit(self, x: NumericArray) -> "NmfPredictor":
         """Fit NMF on X to learn the reference component matrix.
 
         Args:
@@ -57,11 +60,13 @@ class NmfPredictor:
         Returns:
             The fitted predictor instance.
         """
+        x = preprocess_counts(x, self.preprocessing_steps)
+
         w_init, h_init = (
-            init_nmf_matrices(X, self.n_components) if self.pre_init else (None, None)
+            init_nmf_matrices(x, self.n_components) if self.pre_init else (None, None)
         )
         w_reference, h_reference, _ = non_negative_factorization(
-            X,
+            x,
             n_components=self.n_components,  # type: ignore
             solver=self.solver,
             W=w_init,
@@ -70,7 +75,7 @@ class NmfPredictor:
         return replace(self, h_reference=h_reference, ref_embedding=w_reference)
 
     def predict(
-        self, X: NumericArray, indexer: IndexArray
+        self, x: NumericArray, indexer: IndexArray
     ) -> tuple[NumericArray, NumericArray]:
         """Predict all fit-time features using X and a feature index map.
 
@@ -84,7 +89,12 @@ class NmfPredictor:
             fit order, shape (n_samples, n_features_fit).
         """
         assert self.h_reference is not None
+        x = (
+            apply_pipeline(x, pipeline=self.preprocessing_steps)
+            if self.preprocessing_steps is not None
+            else x
+        )
         w_query, _, _ = non_negative_factorization(
-            X=X, H=self.h_reference[:, indexer], init="custom", update_H=False
+            X=x, H=self.h_reference[:, indexer], init="custom", update_H=False
         )
         return w_query, w_query @ self.h_reference

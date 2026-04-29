@@ -1,3 +1,4 @@
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
 from nico2_lib.typing import IndexArray, NumericArray
@@ -13,8 +14,9 @@ class PredictorProtocol(Protocol):
     """
 
     embedding_size: int | None
+    preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
 
-    def fit(self, X: NumericArray) -> "PredictorProtocol":
+    def fit(self, x: NumericArray) -> "PredictorProtocol":
         """Fits a model using X only.
 
         Args:
@@ -27,7 +29,7 @@ class PredictorProtocol(Protocol):
         ...
 
     def predict(
-        self, X: NumericArray, indexer: IndexArray
+        self, x: NumericArray, indexer: IndexArray
     ) -> tuple[NumericArray, NumericArray]:
         """Predicts all fit-time features using X and a feature index map.
 

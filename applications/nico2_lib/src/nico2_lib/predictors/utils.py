@@ -1,4 +1,6 @@
-from typing import Callable
+from collections.abc import Sequence
+from functools import reduce
+from typing import Callable, TypeVar
 
 import numpy as np
 from anndata.typing import AnnData
@@ -7,6 +9,30 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 
 from nico2_lib.typing import NumericArray
+
+T = TypeVar("T")
+U = TypeVar("U")
+V = TypeVar("V")
+
+
+def compose(
+    func_1: Callable[[T], U],
+    func_2: Callable[[U], V],
+) -> Callable[[T], V]:
+    return lambda x: func_2(func_1(x))
+
+
+def compose_pipeline(
+    pipeline: Sequence[Callable[[T], T]],
+) -> Callable[[T], T]:
+    return reduce(compose, pipeline)
+
+
+def preprocess_counts(
+    counts: NumericArray,
+    pipeline: Sequence[Callable[[NumericArray], NumericArray]] | None,
+) -> NumericArray:
+    return compose_pipeline(pipeline)(counts) if pipeline is not None else counts
 
 
 def find_components(
