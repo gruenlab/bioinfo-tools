@@ -63,11 +63,11 @@ class NmfPredictor:
         x = preprocess_counts(x, self.preprocessing_steps)
 
         w_init, h_init = (
-            init_nmf_matrices(x, self.n_components) if self.pre_init else (None, None)
+            init_nmf_matrices(x, self.embedding_size) if self.pre_init else (None, None)
         )
         w_reference, h_reference, _ = non_negative_factorization(
             x,
-            n_components=self.n_components,  # type: ignore
+            n_components=self.embedding_size,
             solver=self.solver,
             W=w_init,
             H=h_init,
