@@ -17,7 +17,7 @@ def slice_mofaflex_weights(
     sliced_weights: dict[str, pd.DataFrame] = {}
     for key, df in weights.items():
         sliced_weights[key] = df.iloc[indexer]
-    return weights
+    return sliced_weights
 
 
 def slice_mofaflex_model(
