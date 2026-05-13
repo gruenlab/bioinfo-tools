@@ -45,11 +45,12 @@ import argparse
 import gc
 import glob
 import importlib.util
+import json
 import logging
 import os
 import sys
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -296,6 +297,21 @@ class EvaluationConfig:
     run_global_gene_filling: str = ""
     run_deg_based_filling: str = ""
     preferred_strategy: str = ""
+
+
+def _save_evaluation_parameters(config: EvaluationConfig) -> None:
+    """Save all evaluation parameter settings to a JSON file in the output directory."""
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    params = asdict(config)
+    params["timestamp"] = datetime.now().isoformat()
+    params["script"] = "run_evaluation.py"
+
+    param_file = config.output_dir / "evaluation_parameters.json"
+    with open(param_file, "w") as f:
+        json.dump(params, f, indent=2, sort_keys=True, default=str)
+
+    logger.info("Parameter settings saved to: %s", param_file)
 
 
 # ---------------------------------------------------------------------------
@@ -2142,6 +2158,8 @@ def main() -> None:
             logger.info("  %-35s = %s", field_name, value)
         logger.info("[DRY RUN] Exiting without execution.")
         return
+
+    _save_evaluation_parameters(config)
 
     logger.info("=" * 80)
     logger.info("EVALUATION PIPELINE  |  mode=%s", config.mode)
