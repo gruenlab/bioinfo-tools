@@ -1,6 +1,6 @@
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -41,14 +41,14 @@ def init_nmf_matrices(
 class NmfPredictor:
     """NMF-based predictor using ProtocolN (fit on X, predict all fit-time features)."""
 
-    init = None
-    random_state = None
-    beta_loss = None
-    solver = None
-    max_iter = None
-    alpha_W = None
-    alpha_H = None
-    l1_ratio = None
+    init: Any = None
+    random_state: Any = None
+    beta_loss: Any = None
+    solver: Any = None
+    max_iter: Any = None
+    alpha_W: Any = None
+    alpha_H: Any = None
+    l1_ratio: Any = None
     embedding_size: int | None = None
     preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
     pre_init: bool = False
