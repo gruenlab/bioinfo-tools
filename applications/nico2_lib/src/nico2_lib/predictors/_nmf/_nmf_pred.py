@@ -5,11 +5,10 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import scanpy as sc
-from sklearn.cluster import KMeans
-from sklearn.decomposition import non_negative_factorization
-
 from nico2_lib.predictors.utils import preprocess_counts
 from nico2_lib.typing import IndexArray, NumericArray
+from sklearn.cluster import KMeans
+from sklearn.decomposition import non_negative_factorization
 
 
 def init_nmf_matrices(
@@ -42,6 +41,14 @@ def init_nmf_matrices(
 class NmfPredictor:
     """NMF-based predictor using ProtocolN (fit on X, predict all fit-time features)."""
 
+    init = None
+    random_state = None
+    beta_loss = None
+    solver = None
+    max_iter = None
+    alpha_W = None
+    alpha_H = None
+    l1_ratio = None
     embedding_size: int | None = None
     preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
     pre_init: bool = False
@@ -69,6 +76,13 @@ class NmfPredictor:
             x,
             n_components=self.embedding_size,
             solver=self.solver,
+            init=self.init,
+            random_state=self.seed,
+            beta_loss=self.beta_loss,
+            max_iter=self.max_iter,
+            alpha_W=self.alpha_W,
+            alpha_H=self.alpha_H,
+            l1_ratio=self.l1_ratio,
             W=w_init,
             H=h_init,
         )
