@@ -24,6 +24,7 @@ import pandas as pd
 import scipy.sparse
 from anndata import AnnData
 from sklearn.decomposition import NMF, PCA
+from nico2_lib as n2l
 
 # Import utility functions for data validation
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -39,7 +40,7 @@ except ImportError as e:
     logger = logging.getLogger(__name__)
     logger.warning(f"Could not import from Utility-module: {e}. Using fallback functions.")
     UTILITY_AVAILABLE = False
-    
+
     # Fallback: Provide simple validation functions
     def is_anndata_raw(adata):
         """Check if data appears to be raw counts."""
@@ -52,7 +53,7 @@ except ImportError as e:
                 sample = sample.toarray()
             return np.allclose(sample, np.round(sample), atol=1e-6)
         return False
-    
+
     def is_anndata_raw_layer(adata, layer_name):
         """Check if layer appears to be raw counts."""
         if layer_name not in adata.layers:
@@ -159,7 +160,7 @@ def compute_nmf_global(
         ValueError: If counts not available or not raw
     """
     logger.info(f"Computing global NMF with {n_components} components...")
-    
+
     # Check for cached model
     if cache_dir:
         cache_file = os.path.join(cache_dir, 'nmf_models', 'global_nmf.pkl')
@@ -202,7 +203,7 @@ def compute_nmf_global(
     index = ind[0].astype(int)
     n2 = len(index)
     counts_dense = counts_dense[:, index]
-    
+
     # Skip if too few features
     if n2 < n_components:
         logging.warning(f"Data has too few features with non-zero standard deviation ({n2}), skipping NMF...")
@@ -335,7 +336,7 @@ def compute_nmf_global(
         'filtered_gene_indices': index,
         **model_meta,
     }
-    
+
     # Cache model if directory provided
     if cache_dir:
         model_dir = os.path.join(cache_dir, 'nmf_models')
@@ -375,7 +376,7 @@ def compute_pca_global(
         ValueError: If data not normalized
     """
     logger.info(f"Computing global PCA with {n_components} components...")
-    
+
     # Check for cached model
     if cache_dir:
         cache_file = os.path.join(cache_dir, 'pca_models', 'global_pca.pkl')
@@ -409,7 +410,7 @@ def compute_pca_global(
         index=adata.var_names,
         columns=[f"PC_{i+1}" for i in range(n_components)]
     )
-    
+
     # Store model data
     model_data = {
         'components': pca.components_,
@@ -420,7 +421,7 @@ def compute_pca_global(
         'gene_names': adata.var_names.tolist(),
         'n_components': n_components,
     }
-    
+
     # Cache model if directory provided
     if cache_dir:
         model_dir = os.path.join(cache_dir, 'pca_models')
@@ -482,7 +483,7 @@ def compute_nmf_per_celltype(
         ValueError: If counts not available or celltype column missing
     """
     logger.info(f"Computing per-celltype NMF (n_components={n_components})...")
-    
+
     # Check for cached model
     if cache_dir:
         cache_file = os.path.join(cache_dir, 'nmf_models', 'per_celltype_nmf.pkl')
@@ -510,17 +511,17 @@ def compute_nmf_per_celltype(
     # Always compare to raw counts for metrics
     # Test if adata.X is raw, else use counts layer
     is_log = not is_anndata_raw(adata)
-    
+
     if is_log:
         # Data is normalized/log-transformed, need to find raw counts
         logger.info("adata.X appears to be normalized/log-transformed, searching for raw counts...")
-        
+
         if 'counts' in adata.layers:
             counts_is_raw = is_anndata_raw_layer(adata, 'counts')
             if not counts_is_raw:
                 logger.error("Counts layer is not raw data! Cannot compute metrics correctly.")
                 raise ValueError("Counts layer does not contain raw data")
-            
+
             counts_full = adata.layers['counts']
             gene_names = adata.var_names
             logger.info("Using adata.layers['counts'] for per-celltype NMF (verified as raw counts)")
@@ -746,7 +747,7 @@ def compute_nmf_per_celltype(
                 )
 
     logger.info(f"✓ Per-celltype NMF complete: {len(celltype_loadings)} celltypes")
-    
+
     # Cache models if directory provided
     if cache_dir:
         model_dir = os.path.join(cache_dir, 'nmf_models')
@@ -764,7 +765,7 @@ def compute_nmf_per_celltype(
             logger.info(f"✓ Saved per-celltype NMF models to {cache_file}")
         except Exception as e:
             logger.warning(f"Failed to save model cache: {e}")
-    
+
     return celltype_loadings, celltype_explained_variance
 
 
@@ -794,9 +795,8 @@ def _compute_single_celltype_nmf(
         return None
 
     counts_dense = counts_dense[:, nonzero_index]
-
-    nmf = NMF(
-        n_components=n_components,
+    nmf_predictor = n2l.emb.NmfPredictor(
+        embedding_size=n_components,
         init=nmf_params['init'],
         random_state=random_state,
         beta_loss=nmf_params['beta_loss'],
@@ -806,8 +806,13 @@ def _compute_single_celltype_nmf(
         alpha_H=0.0,
         l1_ratio=0,
     )
-    W = nmf.fit_transform(counts_dense)
-    H = nmf.components_
+    nmf_predictor = nmf_predictor.fit(counts_dense)
+    W = nmf_predictor.ref_embedding
+    H = nmf_predictor.h_reference
+
+
+
+
 
     factor_names = [f"{celltype}_NMF_{i+1}" for i in range(n_components)]
     factor_r2 = {}
@@ -875,7 +880,7 @@ def compute_pca_per_celltype(
               Format: {celltype: pd.Series({pc_name: r2, ...})}
     """
     logger.info(f"Computing per-celltype PCA (n_components={n_components})...")
-    
+
     # Check for cached model
     if cache_dir:
         cache_file = os.path.join(cache_dir, 'pca_models', 'per_celltype_pca.pkl')
@@ -968,7 +973,7 @@ def compute_pca_per_celltype(
                 )
 
     logger.info(f"✓ Per-celltype PCA complete: {len(celltype_loadings)} celltypes")
-    
+
     # Cache models if directory provided
     if cache_dir:
         model_dir = os.path.join(cache_dir, 'pca_models')
@@ -986,7 +991,7 @@ def compute_pca_per_celltype(
             logger.info(f"✓ Saved per-celltype PCA models to {cache_file}")
         except Exception as e:
             logger.warning(f"Failed to save model cache: {e}")
-    
+
     return celltype_loadings, celltype_explained_variance
 
 
@@ -1109,7 +1114,7 @@ def select_genes_from_nmf(
         ...     analysis_type='global',
         ...     nmf_loadings_global=loadings_df
         ... )
-        
+
         >>> # Per-celltype NMF
         >>> builder = select_genes_from_nmf(
         ...     adata,
@@ -1400,12 +1405,12 @@ def _select_genes_global(
     mean_expr_per_ct: Optional[dict] = None,
 ) -> None:
     """Select genes from global dimension reduction with 3-phase pool-based architecture.
-    
+
     **NEW POOL-BASED ARCHITECTURE:**
     - Phase 1: Create large pool (pool_size_per_factor genes/factor, e.g., 200)
     - Phase 2: Resolve cross-factor duplicates using absolute loading
     - Phase 3: Select final probeset_size genes from duplicate-free pool
-    
+
     This provides consistency with per-celltype mode and enables larger pools for replacement.
 
     Args:
@@ -1497,10 +1502,10 @@ def _select_genes_global(
     if results_dir:
         import pickle
         from pathlib import Path
-        
+
         pool_cache_dir = Path(results_dir) / "nmf_pools"
         pool_cache_dir.mkdir(parents=True, exist_ok=True)
-        
+
         pool_cache_file = pool_cache_dir / "global_pool.pkl"
         with open(pool_cache_file, "wb") as f:
             pickle.dump(genes_per_factor, f)
@@ -1523,21 +1528,21 @@ def _select_genes_global(
             if gene not in gene_weights:
                 gene_weights[gene] = {}
             gene_weights[gene][factor] = float(abs_loadings_df.at[gene, factor])
-    
+
     # Resolve duplicates (assign each gene to best factor by loading)
     logger.info("Resolving duplicates using absolute loading...")
-    
+
     # For global mode, use a simpler approach: assign each gene to its highest-loading factor
     pool_genes = []
     pool_factor_assignments = {}
-    
+
     for gene, factor_loadings in gene_weights.items():
         best_factor = max(factor_loadings.items(), key=lambda x: x[1])[0]
         pool_factor_assignments[gene] = best_factor
         pool_genes.append(gene)
-    
+
     duplicates_resolved = pool_stats["total_selections"] - len(pool_genes)
-    
+
     logger.info(
         f"✓ Phase 2 complete: {len(pool_genes)} unique genes "
         f"({duplicates_resolved} duplicates resolved)"
@@ -1547,9 +1552,9 @@ def _select_genes_global(
     if results_dir:
         import pandas as pd
         from pathlib import Path
-        
+
         pool_cache_dir = Path(results_dir) / "nmf_pools"
-        
+
         # Save as CSV for easy inspection
         pool_df = pd.DataFrame({
             "gene": pool_genes,
@@ -1558,7 +1563,7 @@ def _select_genes_global(
         resolved_pool_file = pool_cache_dir / "global_resolved_pool.csv"
         pool_df.to_csv(resolved_pool_file, index=False)
         logger.info(f"✓ Resolved pool saved to: {resolved_pool_file}")
-        
+
         # Save duplicate resolution statistics
         import json
         stats_file = pool_cache_dir / "global_resolution_stats.json"
@@ -1584,7 +1589,7 @@ def _select_genes_global(
     import math
     genes_per_factor_final = probeset_size / n_components
     genes_per_factor_final_rounded = math.ceil(genes_per_factor_final)
-    
+
     logger.info(
         f"Final allocation: {genes_per_factor_final:.2f} genes/factor "
         f"(rounded UP to {genes_per_factor_final_rounded})"
@@ -1747,12 +1752,12 @@ def _select_genes_per_celltype(
     mean_expr_per_ct: Optional[dict] = None,
 ) -> None:
     """Select genes from per-celltype dimension reduction with 3-phase pool-based architecture.
-    
+
     **NEW POOL-BASED ARCHITECTURE:**
     - Phase 1: Create large pool (pool_size_per_celltype genes/celltype, e.g., 200)
     - Phase 2: Resolve cross-celltype duplicates using R²×loading contribution
     - Phase 3: Select final probeset_size genes from duplicate-free pool
-    
+
     This eliminates the gap-filling problem where cross-celltype duplicates were lost.
 
     Args:
@@ -1862,10 +1867,10 @@ def _select_genes_per_celltype(
     if results_dir:
         import pickle
         from pathlib import Path
-        
+
         pool_cache_dir = Path(results_dir) / "nmf_pools"
         pool_cache_dir.mkdir(parents=True, exist_ok=True)
-        
+
         pool_cache_file = pool_cache_dir / "per_celltype_pool.pkl"
         with open(pool_cache_file, "wb") as f:
             pickle.dump(celltype_genes_per_factor, f)
@@ -1888,7 +1893,7 @@ def _select_genes_per_celltype(
         raise ValueError("celltype_explained_variance required for pool-based selection")
 
     celltype_factor_explained_variance = celltype_explained_variance
-    
+
     # Log variance statistics
     for celltype, factor_r2_series in celltype_factor_explained_variance.items():
         logger.debug(
@@ -1916,9 +1921,9 @@ def _select_genes_per_celltype(
     if results_dir:
         import pandas as pd
         from pathlib import Path
-        
+
         pool_cache_dir = Path(results_dir) / "nmf_pools"
-        
+
         # Save as CSV for easy inspection
         pool_df = pd.DataFrame({
             "gene": pool_genes,
@@ -1928,7 +1933,7 @@ def _select_genes_per_celltype(
         resolved_pool_file = pool_cache_dir / "resolved_pool.csv"
         pool_df.to_csv(resolved_pool_file, index=False)
         logger.info(f"✓ Resolved pool saved to: {resolved_pool_file}")
-        
+
         # Save duplicate resolution statistics
         import json
         stats_file = pool_cache_dir / "resolution_stats.json"
@@ -1957,7 +1962,7 @@ def _select_genes_per_celltype(
     genes_per_celltype_final = probeset_size / len(celltype_loadings)
     genes_per_combo_final = genes_per_celltype_final / n_components
     genes_per_combo_final_rounded = math.ceil(genes_per_combo_final)  # ROUND UP
-    
+
     logger.info(
         f"Final allocation: {genes_per_celltype_final:.2f} genes/celltype, "
         f"{genes_per_combo_final:.2f} genes/combo (rounded UP to {genes_per_combo_final_rounded})"
