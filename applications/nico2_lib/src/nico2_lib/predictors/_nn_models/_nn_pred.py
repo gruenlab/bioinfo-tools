@@ -86,9 +86,9 @@ class VaePredictor:
             dataloader_kwargs=self._merged_dataloader_kwargs,
             trainer_kwargs=self._merged_trainer_kwargs,
         )
-        X_prepared = np.asarray(X, dtype=np.float32)
+        x_prepared = np.asarray(X, dtype=np.float32)
         embedding, res = self._forward(
-            X_prepared,
+            x_prepared,
             encoder=model_query.encoder,
             decoder=self.model_ref.decoder,
             lr=model_query.lr,

@@ -93,6 +93,7 @@ def _find_components(
     opt: bool = True,
     nf_init: int = 3,
     seed: int = 42,
+    pca_components: int = 25
 ) -> tuple[int, np.ndarray]:
     """Choose a component count and KMeans labels from ``adata.obsm["X_pca"]``.
 
@@ -115,7 +116,11 @@ def _find_components(
         tuple[int, np.ndarray]: ``(nf, labels)`` where ``labels`` is a string
         array of shape ``(n_samples,)``.
     """
-    embedding = adata.obsm["X_pca"]
+    try:
+        embedding = adata.obsm["X_pca"]
+    except KeyError:
+        embedding = sk_decomposition.PCA(n_components=pca_components).fit_transform(adata.X)
+    
     n_samples, _ = embedding.shape
     if n_samples < 1:
         return 1, np.array([], dtype=str)

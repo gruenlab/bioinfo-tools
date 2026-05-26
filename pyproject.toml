@@ -9,4 +9,5 @@ dependencies = []
 [tool.uv.workspace]
 members = [
     "applications/nico2_lib",
+    "applications/probedesigner",
 ]

@@ -5,7 +5,6 @@ import anndata as ad
 import mofaflex
 import pandas as pd
 from mofaflex import priors
-
 from nico2_lib.predictors.utils import preprocess_counts
 from nico2_lib.typing import IndexArray, NumericArray
 
@@ -56,7 +55,7 @@ class MofaFlexPredictor:
         )
         model.fit(  # type: ignore
             ad.AnnData(X=x),
-            save_path=False,
+            save_path=None,
         )
 
         return replace(self, _model=model)
@@ -74,8 +73,13 @@ class MofaFlexPredictor:
         )
         model_query.fit(
             ad.AnnData(X=x),
-            save_path=False,
+            save_path=None,
         )
         h_reference: NumericArray = self._model.get_weights()["view_1"].values.T
         w_query: NumericArray = model_query.get_factors()["group_1"].values
         return w_query, w_query @ h_reference
+
+    @property
+    def feature_embeddings(self) -> NumericArray | None:
+        assert self._model is not None, "Model not fitted"
+        return self._model.get_weights()["view_1"].values.T

@@ -7,33 +7,34 @@ import pandas as pd
 import scanpy as sc
 from nico2_lib.predictors.utils import preprocess_counts
 from nico2_lib.typing import IndexArray, NumericArray
+from numpy.random import RandomState
 from sklearn.cluster import KMeans
-from sklearn.decomposition import non_negative_factorization
+from sklearn.decomposition import NMF, non_negative_factorization
 
 
 def init_nmf_matrices(
     X: NumericArray,
     n_components: int,
 ) -> tuple[NumericArray, NumericArray]:
+    n_obs, n_vars = X.shape
     labels = KMeans(n_clusters=n_components).fit_predict(X)
     adata = sc.AnnData(X)
-    adata.obs["kmeans"] = labels
+    adata.obs["kmeans"] = pd.Series(labels).astype(str).astype("category").values
     sc.tl.rank_genes_groups(adata, "kmeans")
     groups_scores = adata.uns["rank_genes_groups"]["scores"]
-    groups_names = adata.uns["rank_genes_groups"]["names"]
-    gsa = np.array(groups_scores.tolist())
-    gna = np.array(groups_names.tolist())
-    df = adata.X.transpose()  # type: ignore
-    w_init = np.zeros((df.shape[0], n_components), dtype=float)
+
+    h_init = np.zeros((n_components, n_vars), dtype=float)
     for i in range(n_components):
-        gsd = pd.DataFrame(gsa.transpose(), columns=gna[:, i])
-        w_init[:, i] = gsd[adata.var.index].iloc[i]
-        w_init[w_init[:, i] < 0, i] = 0.1
-        w_init[:, i] = w_init[:, i] + 0.01
-    h_init = np.zeros((n_components, df.shape[1]), dtype=float)
+        scores = groups_scores[str(i)]
+        h_init[i, :] = scores
+    h_init[h_init < 0] = 0.1
+    h_init += 0.01
+    w_init = np.zeros((n_obs, n_components), dtype=float)
     for i in range(n_components):
-        h_init[i, adata.obs["kmeans"].astype("float") == i] = 1
-        h_init[i, adata.obs["kmeans"].astype("float") != i] = 0.1
+        mask = labels == i
+        w_init[mask, i] = 1.0
+        w_init[~mask, i] = 0.1
+
     return w_init, h_init
 
 
@@ -41,6 +42,7 @@ def init_nmf_matrices(
 class NmfPredictor:
     """NMF-based predictor using ProtocolN (fit on X, predict all fit-time features)."""
 
+<<<<<<< HEAD
     init = None
     random_state = None
     beta_loss = None
@@ -49,44 +51,53 @@ class NmfPredictor:
     alpha_W = None
     alpha_H = None
     l1_ratio = None
+=======
+>>>>>>> a56f35b (temp commit for main)
     embedding_size: int | None = None
+    init: Literal["random", "nndsvd", "nndsvda", "nndsvdar", "custom"] | None = None
+    random_state: int | RandomState | None = None
+    max_iter: int = 200
+    alpha_W: float = 0.0
+    alpha_H: float | Literal["same"] = "same"
+    l1_ratio: float = 0.0
     preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
     pre_init: bool = False
-    seed: int = 0
     solver: Literal["cd", "mu"] = "cd"
     h_reference: NumericArray | None = None
     n_shared_features: int | None = None
     ref_embedding: NumericArray | None = None
 
     def fit(self, x: NumericArray) -> "NmfPredictor":
-        """Fit NMF on X to learn the reference component matrix.
-
-        Args:
-            X: Feature matrix used for fitting, shape (n_samples, n_features_fit).
-
-        Returns:
-            The fitted predictor instance.
-        """
         x = preprocess_counts(x, self.preprocessing_steps)
+        w_init, h_init = (None, None)
+        if self.pre_init and self.embedding_size is not None:
+            w_init, h_init = init_nmf_matrices(x, self.embedding_size)
 
-        w_init, h_init = (
-            init_nmf_matrices(x, self.embedding_size) if self.pre_init else (None, None)
-        )
-        w_reference, h_reference, _ = non_negative_factorization(
-            x,
-            n_components=self.embedding_size,
+        model = NMF(
+            n_components=self.embedding_size or 3,
+            init="custom" if w_init is not None else "nndsvd",
             solver=self.solver,
-            init=self.init,
-            random_state=self.seed,
-            beta_loss=self.beta_loss,
             max_iter=self.max_iter,
-            alpha_W=self.alpha_W,
-            alpha_H=self.alpha_H,
-            l1_ratio=self.l1_ratio,
-            W=w_init,
-            H=h_init,
+            random_state=self.random_state,
+            beta_loss="frobenius",
         )
-        return replace(self, h_reference=h_reference, ref_embedding=w_reference)
+
+        if w_init is not None and h_init is not None:
+            w_reference = model.fit_transform(
+                x,
+                W=w_init,
+                H=h_init,
+            )
+        else:
+            w_reference = model.fit_transform(x)
+
+        h_reference = model.components_
+
+        return replace(
+            self,
+            h_reference=h_reference,
+            ref_embedding=w_reference,
+        )
 
     def predict(
         self, x: NumericArray, indexer: IndexArray
@@ -103,12 +114,23 @@ class NmfPredictor:
             fit order, shape (n_samples, n_features_fit).
         """
         assert self.h_reference is not None
-        x = (
-            apply_pipeline(x, pipeline=self.preprocessing_steps)
-            if self.preprocessing_steps is not None
-            else x
-        )
+        if self.preprocessing_steps is not None:
+            for step in self.preprocessing_steps:
+                x = step(x)
         w_query, _, _ = non_negative_factorization(
-            X=x, H=self.h_reference[:, indexer], init="custom", update_H=False
+            X=x,
+            H=self.h_reference[:, indexer],
+            init="custom",
+            update_H=False,
+            solver=self.solver,
+            beta_loss="frobenius",
         )
         return w_query, w_query @ self.h_reference
+
+    @property
+    def feature_embedding(self) -> NumericArray | None:
+        """Returns the feature embedding matrix."""
+        assert self.h_reference is not None, (
+            "Embedding not available; fit must be called first."
+        )
+        return self.h_reference

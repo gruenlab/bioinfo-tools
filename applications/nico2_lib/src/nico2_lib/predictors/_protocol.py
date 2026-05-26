@@ -45,3 +45,8 @@ class PredictorProtocol(Protocol):
             fit order, shape (n_samples, n_features_fit).
         """
         ...
+
+    @property
+    def feature_embedding(self) -> NumericArray | None:
+        """Returns the feature embedding matrix if available."""
+        ...

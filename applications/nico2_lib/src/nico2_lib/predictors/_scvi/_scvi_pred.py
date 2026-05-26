@@ -9,11 +9,10 @@ import scanpy as sc
 import sklearn as sk
 import torch
 from anndata.typing import AnnData
-from torch.distributions import NegativeBinomial
-
 from nico2_lib.predictors._scvi._scvi import SCVI
 from nico2_lib.predictors.utils import preprocess_counts
 from nico2_lib.typing import IndexArray, NumericArray
+from torch.distributions import NegativeBinomial
 
 
 @dataclass(frozen=True)
@@ -74,6 +73,10 @@ class ScviPredictor:
         predicted_counts = np.nan_to_num(predicted_counts)
         embeddings = np.nan_to_num(embeddings)
         return embeddings, predicted_counts
+
+    @property
+    def feature_embedding(self) -> NumericArray | None:
+        return None
 
 
 def _validate_indexer(
