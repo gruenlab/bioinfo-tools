@@ -23,17 +23,56 @@ def init_nmf_matrices(
     sc.tl.rank_genes_groups(adata, "kmeans")
     groups_scores = adata.uns["rank_genes_groups"]["scores"]
 
-    h_init = np.zeros((n_components, n_vars), dtype=float)
+    h_init = np.zeros((n_components, n_vars), dtype=np.float64)
     for i in range(n_components):
         scores = groups_scores[str(i)]
         h_init[i, :] = scores
     h_init[h_init < 0] = 0.1
     h_init += 0.01
-    w_init = np.zeros((n_obs, n_components), dtype=float)
+    w_init = np.zeros((n_obs, n_components), dtype=np.float64)
     for i in range(n_components):
         mask = labels == i
         w_init[mask, i] = 1.0
         w_init[~mask, i] = 0.1
+
+    return w_init, h_init
+
+
+def robust_init_nmf_matrices(X, n_components: int) -> tuple[np.ndarray, np.ndarray]:
+    n_obs, n_vars = X.shape
+
+    kmeans = KMeans(n_clusters=n_components, n_init="auto", random_state=42)
+    labels = kmeans.fit_predict(X)
+
+    counts = pd.Series(labels).value_counts()
+    if counts.min() < 2:
+        h_init = np.full((n_components, n_vars), 0.1)
+        for i in range(n_components):
+            mask = labels == i
+            if mask.any():
+                # Use the mean profile of the cluster if possible
+                h_init[i, :] = np.array(X[mask].mean(axis=0)).flatten()
+    else:
+        adata = sc.AnnData(X.astype(np.float64))
+        adata.obs["kmeans"] = pd.Series(labels).astype(str).astype("category").values
+
+        try:
+            sc.tl.rank_genes_groups(adata, "kmeans", method="t-test")
+            h_init = np.zeros((n_components, n_vars))
+            for i in range(n_components):
+                scores_df = sc.get.rank_genes_groups_df(adata, group=str(i))
+                scores_df = scores_df.set_index("names").reindex(adata.var_names)
+                h_init[i, :] = scores_df["scores"].values
+        except Exception:
+            h_init = np.random.rand(n_components, n_vars) * 0.1
+
+    h_init = np.nan_to_num(h_init, nan=0.1)
+    h_init[h_init < 0] = 0.1
+    h_init += 0.01
+
+    w_init = np.full((n_obs, n_components), 0.1)
+    for i in range(n_components):
+        w_init[labels == i, i] = 1.0
 
     return w_init, h_init
 
@@ -60,7 +99,7 @@ class NmfPredictor:
         x = preprocess_counts(x, self.preprocessing_steps)
         w_init, h_init = (None, None)
         if self.pre_init and self.embedding_size is not None:
-            w_init, h_init = init_nmf_matrices(x, self.embedding_size)
+            w_init, h_init = robust_init_nmf_matrices(x, self.embedding_size)
 
         model = NMF(
             n_components=self.embedding_size or 3,
