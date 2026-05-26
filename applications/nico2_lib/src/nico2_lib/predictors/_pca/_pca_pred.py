@@ -44,7 +44,7 @@ class PcaPredictor:
         return cell_embeddings, pca.inverse_transform(cell_embeddings)
 
     @property
-    def feature_embeddings(self) -> NumericArray | None:
+    def feature_embedding(self) -> NumericArray | None:
         assert self._feature_embeddings is not None, (
             "fit must be called before accessing feature_embeddings"
         )
