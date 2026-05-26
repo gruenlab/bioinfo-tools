@@ -42,17 +42,6 @@ def init_nmf_matrices(
 class NmfPredictor:
     """NMF-based predictor using ProtocolN (fit on X, predict all fit-time features)."""
 
-<<<<<<< HEAD
-    init = None
-    random_state = None
-    beta_loss = None
-    solver = None
-    max_iter = None
-    alpha_W = None
-    alpha_H = None
-    l1_ratio = None
-=======
->>>>>>> a56f35b (temp commit for main)
     embedding_size: int | None = None
     init: Literal["random", "nndsvd", "nndsvda", "nndsvdar", "custom"] | None = None
     random_state: int | RandomState | None = None
