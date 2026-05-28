@@ -29,7 +29,6 @@ from ._factor_aware import (
 from ._filtering import (
     apply_xenium_filter_to_genelist,
     select_top_n_from_filtered_list,
-    apply_odt_filter_with_replacement,
     apply_blacklist_filter,
 )
 from ._deg_selection import (
@@ -62,7 +61,6 @@ __all__ = [
     # Filtering functions
     'apply_xenium_filter_to_genelist',
     'select_top_n_from_filtered_list',
-    'apply_odt_filter_with_replacement',
     'apply_blacklist_filter',
     
     # DEG selection

@@ -2,7 +2,7 @@ import shutil
 from typing import Optional
 import pandas as pd
 import anndata as ad  # type: ignore
-from anndata.typing import AnnData  # type: ignore
+from anndata import AnnData  # type: ignore
 import scanpy as sc
 from nico2_lib.datasets._utils import (
     github_url_to_raw,

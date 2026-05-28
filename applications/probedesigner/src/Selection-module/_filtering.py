@@ -4,7 +4,7 @@ Separated filtering functions for gene selection pipeline.
 This module provides modular, composable filtering functions:
 - Xenium expression filter (celltype-aware or global)
 - Top-N selection from filtered lists
-- ODT designability filter with factor/source-aware replacement
+- Blacklist filter for unwanted gene patterns
 
 Each function operates independently and can be applied in sequence
 or customized based on pipeline needs.
@@ -28,11 +28,8 @@ from _constants import (
     COL_COMPONENT,
     COL_GENE_SOURCE,
     COL_PASSED_XENIUM,
-    COL_PASSED_ODT,
     DEFAULT_MIN_XENIUM_EXPRESSION,
     DEFAULT_MAX_XENIUM_EXPRESSION,
-    MIN_ODT_PROBES_THRESHOLD,
-    MAX_ODT_FILTER_ITERATIONS,
     DEFAULT_BLACKLIST_PATTERNS
 )
 from _gene_list_builder import GeneListBuilder
@@ -139,7 +136,7 @@ def select_top_n_from_filtered_list(
         n_top_genes: Number of genes to select.
         filter_criteria: Which filters must pass.
             If None, defaults to ['passed_xenium'].
-            Options: 'passed_xenium', 'passed_odt'.
+            Options: 'passed_xenium'.
         respect_celltype_balance: If True, select proportionally per celltype.
         
     Returns:
@@ -161,9 +158,9 @@ def select_top_n_from_filtered_list(
     
     if filter_criteria is None:
         filter_criteria = [COL_PASSED_XENIUM]
-    
+
     # Validate filter criteria
-    valid_filters = [COL_PASSED_XENIUM, COL_PASSED_ODT]
+    valid_filters = [COL_PASSED_XENIUM]
     invalid = set(filter_criteria) - set(valid_filters)
     if invalid:
         raise ValueError(

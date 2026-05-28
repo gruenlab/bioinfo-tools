@@ -351,6 +351,18 @@ Examples:
             'is set. Default: re-run standard NMF with optimal K.'
         )
     )
+    dimred.add_argument(
+        '--nmf_counts_input',
+        type=str,
+        default='raw',
+        choices=['raw', 'lognorm'],
+        help=(
+            "Count matrix used as NMF input. "
+            "'raw' (default): raw integer counts from adata.raw or adata.layers['counts'] "
+            "(validated with is_anndata_raw_layer). "
+            "'lognorm': log-normalised counts from adata.X."
+        )
+    )
 
     # =========================================================================
     # Combination strategy parameters (for rf_nmf, rf_pca)
@@ -650,7 +662,6 @@ def run_pipeline(args: argparse.Namespace) -> GeneListBuilder:
         'force_include_genes': args.force_include_genes,
         'apply_xenium_filter': not args.disable_xenium_filter,
         'xenium_celltype_aware': not args.disable_xenium_celltype_aware,
-        'apply_odt_filter': False,   # ODT runs only from the dedicated ODT tab, never during selection
         'xenium_min_expr': args.xenium_min_expr,
         'xenium_max_expr': args.xenium_max_expr,
         'mean_expr_per_ct': mean_expr_per_ct,
@@ -672,6 +683,7 @@ def run_pipeline(args: argparse.Namespace) -> GeneListBuilder:
                 'pool_size_per_celltype': args.pool_size_per_celltype,
                 'pool_size_per_factor': args.pool_size_per_factor,
                 'nmf_model_cache_dir': args.nmf_model_cache_dir,
+                'nmf_counts_input': args.nmf_counts_input,
                 'use_consensus_nmf': args.use_consensus_nmf,
                 'k_min': args.k_min,
                 'k_max': args.k_max,
@@ -702,6 +714,7 @@ def run_pipeline(args: argparse.Namespace) -> GeneListBuilder:
             rf_deg_cache_dir=args.rf_deg_cache_dir,
             dimred_cache_dir=args.dimred_cache_dir,
             nmf_model_cache_dir=args.nmf_model_cache_dir,
+            nmf_counts_input=args.nmf_counts_input,
             force_recompute=args.force_recompute,
             run_celltype_filling=not args.disable_celltype_filling,
             run_global_filling=not args.disable_global_filling,

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,17 @@ from metrics import (
 
 logger = logging.getLogger(__name__)
 
+_UTILITY_DIR = Path(__file__).parent.parent / "Utility-module"
+if _UTILITY_DIR.exists():
+    sys.path.insert(0, str(_UTILITY_DIR))
+try:
+    from _validation import is_anndata_raw_layer, is_anndata_raw  # type: ignore[import]
+except ImportError:
+    def is_anndata_raw_layer(adata, layer_name: str) -> bool:  # type: ignore[misc]
+        return True
+    def is_anndata_raw(adata) -> bool:  # type: ignore[misc]
+        return True
+
 __all__ = [
     "reconstruct_with_tangram",
     "run_tangram_reconstruction_check",
@@ -70,11 +82,6 @@ __all__ = [
 
 try:
     import tangram as tg
-    from tangram import mapping_optimizer as mo
-    from tangram import mapping_utils as mu
-    from tangram import utils as ut
-    from scipy.sparse.csc import csc_matrix
-    from scipy.sparse.csr import csr_matrix
     _TANGRAM_AVAILABLE = True
 except ImportError:
     tg = None
@@ -83,216 +90,14 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Tangram helpers (adapted from nico2_lib/_tangram_pred.py)
-# Changes vs. original tangram source: zero-count gene filtering is removed
-# so that all shared genes (including zero-expressed ones) are reconstructed.
+# Tangram helpers — imported from nico2_lib (identical unfiltered wrappers)
 # ---------------------------------------------------------------------------
 
-
-def pp_adatas_unfiltered(adata_sc, adata_sp, genes=None, gene_to_lowercase=True):
-    """Pre-process AnnDatas for Tangram mapping without filtering zero-count genes.
-
-    Identical to ``tangram.pp_adatas`` except the ``filter_genes`` calls that
-    drop all-zero genes are removed, preserving the full shared gene set.
-    """
-    if genes is None:
-        genes = adata_sc.var.index
-
-    if gene_to_lowercase:
-        adata_sc.var.index = [g.lower() for g in adata_sc.var.index]
-        adata_sp.var.index = [g.lower() for g in adata_sp.var.index]
-        genes = list(g.lower() for g in genes)
-
-    adata_sc.var_names_make_unique()
-    adata_sp.var_names_make_unique()
-
-    genes = list(set(genes) & set(adata_sc.var.index) & set(adata_sp.var.index))
-
-    adata_sc.uns["training_genes"] = genes
-    adata_sp.uns["training_genes"] = genes
-
-    overlap_genes = list(set(adata_sc.var.index) & set(adata_sp.var.index))
-    adata_sc.uns["overlap_genes"] = overlap_genes
-    adata_sp.uns["overlap_genes"] = overlap_genes
-
-    adata_sp.obs["uniform_density"] = np.ones(adata_sp.X.shape[0]) / adata_sp.X.shape[0]
-
-    rna_count_per_spot = np.array(adata_sp.X.sum(axis=1)).squeeze()
-    adata_sp.obs["rna_count_based_density"] = rna_count_per_spot / np.sum(rna_count_per_spot)
-
-
-def _map_cells_to_space_unfiltered(
-    adata_sc,
-    adata_sp,
-    cv_train_genes=None,
-    cluster_label=None,
-    mode="cells",
-    device="cpu",
-    learning_rate=0.1,
-    num_epochs=1000,
-    scale=True,
-    lambda_d=0,
-    lambda_g1=1,
-    lambda_g2=0,
-    lambda_r=0,
-    lambda_count=1,
-    lambda_f_reg=1,
-    target_count=None,
-    random_state=None,
-    verbose=True,
-    density_prior="rna_count_based",
-):
-    """Map single-cell data onto spatial data without rejecting zero-value genes.
-
-    Identical to ``tangram.map_cells_to_space`` except the assertion that
-    raises on all-zero gene columns is removed.
-    """
-    import torch as _torch
-
-    if lambda_g1 == 0:
-        raise ValueError("lambda_g1 cannot be 0.")
-    if (type(density_prior) is str) and density_prior not in ["rna_count_based", "uniform", None]:
-        raise ValueError("Invalid input for density_prior.")
-    if density_prior is not None and (lambda_d == 0 or lambda_d is None):
-        lambda_d = 1
-    if lambda_d > 0 and density_prior is None:
-        raise ValueError("When lambda_d is set, please define the density_prior.")
-    if mode not in ["clusters", "cells", "constrained"]:
-        raise ValueError('Argument "mode" must be "cells", "clusters" or "constrained"')
-    if mode == "clusters" and cluster_label is None:
-        raise ValueError("A cluster_label must be specified if mode is 'clusters'.")
-    if mode == "constrained" and not all([target_count, lambda_f_reg, lambda_count]):
-        raise ValueError(
-            "target_count, lambda_f_reg and lambda_count must be specified if mode is 'constrained'."
-        )
-
-    if mode == "clusters":
-        adata_sc = mu.adata_to_cluster_expression(adata_sc, cluster_label, scale, add_density=True)
-
-    if not set(["training_genes", "overlap_genes"]).issubset(set(adata_sc.uns.keys())):
-        raise ValueError("Missing tangram parameters. Run `pp_adatas()`.")
-    if not set(["training_genes", "overlap_genes"]).issubset(set(adata_sp.uns.keys())):
-        raise ValueError("Missing tangram parameters. Run `pp_adatas()`.")
-    assert list(adata_sp.uns["training_genes"]) == list(adata_sc.uns["training_genes"])
-
-    training_genes = (
-        cv_train_genes
-        if cv_train_genes is not None and set(cv_train_genes).issubset(set(adata_sc.uns["training_genes"]))
-        else adata_sc.uns["training_genes"]
-    )
-
-    if isinstance(adata_sc.X, (csc_matrix, csr_matrix)):
-        S = np.array(adata_sc[:, training_genes].X.toarray(), dtype="float32")
-    else:
-        S = np.array(adata_sc[:, training_genes].X, dtype="float32")
-
-    if isinstance(adata_sp.X, (csc_matrix, csr_matrix)):
-        G = np.array(adata_sp[:, training_genes].X.toarray(), dtype="float32")
-    else:
-        G = np.array(adata_sp[:, training_genes].X, dtype="float32")
-
-    # Zero-value gene check removed (code adapted from original tangram source)
-
-    d_source = None
-    d_str = density_prior
-    if type(density_prior) is np.ndarray:
-        d_str = "customized"
-    if density_prior == "rna_count_based":
-        density_prior = adata_sp.obs["rna_count_based_density"]
-    elif density_prior == "uniform":
-        density_prior = adata_sp.obs["uniform_density"]
-
-    if mode == "cells":
-        d = density_prior
-    if mode == "clusters":
-        d_source = np.array(adata_sc.obs["cluster_density"])
-    if mode in ["clusters", "constrained"]:
-        d = density_prior if density_prior is not None else adata_sp.obs["uniform_density"]
-        if lambda_d is None or lambda_d == 0:
-            lambda_d = 1
-
-    device = _torch.device(device)
-    print_each = 100 if verbose else None
-
-    if mode in ["cells", "clusters"]:
-        hyperparameters = {
-            "lambda_d": lambda_d,
-            "lambda_g1": lambda_g1,
-            "lambda_g2": lambda_g2,
-            "lambda_r": lambda_r,
-            "d_source": d_source,
-        }
-        mapper = mo.Mapper(S=S, G=G, d=d, device=device, random_state=random_state, **hyperparameters)
-        mapping_matrix, training_history = mapper.train(
-            learning_rate=learning_rate, num_epochs=num_epochs, print_each=print_each
-        )
-    elif mode == "constrained":
-        hyperparameters = {
-            "lambda_d": lambda_d,
-            "lambda_g1": lambda_g1,
-            "lambda_g2": lambda_g2,
-            "lambda_r": lambda_r,
-            "lambda_count": lambda_count,
-            "lambda_f_reg": lambda_f_reg,
-            "target_count": target_count,
-        }
-        mapper = mo.MapperConstrained(S=S, G=G, d=d, device=device, random_state=random_state, **hyperparameters)
-        mapping_matrix, F_out, training_history = mapper.train(
-            learning_rate=learning_rate, num_epochs=num_epochs, print_each=print_each
-        )
-
-    import scanpy as _sc
-    adata_map = _sc.AnnData(
-        X=mapping_matrix,
-        obs=adata_sc[:, training_genes].obs.copy(),
-        var=adata_sp[:, training_genes].obs.copy(),
-    )
-    if mode == "constrained":
-        adata_map.obs["F_out"] = F_out
-
-    G_predicted = adata_map.X.T @ S
-    cos_sims = []
-    for v1, v2 in zip(G.T, G_predicted.T):
-        norm_sq = np.linalg.norm(v1) * np.linalg.norm(v2)
-        cos_sims.append((v1 @ v2) / norm_sq)
-
-    df_cs = pd.DataFrame(cos_sims, training_genes, columns=["train_score"])
-    df_cs = df_cs.sort_values(by="train_score", ascending=False)
-    adata_map.uns["train_genes_df"] = df_cs
-
-    ut.annotate_gene_sparsity(adata_sc)
-    ut.annotate_gene_sparsity(adata_sp)
-    adata_map.uns["train_genes_df"]["sparsity_sc"] = adata_sc[:, training_genes].var.sparsity
-    adata_map.uns["train_genes_df"]["sparsity_sp"] = adata_sp[:, training_genes].var.sparsity
-    adata_map.uns["train_genes_df"]["sparsity_diff"] = (
-        adata_sp[:, training_genes].var.sparsity - adata_sc[:, training_genes].var.sparsity
-    )
-    adata_map.uns["training_history"] = training_history
-    return adata_map
-
-
-def project_genes_unfiltered(adata_map, adata_sc, cluster_label=None, scale=True):
-    """Transfer gene expression from single-cell onto space without filtering zero genes.
-
-    Identical to ``tangram.project_genes`` except the ``filter_genes`` call
-    that drops all-zero genes is removed.
-    """
-    adata_sc.var.index = [g.lower() for g in adata_sc.var.index]
-    adata_sc.var_names_make_unique()
-
-    if cluster_label:
-        adata_sc = mu.adata_to_cluster_expression(adata_sc, cluster_label, scale=scale)
-
-    if not adata_map.obs.index.equals(adata_sc.obs.index):
-        raise ValueError("The two AnnDatas need to have same `obs` index.")
-    if hasattr(adata_sc.X, "toarray"):
-        adata_sc.X = adata_sc.X.toarray()
-    X_space = adata_map.X.T @ adata_sc.X
-    import scanpy as _sc
-    adata_ge = _sc.AnnData(X=X_space, obs=adata_map.var, var=adata_sc.var, uns=adata_sc.uns)
-    training_genes = adata_map.uns["train_genes_df"].index.values
-    adata_ge.var["is_training"] = adata_ge.var.index.isin(training_genes)
-    return adata_ge
+from nico2_lib.predictors._tangram._tangram_pred import (
+    pp_adatas_unfiltered,
+    map_cells_to_space as _map_cells_to_space_unfiltered,
+    project_genes_unfiltered,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +112,7 @@ def reconstruct_with_tangram(
     strict_deps: bool = False,
     train_idx: np.ndarray | None = None,
     test_idx: np.ndarray | None = None,
+    nmf_counts_input: str = "raw",
 ) -> sc.AnnData:
     """Reconstruct full transcriptome from probe genes using Tangram.
 
@@ -367,16 +173,40 @@ def reconstruct_with_tangram(
         ad_sc = adata_full.copy()
         ad_sp = adata_subset.copy()
 
-    # CRITICAL FIX: Extract raw counts from layers["counts"] for fair comparison with NMF
-    if "counts" not in ad_sc.layers or "counts" not in ad_sp.layers:
+    if nmf_counts_input == "raw":
+        if "counts" not in ad_sc.layers or "counts" not in ad_sp.layers:
+            raise ValueError(
+                "reconstruct_with_tangram requires 'counts' layer with raw data when "
+                "nmf_counts_input='raw'. "
+                f"Found layers: ad_sc={list(ad_sc.layers.keys())}, ad_sp={list(ad_sp.layers.keys())}"
+            )
+        if not is_anndata_raw_layer(ad_sc, "counts"):
+            raise ValueError(
+                "nmf_counts_input='raw': ad_sc.layers['counts'] does not contain raw integer counts"
+            )
+        if not is_anndata_raw_layer(ad_sp, "counts"):
+            raise ValueError(
+                "nmf_counts_input='raw': ad_sp.layers['counts'] does not contain raw integer counts"
+            )
+        logger.info("Extracting raw counts from layers['counts'] for Tangram (verified)")
+        ad_sc.X = ad_sc.layers["counts"].copy()
+        ad_sp.X = ad_sp.layers["counts"].copy()
+    elif nmf_counts_input == "lognorm":
+        if is_anndata_raw(ad_sc):
+            raise ValueError(
+                "nmf_counts_input='lognorm': ad_sc.X appears to contain raw integer counts, "
+                "not log-normalized data."
+            )
+        if is_anndata_raw(ad_sp):
+            raise ValueError(
+                "nmf_counts_input='lognorm': ad_sp.X appears to contain raw integer counts, "
+                "not log-normalized data."
+            )
+        logger.info("Using adata.X (log-normalized) for Tangram (verified)")
+    else:
         raise ValueError(
-            "reconstruct_with_tangram requires 'counts' layer with raw data. "
-            f"Found layers: ad_sc={list(ad_sc.layers.keys())}, ad_sp={list(ad_sp.layers.keys())}"
+            f"Unknown nmf_counts_input='{nmf_counts_input}'. Choose 'raw' or 'lognorm'."
         )
-
-    logger.info("Extracting raw counts from layers['counts'] for Tangram (fair comparison with NMF)")
-    ad_sc.X = ad_sc.layers["counts"].copy()
-    ad_sp.X = ad_sp.layers["counts"].copy()
 
     logger.info("Preprocessing data (zero-count gene filtering disabled to preserve full gene set)...")
     pp_adatas_unfiltered(ad_sc, ad_sp, genes=None)
@@ -499,6 +329,7 @@ def _run_tangram_per_celltype(
     num_epochs: int,
     min_cells: int = MIN_CELLS_PER_CELLTYPE,
     per_celltype_splits: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    nmf_counts_input: str = "raw",
 ) -> dict[str, dict[str, Any]]:
     """Run Tangram reconstruction separately for each cell type.
 
@@ -551,6 +382,7 @@ def _run_tangram_per_celltype(
                 ad_ge = reconstruct_with_tangram(
                     adata_full, adata_subset, num_epochs=num_epochs,
                     train_idx=train_ct_idx, test_idx=test_ct_idx,
+                    nmf_counts_input=nmf_counts_input,
                 )
                 ad_ct_ref = adata_full[test_ct_idx]
             else:
@@ -558,6 +390,7 @@ def _run_tangram_per_celltype(
                 ad_ct_sub = adata_subset[mask].copy()
                 ad_ge = reconstruct_with_tangram(
                     ad_ct_full, ad_ct_sub, num_epochs=num_epochs,
+                    nmf_counts_input=nmf_counts_input,
                 )
                 ad_ct_ref = ad_ct_full
 
@@ -918,6 +751,7 @@ def run_tangram_reconstruction_check(
     test_idx: np.ndarray | None = None,
     per_celltype_splits: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
     plot_heatmaps: bool = True,
+    nmf_counts_input: str = "raw",
 ) -> dict[str, Any]:
     """Run the Tangram reconstruction check for a single panel.
 
@@ -981,6 +815,7 @@ def run_tangram_reconstruction_check(
             ad_ge = reconstruct_with_tangram(
                 adata_full, adata_subset, num_epochs=num_epochs,
                 train_idx=train_idx, test_idx=test_idx,
+                nmf_counts_input=nmf_counts_input,
             )
 
             # Tangram's pp_adatas() lowercases var_names; build a case-insensitive
@@ -1067,6 +902,7 @@ def run_tangram_reconstruction_check(
         per_celltype_results = _run_tangram_per_celltype(
             adata_full, adata_subset, celltype_col, num_epochs, min_cells_per_celltype,
             per_celltype_splits=per_celltype_splits,
+            nmf_counts_input=nmf_counts_input,
         )
         result["per_celltype"] = per_celltype_results
         summary = _aggregate_per_celltype_metrics(per_celltype_results)

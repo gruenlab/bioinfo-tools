@@ -28,10 +28,10 @@ from _constants import (
     COL_MEAN_EXPRESSION,
     COL_SELECTED_INITIAL,
     COL_PASSED_XENIUM,
-    COL_PASSED_ODT,
+
     COL_FINAL_SELECTION,
     COL_XENIUM_FAILURE_REASON,
-    COL_ODT_FAILURE_REASON,
+
     COL_REPLACED_BY,
     COL_REPLACES_GENE,
     COL_REPLACEMENT_REASON,
@@ -191,10 +191,8 @@ class GeneListBuilder:
                 COL_MEAN_EXPRESSION: None,  # Set later if available
                 COL_SELECTED_INITIAL: False,
                 COL_PASSED_XENIUM: None,
-                COL_PASSED_ODT: None,
                 COL_FINAL_SELECTION: False,
                 COL_XENIUM_FAILURE_REASON: None,
-                COL_ODT_FAILURE_REASON: None,
                 COL_REPLACED_BY: None,
                 COL_REPLACES_GENE: None,
                 COL_REPLACEMENT_REASON: None,
@@ -359,41 +357,34 @@ class GeneListBuilder:
         
         Args:
             gene: Gene name.
-            filter_name: Name of filter ('xenium', 'odt').
+            filter_name: Name of filter ('xenium').
             passed: Whether gene passed the filter.
             failure_reason: Reason for failure if passed=False.
-            
+
         Raises:
             ValueError: If filter_name is invalid.
             KeyError: If gene not found in gene_records.
-            
+
         Examples:
             >>> builder.mark_filter_result('Gene1', 'xenium', True)
-            >>> builder.mark_filter_result(
-            ...     'Gene2', 'odt', False, 'insufficient_probes'
-            ... )
         """
-        valid_filters = ['xenium', 'odt']
+        valid_filters = ['xenium']
         if filter_name not in valid_filters:
             raise ValueError(
                 f"filter_name must be one of {valid_filters}, "
                 f"got '{filter_name}'"
             )
-        
+
         if gene not in self.gene_records:
             raise KeyError(
                 f"Gene '{gene}' not found in gene_records. "
                 "Call add_genes() first."
             )
-        
+
         if filter_name == 'xenium':
             self.gene_records[gene][COL_PASSED_XENIUM] = passed
             if not passed and failure_reason:
                 self.gene_records[gene][COL_XENIUM_FAILURE_REASON] = failure_reason
-        elif filter_name == 'odt':
-            self.gene_records[gene][COL_PASSED_ODT] = passed
-            if not passed and failure_reason:
-                self.gene_records[gene][COL_ODT_FAILURE_REASON] = failure_reason
         
         logger.debug(
             f"Gene {gene}: {filter_name} filter "
@@ -413,13 +404,13 @@ class GeneListBuilder:
         Args:
             failed_gene: Gene that failed filter.
             replacement_gene: Gene that replaced it.
-            reason: Reason for replacement (e.g., 'xenium_filter', 'odt_filter').
+            reason: Reason for replacement (e.g., 'xenium_filter', 'duplicate').
             
         Raises:
             KeyError: If either gene not found in gene_records.
             
         Examples:
-            >>> builder.record_replacement('Gene1', 'Gene2', 'odt_filter')
+            >>> builder.record_replacement('Gene1', 'Gene2', 'xenium_filter')
         """
         if failed_gene not in self.gene_records:
             raise KeyError(
@@ -644,14 +635,6 @@ class GeneListBuilder:
                 1 for r in self.gene_records.values()
                 if r.get(COL_PASSED_XENIUM) is False
             ),
-            'odt_passed': sum(
-                1 for r in self.gene_records.values()
-                if r.get(COL_PASSED_ODT, False)
-            ),
-            'odt_failed': sum(
-                1 for r in self.gene_records.values()
-                if r.get(COL_PASSED_ODT) is False
-            ),
             'replacements_made': sum(
                 1 for r in self.gene_records.values()
                 if r.get(COL_REPLACES_GENE) is not None
@@ -692,8 +675,6 @@ class GeneListBuilder:
             "Filtering:",
             f"  Xenium passed: {stats['xenium_passed']}",
             f"  Xenium failed: {stats['xenium_failed']}",
-            f"  ODT passed: {stats['odt_passed']}",
-            f"  ODT failed: {stats['odt_failed']}",
             f"",
             f"Replacements made: {stats['replacements_made']}",
         ]
@@ -755,24 +736,24 @@ class GeneListBuilder:
         Count how many genes failed a specific filter.
         
         Args:
-            filter_name: Name of filter ('xenium' or 'odt').
-            
+            filter_name: Name of filter ('xenium').
+
         Returns:
             Number of genes that failed the filter.
-            
+
         Raises:
             ValueError: If filter_name is invalid.
-            
+
         Examples:
             >>> xenium_failures = builder.count_filter_failures('xenium')
         """
-        valid_filters = ['xenium', 'odt']
+        valid_filters = ['xenium']
         if filter_name not in valid_filters:
             raise ValueError(
                 f"filter_name must be one of {valid_filters}, got '{filter_name}'"
             )
-        
-        col = COL_PASSED_XENIUM if filter_name == 'xenium' else COL_PASSED_ODT
+
+        col = COL_PASSED_XENIUM
         
         return sum(
             1 for record in self.gene_records.values()

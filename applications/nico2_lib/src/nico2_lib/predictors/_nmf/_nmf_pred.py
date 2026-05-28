@@ -91,6 +91,12 @@ class NmfPredictor:
     preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
     pre_init: bool = False
     solver: Literal["cd", "mu"] = "cd"
+    beta_loss: str = "frobenius"
+    max_iter: int = 1000
+    init: str | None = None
+    alpha_W: float = 0.0
+    alpha_H: float = 0.0
+    l1_ratio: float = 0.0
     h_reference: NumericArray | None = None
     n_shared_features: int | None = None
     ref_embedding: NumericArray | None = None
@@ -146,12 +152,8 @@ class NmfPredictor:
             for step in self.preprocessing_steps:
                 x = step(x)
         w_query, _, _ = non_negative_factorization(
-            X=x,
-            H=self.h_reference[:, indexer],
-            init="custom",
-            update_H=False,
-            solver=self.solver,
-            beta_loss="frobenius",
+            X=x, H=self.h_reference[:, indexer], init="custom", update_H=False,
+            n_components=self.embedding_size, max_iter=self.max_iter,
         )
         return w_query, w_query @ self.h_reference
 

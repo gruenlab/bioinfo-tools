@@ -24,7 +24,6 @@ __all__ = [
     'log_memory_usage',
     'get_preprocessing_name',
     'get_panel_cache_prefix',
-    'load_preprocessed_data',
     'get_component_panel_path',
     'load_cached_panel',
     'save_panel_to_cache',
@@ -260,87 +259,6 @@ def get_panel_cache_prefix(filter_method: str, subset_to_hvg: bool) -> str:
     hvg_part = "HVG-Subset" if subset_to_hvg else "All-Genes"
 
     return f"{filter_part}/{hvg_part}"
-
-
-##############################################################################
-# DATA LOADING UTILITIES
-##############################################################################
-
-
-def load_preprocessed_data(
-        preprocessed_dir: str,
-        filter_method: str,
-        subset_to_hvg: bool,
-        load_global_loadings: bool = True) -> tuple:
-    """
-    Load preprocessed data from central directory.
-
-    Args:
-        preprocessed_dir: Base directory containing preprocessed datasets.
-        filter_method: Filter method: 'scanpy', '10x', 'no_filter'.
-        subset_to_hvg: Whether to use HVG subset.
-        load_global_loadings: Whether to load global PCA/NMF loadings
-            (default: True). Set to False for per_celltype strategies.
-
-    Returns:
-        Tuple of (adata, pca_df, nmf_df). pca_df and nmf_df will be None
-        if load_global_loadings=False.
-
-    Raises:
-        FileNotFoundError: If preprocessed data directory or required files not found.
-    """
-    # Get preprocessing name
-    preproc_name = get_preprocessing_name(filter_method, subset_to_hvg)
-    preproc_path = os.path.join(preprocessed_dir, preproc_name)
-
-    logger.info(f"Loading preprocessed data: {preproc_name}")
-    logger.info(f"Path: {preproc_path}")
-
-    # Check if directory exists
-    if not os.path.exists(preproc_path):
-        raise FileNotFoundError(
-            f"Preprocessed data not found: {preproc_path}\n"
-            f"Please run the preprocessing script first:\n"
-            f"  sbatch 20251010_Preprocess-Data.sh"
-        )
-
-    # Load AnnData
-    adata_path = os.path.join(preproc_path, "preprocessed.h5ad")
-    if not os.path.exists(adata_path):
-        raise FileNotFoundError(f"AnnData file not found: {adata_path}")
-
-    logger.info(f"Loading AnnData from: {adata_path}")
-    adata = sc.read_h5ad(adata_path)
-    logger.info(f"Loaded: {adata.shape[0]:,} cells × {adata.shape[1]:,} genes")
-
-    # Conditionally load global PCA and NMF loadings
-    pca_df = None
-    nmf_df = None
-
-    if load_global_loadings:
-        # Load PCA loadings
-        pca_path = os.path.join(preproc_path, "pca_loadings.csv")
-        if not os.path.exists(pca_path):
-            raise FileNotFoundError(f"PCA loadings not found: {pca_path}")
-
-        logger.info(f"Loading PCA loadings from: {pca_path}")
-        pca_df = pd.read_csv(pca_path, index_col=0)
-        logger.info(f"PCA loadings: {pca_df.shape[0]:,} genes × {pca_df.shape[1]} components")
-
-        # Load NMF loadings
-        nmf_path = os.path.join(preproc_path, "nmf_loadings.csv")
-        if not os.path.exists(nmf_path):
-            raise FileNotFoundError(f"NMF loadings not found: {nmf_path}")
-
-        logger.info(f"Loading NMF loadings from: {nmf_path}")
-        nmf_df = pd.read_csv(nmf_path, index_col=0)
-        logger.info(f"NMF loadings: {nmf_df.shape[0]:,} genes × {nmf_df.shape[1]} components")
-    else:
-        logger.info("Skipping global PCA/NMF loadings (not needed for per_celltype strategy)")
-
-    logger.info("Preprocessed data loaded successfully")
-
-    return adata, pca_df, nmf_df
 
 
 ##############################################################################

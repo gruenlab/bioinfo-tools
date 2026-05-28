@@ -10,12 +10,14 @@ from __future__ import annotations
 import gc
 import logging
 import sys
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import scipy.sparse
-from sklearn.decomposition import non_negative_factorization
+from sklearn.decomposition import non_negative_factorization  # still used by cNMF path
+from nico2_lib.predictors._nmf._nmf_pred import NmfPredictor
 from tqdm import tqdm
 
 from metrics import calculate_explained_variance, calculate_mse
@@ -29,6 +31,17 @@ from metrics import (
 )
 
 logger = logging.getLogger(__name__)
+
+_UTILITY_DIR = Path(__file__).parent.parent / "Utility-module"
+if _UTILITY_DIR.exists():
+    sys.path.insert(0, str(_UTILITY_DIR))
+try:
+    from _validation import is_anndata_raw_layer, is_anndata_raw  # type: ignore[import]
+except ImportError:
+    def is_anndata_raw_layer(adata, layer_name: str) -> bool:  # type: ignore[misc]
+        return True
+    def is_anndata_raw(adata) -> bool:  # type: ignore[misc]
+        return True
 
 __all__ = [
     "nmf_reconstruction",
@@ -336,16 +349,24 @@ def nmf_reconstruction(
             logger.warning("Cached training data shape doesn't match, recomputing...")
             cached_full_nmf = None
 
+    _nmf_kwargs = dict(
+        embedding_size=n_components, seed=random_state, max_iter=max_iter,
+        beta_loss="frobenius", init=None, alpha_W=0.0, alpha_H=0.0, l1_ratio=0.0,
+    )
+
     if cached_full_nmf is None or "training" not in cached_full_nmf:
         logger.info("Computing Full NMF on training data")
-        W_full_train, H_full_train, _ = non_negative_factorization(
-            A_train, n_components=n_components, max_iter=max_iter, random_state=random_state
-        )
+        train_predictor = NmfPredictor(**_nmf_kwargs).fit(A_train)
+        W_full_train = train_predictor.ref_embedding
+        H_full_train = train_predictor.h_reference
         A_train_baseline = W_full_train @ H_full_train
         mse_train_baseline = calculate_mse(A_train, A_train_baseline)
         expvar_train_baseline = calculate_explained_variance(A_train, A_train_baseline)
+    else:
+        # Reconstruct a pre-fitted predictor from cached H so predict() can be used
+        train_predictor = NmfPredictor(**_nmf_kwargs, h_reference=H_full_train, ref_embedding=W_full_train)
 
-    # Step 2: Extract gene subset patterns
+    # Step 2: Extract gene subset patterns (for logging only — computed internally by predict())
     logger.info("Step 1: Extract probe gene patterns")
     H_P = H_full_train[:, probe_indices]
 
@@ -359,10 +380,7 @@ def nmf_reconstruction(
         )
 
     logger.info("Step 2: Iterative solve for train sample factors")
-    W_train, _, _ = non_negative_factorization(
-        A_P_train, H=H_P, n_components=n_components, init="custom",
-        update_H=False, max_iter=max_iter, random_state=random_state,
-    )
+    W_train, A_train_recon = train_predictor.predict(A_P_train, indexer=probe_indices)
     logger.info(f"W_train shape: {W_train.shape} (cells × components)")
 
     # ================================================================
@@ -396,27 +414,21 @@ def nmf_reconstruction(
 
     if cached_full_nmf is None or "testing" not in cached_full_nmf:
         logger.info("Computing Full NMF on testing data")
-        W_full_test, H_full_test, _ = non_negative_factorization(
-            A_test, n_components=n_components, max_iter=max_iter, random_state=random_state
-        )
+        _test_pred = NmfPredictor(**_nmf_kwargs).fit(A_test)
+        W_full_test = _test_pred.ref_embedding
+        H_full_test = _test_pred.h_reference
         A_test_baseline = W_full_test @ H_full_test
         mse_test_baseline = calculate_mse(A_test, A_test_baseline)
         expvar_test_baseline = calculate_explained_variance(A_test, A_test_baseline)
 
     logger.info("Step 2: Iterative solve for test sample factors")
-    W_test, _, _ = non_negative_factorization(
-        A_P_test, H=H_P, n_components=n_components, init="custom",
-        update_H=False, max_iter=max_iter, random_state=random_state,
-    )
+    W_test, A_test_recon = train_predictor.predict(A_P_test, indexer=probe_indices)
     logger.info(f"W_test shape: {W_test.shape} (cells × components)")
 
     # ================================================================
     # RECONSTRUCTION AND EVALUATION
     # ================================================================
     logger.info("--- Reconstruction and Evaluation ---")
-
-    A_train_recon = W_train @ H_full_train
-    A_test_recon = W_test @ H_full_train
 
     mse_train_probe = calculate_mse(A_train, A_train_recon)
     expvar_train_probe = calculate_explained_variance(A_train, A_train_recon)
@@ -496,6 +508,7 @@ def nmf_reconstruction_by_celltype(
     cnmf_density_threshold: float = 0.5,
     cnmf_local_neighborhood_size: float = 0.30,
     per_celltype_splits: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    nmf_counts_input: str = "raw",
 ) -> dict[str, Any]:
     """Evaluate NMF representation for each celltype separately.
 
@@ -514,6 +527,9 @@ def nmf_reconstruction_by_celltype(
         per_celltype_splits: Required. Per-celltype train/test index splits as returned by
             :func:`_splits.generate_evaluation_splits`. Must be provided so that the exact same
             cell partitions are used across NMF and Tangram evaluation.
+        nmf_counts_input: Count matrix to use as NMF input. ``"raw"`` (default): raw integer
+            counts from ``adata.layers['counts']``. ``"lognorm"``: log-normalised counts from
+            ``adata.X``.
 
     Returns:
         Dictionary with MSE and explained variance metrics by celltype.
@@ -529,10 +545,6 @@ def nmf_reconstruction_by_celltype(
         )
 
     logger.info(f"Evaluating NMF representation by celltype with {len(probeset_genes)} genes")
-
-    if "counts" not in adata.layers:
-        logger.warning("No 'counts' layer found, using .X")
-        adata.layers["counts"] = adata.X.copy()
 
     if celltype_column not in adata.obs.columns:
         raise ValueError(f"Celltype column '{celltype_column}' not found in adata.obs")
@@ -556,7 +568,25 @@ def nmf_reconstruction_by_celltype(
         cached_full_nmf_by_celltype = {}
 
     def _to_float64(ad):
-        m = ad.layers["counts"] if "counts" in ad.layers else ad.X
+        if nmf_counts_input == "lognorm":
+            if is_anndata_raw(ad):
+                raise ValueError(
+                    "nmf_counts_input='lognorm': ad.X appears to contain raw integer counts, "
+                    "not log-normalized data."
+                )
+            m = ad.X
+        else:  # raw
+            if "counts" in ad.layers:
+                if not is_anndata_raw_layer(ad, "counts"):
+                    raise ValueError(
+                        "nmf_counts_input='raw': ad.layers['counts'] does not contain raw integer counts."
+                    )
+                m = ad.layers["counts"]
+            else:
+                raise ValueError(
+                    "nmf_counts_input='raw': ad.layers['counts'] not found. "
+                    "Provide raw counts in layers['counts']."
+                )
         return (m.toarray() if scipy.sparse.issparse(m) else np.asarray(m)).astype(np.float64)
 
     for celltype in tqdm(celltypes, desc="Processing celltypes"):
@@ -641,18 +671,23 @@ def nmf_reconstruction_by_celltype(
             else:
                 logger.info(f"Computing NMF for celltype {celltype}")
 
-                logger.info("Computing Full NMF on training data")
-                W_full_train, H_full_train, _ = non_negative_factorization(
-                    A_train_ct, n_components=n_components, max_iter=max_iter, random_state=random_state
+                _nmf_kwargs_ct = dict(
+                    embedding_size=n_components, seed=random_state, max_iter=max_iter,
+                    beta_loss="frobenius", init=None, alpha_W=0.0, alpha_H=0.0, l1_ratio=0.0,
                 )
+
+                logger.info("Computing Full NMF on training data")
+                _train_pred_ct = NmfPredictor(**_nmf_kwargs_ct).fit(A_train_ct)
+                W_full_train = _train_pred_ct.ref_embedding
+                H_full_train = _train_pred_ct.h_reference
                 A_train_baseline = W_full_train @ H_full_train
                 mse_train_baseline = calculate_mse(A_train_ct, A_train_baseline)
                 expvar_train_baseline = calculate_explained_variance(A_train_ct, A_train_baseline)
 
                 logger.info("Computing Full NMF on testing data")
-                W_full_test, H_full_test, _ = non_negative_factorization(
-                    A_test_ct, n_components=n_components, max_iter=max_iter, random_state=random_state
-                )
+                _test_pred_ct = NmfPredictor(**_nmf_kwargs_ct).fit(A_test_ct)
+                W_full_test = _test_pred_ct.ref_embedding
+                H_full_test = _test_pred_ct.h_reference
                 A_test_baseline = W_full_test @ H_full_test
                 mse_test_baseline = calculate_mse(A_test_ct, A_test_baseline)
                 expvar_test_baseline = calculate_explained_variance(A_test_ct, A_test_baseline)
@@ -676,20 +711,15 @@ def nmf_reconstruction_by_celltype(
             # Apply NMF representation approach
             logger.info(f"Running NMF representation for celltype {celltype}")
 
-            H_P = H_full_train[:, probe_indices]
-
-            W_train, _, _ = non_negative_factorization(
-                A_P_train_ct, H=H_P, n_components=n_components, init="custom",
-                update_H=False, max_iter=max_iter, random_state=random_state,
+            # H_full_train is set above (either from cache or fresh fit)
+            _train_pred_ct = NmfPredictor(
+                embedding_size=n_components, seed=random_state, max_iter=max_iter,
+                beta_loss="frobenius", init=None, alpha_W=0.0, alpha_H=0.0, l1_ratio=0.0,
+                h_reference=H_full_train, ref_embedding=W_full_train,
             )
 
-            W_test, _, _ = non_negative_factorization(
-                A_P_test_ct, H=H_P, n_components=n_components, init="custom",
-                update_H=False, max_iter=max_iter, random_state=random_state,
-            )
-
-            A_train_recon = W_train @ H_full_train
-            A_test_recon = W_test @ H_full_train
+            W_train, A_train_recon = _train_pred_ct.predict(A_P_train_ct, indexer=probe_indices)
+            W_test, A_test_recon = _train_pred_ct.predict(A_P_test_ct, indexer=probe_indices)
 
             mse_train_probe = calculate_mse(A_train_ct, A_train_recon)
             expvar_train_probe = calculate_explained_variance(A_train_ct, A_train_recon)

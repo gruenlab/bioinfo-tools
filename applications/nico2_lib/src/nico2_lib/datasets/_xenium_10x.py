@@ -14,8 +14,7 @@ import zipfile
 import requests
 from pathlib import Path
 from typing import Dict, Literal, Optional
-from anndata import read_h5ad  # type: ignore
-from anndata.typing import AnnData  # type: ignore
+from anndata import AnnData, read_h5ad  # type: ignore
 from nico2_lib.datasets._utils import ensure_dataset_dir, download_and_extract, cleanup
 
 xenium_key = Literal[

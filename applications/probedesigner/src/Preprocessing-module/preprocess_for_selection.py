@@ -1,8 +1,7 @@
 """Preprocessing for gene selection pipeline.
 
 This module preprocesses raw data for all filter/HVG combinations, creating
-preprocessed datasets with normalized expression, PCA/NMF embeddings, and
-quality control metrics.
+preprocessed datasets with normalized expression and PCA embeddings.
 """
 
 from __future__ import annotations
@@ -14,20 +13,14 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 import scanpy as sc
-import scipy.sparse
 from anndata import AnnData
-from sklearn.decomposition import NMF, PCA
 
 # Import from sibling modules
 _MODULES_DIR = Path(__file__).parent.parent
 _PREPROCESSING_DIR = Path(__file__).parent
-_UTILITY_DIR = _MODULES_DIR / "Utility-module"
 
 # Import constants from local module using direct import
 import importlib.util
@@ -38,20 +31,14 @@ _constants_spec.loader.exec_module(_preprocessing_constants)
 
 # Extract constants
 DEFAULT_N_COMPONENTS_PCA = _preprocessing_constants.DEFAULT_N_COMPONENTS_PCA
-DEFAULT_N_COMPONENTS_NMF = _preprocessing_constants.DEFAULT_N_COMPONENTS_NMF
 DEFAULT_RANDOM_STATE = _preprocessing_constants.DEFAULT_RANDOM_STATE
 NORMALIZE_TARGET_SUM = _preprocessing_constants.NORMALIZE_TARGET_SUM
+DEFAULT_N_COMPONENTS_NMF = _preprocessing_constants.DEFAULT_N_COMPONENTS_NMF
 DEFAULT_N_HVG = _preprocessing_constants.DEFAULT_N_HVG
+DEFAULT_HVG_FLAVOR = _preprocessing_constants.DEFAULT_HVG_FLAVOR
 DEFAULT_MIN_GENES_PER_CELL = _preprocessing_constants.DEFAULT_MIN_GENES_PER_CELL
 DEFAULT_MIN_CELLS_PER_GENE = _preprocessing_constants.DEFAULT_MIN_CELLS_PER_GENE
 FILTER_METHODS = _preprocessing_constants.FILTER_METHODS
-
-# Add Utility-module for validation functions
-if str(_UTILITY_DIR) not in sys.path:
-    sys.path.insert(0, str(_UTILITY_DIR))
-
-# Import from Utility-module
-from _validation import is_anndata_raw, is_anndata_raw_layer
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +112,8 @@ def preprocess_for_selection(
     filter_methods: List[str] = None,
     hvg_option: str = 'both',
     n_components_pca: int = DEFAULT_N_COMPONENTS_PCA,
-    n_components_nmf: int = DEFAULT_N_COMPONENTS_NMF,
+    n_hvg: int = DEFAULT_N_HVG,
+    hvg_flavor: str = DEFAULT_HVG_FLAVOR,
     random_state: int = DEFAULT_RANDOM_STATE
 ) -> None:
     """
@@ -134,13 +122,11 @@ def preprocess_for_selection(
     Creates preprocessed datasets for specified combinations of:
     - Filter methods (scanpy, no_filter)
     - HVG options (all_genes, hvg_subset, or both)
-    
+
     Each dataset includes:
-    - Filtered and normalized expression data
-    - Global PCA loadings
-    - Global NMF loadings (optional, if data is raw)
-    - QC plots and statistics
-    
+    - Filtered and normalized expression data (layers["counts"] = raw, .X = log-norm)
+    - PCA embedding
+
     Args:
         input_file: Path to raw h5ad file
         output_dir: Base output directory for preprocessed datasets
@@ -148,7 +134,8 @@ def preprocess_for_selection(
         filter_methods: List of filter methods to use
         hvg_option: HVG processing - 'all_genes', 'hvg', or 'both' (default)
         n_components_pca: Number of PCA components
-        n_components_nmf: Number of NMF components
+        n_hvg: Number of highly variable genes to select
+        hvg_flavor: Scanpy HVG flavor ('seurat', 'seurat_v3', 'cell_ranger')
         random_state: Random state for reproducibility
     
     Examples:
@@ -179,8 +166,9 @@ def preprocess_for_selection(
     logger.info(f"Cell type column: {celltype_column}")
     logger.info(f"Filter methods: {filter_methods}")
     logger.info(f"HVG option: {hvg_option}")
+    logger.info(f"HVG count: {n_hvg}")
+    logger.info(f"HVG flavor: {hvg_flavor}")
     logger.info(f"PCA components: {n_components_pca}")
-    logger.info(f"NMF components: {n_components_nmf}")
 
     # Load data
     logger.info("")
@@ -214,7 +202,8 @@ def preprocess_for_selection(
                     filter_method=filter_method,
                     subset_to_hvg=subset_to_hvg,
                     n_components_pca=n_components_pca,
-                    n_components_nmf=n_components_nmf,
+                    n_hvg=n_hvg,
+                    hvg_flavor=hvg_flavor,
                     random_state=random_state
                 )
             except Exception as e:
@@ -236,7 +225,8 @@ def _process_single_combination(
     filter_method: str,
     subset_to_hvg: bool,
     n_components_pca: int,
-    n_components_nmf: int,
+    n_hvg: int,
+    hvg_flavor: str,
     random_state: int
 ) -> None:
     """Process single filter/HVG combination."""
@@ -258,10 +248,6 @@ def _process_single_combination(
     adata = _apply_filtering(adata, filter_method)
     logger.info(f"After filtering: {adata.shape[0]} cells x {adata.shape[1]} genes")
 
-    # Check if data is raw BEFORE any transformations
-    is_raw = is_anndata_raw(adata)
-    logger.info(f"Data is raw (integer counts): {is_raw}")
-
     # Step 2: Normalize and log-transform
     logger.info("")
     logger.info("Step 2: Normalization and log-transformation")
@@ -274,86 +260,31 @@ def _process_single_combination(
     if subset_to_hvg:
         logger.info("")
         logger.info("Step 3: Selecting highly variable genes")
-        sc.pp.highly_variable_genes(adata, n_top_genes=DEFAULT_N_HVG)
+        sc.pp.highly_variable_genes(adata, flavor=hvg_flavor, n_top_genes=n_hvg)
         adata = adata[:, adata.var['highly_variable']].copy()
         logger.info(f"After HVG selection: {adata.shape[1]} genes")
-    
+
     # Step 4: PCA
     logger.info("")
     logger.info(f"Step 4: Running PCA ({n_components_pca} components)")
     sc.pp.pca(adata, n_comps=n_components_pca, random_state=random_state)
-    
-    # Save PCA loadings
-    pca_loadings = pd.DataFrame(
-        adata.varm['PCs'],
-        index=adata.var_names,
-        columns=[f'PC{i+1}' for i in range(n_components_pca)]
-    )
-    pca_output = os.path.join(comb_dir, 'pca_loadings.csv')
-    pca_loadings.to_csv(pca_output)
-    logger.info(f"Saved PCA loadings: {pca_output}")
-    
-    # Step 5: NMF (only if data was raw before normalization)
-    if is_raw:
-        logger.info("")
-        logger.info(f"Step 5: Running NMF ({n_components_nmf} components)")
-        
-        # Get raw counts
-        if hasattr(adata, 'raw') and adata.raw is not None:
-            counts = adata.raw.X
-        else:
-            counts = adata.X
-        
-        # Ensure sparse matrix
-        if not scipy.sparse.issparse(counts):
-            counts = scipy.sparse.csr_matrix(counts)
-        
-        # Run NMF
-        nmf_model = NMF(
-            n_components=n_components_nmf,
-            init='nndsvda',
-            solver='mu',
-            beta_loss='kullback-leibler',
-            max_iter=500,
-            random_state=random_state
-        )
-        
-        nmf_model.fit(counts)
 
-        # Save NMF loadings
-        # Note: NMF was run on adata.raw.X which may contain all genes (before HVG filtering)
-        # So we need to use adata.raw.var_names for the index, not adata.var_names
-        if hasattr(adata, 'raw') and adata.raw is not None:
-            gene_names = adata.raw.var_names
-        else:
-            gene_names = adata.var_names
-
-        nmf_loadings = pd.DataFrame(
-            nmf_model.components_.T,
-            index=gene_names,
-            columns=[f'NMF{i+1}' for i in range(n_components_nmf)]
-        )
-        nmf_output = os.path.join(comb_dir, 'nmf_loadings.csv')
-        nmf_loadings.to_csv(nmf_output)
-        logger.info(f"Saved NMF loadings: {nmf_output}")
-    else:
-        logger.warning("Data is not raw - skipping NMF")
-    
-    # Step 6: Save preprocessed data
+    # Step 5: Save preprocessed data
     logger.info("")
-    logger.info("Step 6: Saving preprocessed data")
+    logger.info("Step 5: Saving preprocessed data")
     adata_output = os.path.join(comb_dir, 'preprocessed.h5ad')
     adata.write(adata_output)
     logger.info(f"Saved preprocessed data: {adata_output}")
-    
-    # Step 7: Save metadata
+
+    # Step 6: Save metadata
     metadata = {
         'filter_method': filter_method,
         'subset_to_hvg': subset_to_hvg,
         'n_cells': adata.shape[0],
         'n_genes': adata.shape[1],
         'n_components_pca': n_components_pca,
-        'n_components_nmf': n_components_nmf if is_raw else None,
+        'n_hvg': n_hvg,
+        'hvg_flavor': hvg_flavor,
         'celltype_column': celltype_column,
         'timestamp': datetime.now().isoformat()
     }
@@ -443,8 +374,13 @@ def parse_arguments() -> argparse.Namespace:
         help=f'Number of PCA components (default: {DEFAULT_N_COMPONENTS_PCA})'
     )
     parser.add_argument(
-        '--n_components_nmf', type=int, default=DEFAULT_N_COMPONENTS_NMF,
-        help=f'Number of NMF components (default: {DEFAULT_N_COMPONENTS_NMF})'
+        '--n_hvg', type=int, default=DEFAULT_N_HVG,
+        help=f'Number of highly variable genes (default: {DEFAULT_N_HVG})'
+    )
+    parser.add_argument(
+        '--hvg_flavor', type=str, default=DEFAULT_HVG_FLAVOR,
+        choices=['seurat', 'seurat_v3', 'cell_ranger'],
+        help=f'Scanpy HVG flavor (default: {DEFAULT_HVG_FLAVOR})'
     )
     parser.add_argument(
         '--random_state', type=int, default=DEFAULT_RANDOM_STATE,
@@ -482,7 +418,8 @@ def main() -> int:
             filter_methods=args.filter_methods,
             hvg_option=args.hvg_option,
             n_components_pca=args.n_components_pca,
-            n_components_nmf=args.n_components_nmf,
+            n_hvg=args.n_hvg,
+            hvg_flavor=args.hvg_flavor,
             random_state=args.random_state
         )
         return 0

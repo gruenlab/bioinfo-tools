@@ -45,32 +45,36 @@ def is_anndata_raw(adata: AnnData) -> bool:
     if adata.X is None:
         raise ValueError("AnnData object has no data in .X")
 
-    # Handle sparse matrices
-    if scipy.sparse.issparse(adata.X):
-        # For sparse matrices, check the data array
-        sample_data = adata.X.data
-        if len(sample_data) > SAMPLE_SIZE_FOR_RAW_CHECK:
-            sample_data = sample_data[:SAMPLE_SIZE_FOR_RAW_CHECK]
-    else:
-        # For dense matrices, sample a subset
-        flat_data = adata.X.flatten()
-        if len(flat_data) > SAMPLE_SIZE_FOR_RAW_CHECK:
-            sample_indices = np.random.choice(len(flat_data), SAMPLE_SIZE_FOR_RAW_CHECK, replace=False)
-            sample_data = flat_data[sample_indices]
-        else:
-            sample_data = flat_data
-
-    # Remove zeros for the check
-    non_zero_data = sample_data[sample_data != 0]
-
-    if len(non_zero_data) == 0:
-        # All zeros - could be either, but likely raw
+    # Integer dtype is a definitive indicator of raw counts.
+    # sc.pp.normalize_total converts to float, so float dtype indicates processed data
+    # (though we still verify with a value check below for pipelines that store
+    # normalized data as float from the start).
+    if np.issubdtype(adata.X.dtype, np.integer):
         return True
 
-    # Check if values are close to integers (within floating point precision)
-    is_integer_data = np.allclose(non_zero_data, np.round(non_zero_data))
+    # Value-based check: sample specifically from non-zero positions to avoid the
+    # all-zeros false positive on sparse panels (random sampling from the full
+    # matrix can land entirely on zero-valued positions, making non_zero_data empty
+    # and causing np.allclose([], []) to vacuously return True).
+    if scipy.sparse.issparse(adata.X):
+        # .data contains only the stored (non-zero) values — no zeros to sample.
+        non_zero_data = adata.X.data
+        if len(non_zero_data) > SAMPLE_SIZE_FOR_RAW_CHECK:
+            idx = np.random.choice(len(non_zero_data), SAMPLE_SIZE_FOR_RAW_CHECK, replace=False)
+            non_zero_data = non_zero_data[idx]
+    else:
+        flat = adata.X.flatten()
+        nz_idx = np.flatnonzero(flat)
+        if len(nz_idx) == 0:
+            return True  # All zeros — conservative: assume raw
+        if len(nz_idx) > SAMPLE_SIZE_FOR_RAW_CHECK:
+            nz_idx = np.random.choice(nz_idx, SAMPLE_SIZE_FOR_RAW_CHECK, replace=False)
+        non_zero_data = flat[nz_idx]
 
-    return is_integer_data
+    if len(non_zero_data) == 0:
+        return True  # Sparse with no stored values — assume raw
+
+    return bool(np.allclose(non_zero_data, np.round(non_zero_data)))
 
 
 def is_anndata_raw_layer(adata: AnnData, layer_name: str) -> bool:
@@ -92,32 +96,27 @@ def is_anndata_raw_layer(adata: AnnData, layer_name: str) -> bool:
 
     layer_data = adata.layers[layer_name]
 
-    # Handle sparse matrices
-    if scipy.sparse.issparse(layer_data):
-        # For sparse matrices, check the data array
-        sample_data = layer_data.data
-        if len(sample_data) > SAMPLE_SIZE_FOR_RAW_CHECK:
-            sample_data = sample_data[:SAMPLE_SIZE_FOR_RAW_CHECK]
-    else:
-        # For dense matrices, sample a subset
-        flat_data = layer_data.flatten()
-        if len(flat_data) > SAMPLE_SIZE_FOR_RAW_CHECK:
-            sample_indices = np.random.choice(len(flat_data), SAMPLE_SIZE_FOR_RAW_CHECK, replace=False)
-            sample_data = flat_data[sample_indices]
-        else:
-            sample_data = flat_data
-
-    # Remove zeros for the check
-    non_zero_data = sample_data[sample_data != 0]
-
-    if len(non_zero_data) == 0:
-        # All zeros - could be either, but likely raw
+    if np.issubdtype(layer_data.dtype, np.integer):
         return True
 
-    # Check if values are close to integers (within floating point precision)
-    is_integer_data = np.allclose(non_zero_data, np.round(non_zero_data))
+    if scipy.sparse.issparse(layer_data):
+        non_zero_data = layer_data.data
+        if len(non_zero_data) > SAMPLE_SIZE_FOR_RAW_CHECK:
+            idx = np.random.choice(len(non_zero_data), SAMPLE_SIZE_FOR_RAW_CHECK, replace=False)
+            non_zero_data = non_zero_data[idx]
+    else:
+        flat = layer_data.flatten()
+        nz_idx = np.flatnonzero(flat)
+        if len(nz_idx) == 0:
+            return True
+        if len(nz_idx) > SAMPLE_SIZE_FOR_RAW_CHECK:
+            nz_idx = np.random.choice(nz_idx, SAMPLE_SIZE_FOR_RAW_CHECK, replace=False)
+        non_zero_data = flat[nz_idx]
 
-    return is_integer_data
+    if len(non_zero_data) == 0:
+        return True
+
+    return bool(np.allclose(non_zero_data, np.round(non_zero_data)))
 
 
 def X_is_raw(adata: AnnData, X: bool = True) -> bool:

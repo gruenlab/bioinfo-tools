@@ -100,7 +100,7 @@ def select_DEGs(
     and marks top N genes as selected.
 
     Note: min_fold_change is NOT used for exclusion, only for ranking. This ensures
-    enough genes remain for downstream ODT/Xenium filtering.
+    enough genes remain for downstream Xenium filtering.
 
     Args:
         adata: Processed AnnData object (log-normalized)
@@ -195,7 +195,7 @@ def select_DEGs(
     logger.info(f"After p-value filter: {len(deg_df_filtered)} genes remain (ranked by scanpy scores)")
     logger.info(f"Excluded: {len(deg_df) - len(deg_df_filtered)} genes with pval_adj > {max_pval}")
 
-    # Add ALL genes passing pval filter to builder (for comprehensive tracking and ODT replacement)
+    # Add ALL genes passing pval filter to builder (for comprehensive tracking and replacement)
     for _, row in deg_df_filtered.iterrows():
         builder.add_gene(
             gene=row["gene"],

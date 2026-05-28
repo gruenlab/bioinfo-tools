@@ -60,10 +60,12 @@ __all__ = [
     "compute_neighborhood_preservation",
     "evaluate_neighborhood_preservation",
     "compute_clustering_similarity",
+    "compute_celltype_jaccard_vs_leiden",
     "evaluate_clustering_quality",
     "split_train_test_sets",
     "uniform_samples",
     "evaluate_celltype_identification",
+    "compute_rare_celltype_marker_coverage",
 ]
 
 # Ensure the Utility-module directory is on sys.path so its files are importable
@@ -74,12 +76,19 @@ if str(_utility_dir) not in sys.path:
 
 from _validation import is_anndata_raw, is_anndata_raw_layer, X_is_raw  # noqa: E402
 
+# Ensure the evaluation module directory is on sys.path for sibling imports
+if str(_current_dir) not in sys.path:
+    sys.path.insert(0, str(_current_dir))
+
+from metrics import calculate_inverse_frequency_weighted_f1  # noqa: E402
+
 
 def compute_neighborhood_preservation(
     ref_data: sc.AnnData,
     reduced_data: sc.AnnData,
     k_values: list[int] | None = None,
     dimensionality_reduction: str = "pca",
+    cell_annotations: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Compute how well k-nearest neighbors are preserved between datasets.
 
@@ -92,10 +101,15 @@ def compute_neighborhood_preservation(
         k_values: List of k values to evaluate. Defaults to [5, 10, 15, 20, 30, 50].
         dimensionality_reduction: Which dimensionality reduction was used: "pca",
             "nmf", or "both" (default: "pca").
+        cell_annotations: Optional array of cell type labels aligned with the common
+            cells (post-subset order). When provided, per-cell-type mean Jaccard scores
+            are stored under "celltype_scores" in the return dict.
 
     Returns:
         Dictionary with preservation scores for each k value and optimal k.
         If dimensionality_reduction="both", returns nested dict with 'pca' and 'nmf' keys.
+        When cell_annotations is provided, each rep result also has a "celltype_scores"
+        key: {k: {celltype: mean_jaccard}}.
     """
     if k_values is None:
         k_values = DEFAULT_KNN_K_VALUES
@@ -131,7 +145,8 @@ def compute_neighborhood_preservation(
         if len(representations) > 1:
             logger.info(f"\n--- Evaluating {rep.upper()} representation ---")
 
-        knn_overlap_scores = {}
+        knn_overlap_scores: dict[int, float] = {}
+        knn_celltype_scores: dict[int, dict[str, float]] = {}
 
         # For each k value, compute the preservation score
         for k in k_values:
@@ -178,6 +193,7 @@ def compute_neighborhood_preservation(
 
             # Calculate neighborhood overlap for each cell
             knn_overlap_sum = 0
+            ct_overlap_accumulator: dict[str, list[float]] = {}
 
             for i in range(n_cells):
                 # Get indices of k nearest neighbors in reference
@@ -200,8 +216,19 @@ def compute_neighborhood_preservation(
                 overlap = intersection / union if union > 0 else 0
                 knn_overlap_sum += overlap
 
+                # Accumulate per-cell-type scores
+                if cell_annotations is not None:
+                    ct = str(cell_annotations[i])
+                    if ct not in ct_overlap_accumulator:
+                        ct_overlap_accumulator[ct] = []
+                    ct_overlap_accumulator[ct].append(overlap)
+
             # Store average overlap for this k
             knn_overlap_scores[k] = knn_overlap_sum / n_cells
+            if cell_annotations is not None:
+                knn_celltype_scores[k] = {
+                    ct: float(np.mean(scores)) for ct, scores in ct_overlap_accumulator.items()
+                }
             logger.info(f"Average neighborhood preservation for k={k}: {knn_overlap_scores[k]:.4f}")
 
         # Find the k value with the best preservation score
@@ -214,7 +241,12 @@ def compute_neighborhood_preservation(
             best_score = np.nan
 
         # Store results for this representation
-        all_results[rep] = {"optimal_k": optimal_k, "scores": knn_overlap_scores, "best_score": best_score}
+        all_results[rep] = {
+            "optimal_k": optimal_k,
+            "scores": knn_overlap_scores,
+            "best_score": best_score,
+            "celltype_scores": knn_celltype_scores,
+        }
 
     # Return nested dict if multiple representations, flat dict if single representation
     if len(representations) > 1:
@@ -227,6 +259,7 @@ def evaluate_neighborhood_preservation(
     sets: dict[str, sc.AnnData],
     reference_key: str = "full_transcriptome",
     dimensionality_reduction: str = "pca",
+    celltype_col: str | None = None,
 ) -> pd.DataFrame:
     """Evaluate neighborhood preservation across all genesets.
 
@@ -234,6 +267,9 @@ def evaluate_neighborhood_preservation(
         sets: Dictionary of AnnData objects for different genesets.
         reference_key: Key for the reference dataset in the sets dictionary.
         dimensionality_reduction: Which dimensionality reduction to use ("pca", "nmf", or "both").
+        celltype_col: Optional column in obs with cell type labels. When provided,
+            per-cell-type mean kNN Jaccard scores are appended to the result DataFrame
+            as rows with a "celltype" column.
 
     Returns:
         DataFrame with neighborhood preservation metrics for all genesets.
@@ -290,10 +326,21 @@ def evaluate_neighborhood_preservation(
 
         logger.info(f"\nEvaluating neighborhood preservation for: {dataset_name}")
 
+        # Build cell_annotations aligned with common cells (post-subset order)
+        cell_annotations: np.ndarray | None = None
+        if celltype_col is not None and celltype_col in reference_data.obs.columns:
+            common_cells = list(
+                set(reference_data.obs_names).intersection(set(dataset.obs_names))
+            )
+            cell_annotations = reference_data[common_cells].obs[celltype_col].values
+
         # Compute neighborhood preservation across different k values
         # Pass the dimensionality reduction method
         preservation_results = compute_neighborhood_preservation(
-            reference_data, dataset, dimensionality_reduction=dimensionality_reduction
+            reference_data,
+            dataset,
+            dimensionality_reduction=dimensionality_reduction,
+            cell_annotations=cell_annotations,
         )
 
         # Handle both flat (single representation) and nested (both representations) results
@@ -348,6 +395,30 @@ def evaluate_neighborhood_preservation(
                 }
             )
 
+        # Emit per-cell-type kNN Jaccard rows from celltype_scores
+        if dimensionality_reduction == "both":
+            reps_to_check = ["pca", "nmf"]
+            rep_results_map = preservation_results
+        else:
+            reps_to_check = [dimensionality_reduction]
+            rep_results_map = {dimensionality_reduction: preservation_results}
+
+        for rep in reps_to_check:
+            if rep not in rep_results_map:
+                continue
+            ct_scores = rep_results_map[rep].get("celltype_scores", {})
+            for k, ct_dict in ct_scores.items():
+                for ct, score in ct_dict.items():
+                    results.append(
+                        {
+                            "dataset": dataset_name,
+                            "representation": rep,
+                            "k": k,
+                            "preservation_score": score,
+                            "celltype": ct,
+                        }
+                    )
+
     # Convert to DataFrame
     results_df = pd.DataFrame(results)
 
@@ -355,16 +426,20 @@ def evaluate_neighborhood_preservation(
 
 
 def compute_clustering_similarity(
-    reference_data: sc.AnnData, test_data: sc.AnnData
+    reference_data: sc.AnnData,
+    test_data: sc.AnnData,
+    celltype_col: str | None = None,
 ) -> dict[str, Any]:
     """Compute similarity between clustering results using ARI and NMI.
 
     Args:
         reference_data: Reference AnnData object with Leiden clustering results.
         test_data: Test AnnData object with Leiden clustering results.
+        celltype_col: Optional column in reference_data.obs with true cell type labels.
+            When provided, also computes per-cell-type Jaccard similarity vs Leiden clusters.
 
     Returns:
-        Dictionary with ARI and NMI scores for different cluster resolutions.
+        Dictionary with ARI, NMI, and (if celltype_col given) celltype_jaccard scores.
     """
     # Match cell barcodes between datasets
     common_cells = list(set(reference_data.obs_names).intersection(set(test_data.obs_names)))
@@ -488,13 +563,99 @@ def compute_clustering_similarity(
         logger.info(f"Default leiden ARI: {default_ari:.4f}")
         logger.info(f"Default leiden NMI: {default_nmi:.4f}")
 
-    return {"ari": ari_scores, "nmi": nmi_scores}
+    # Compute per-cell-type Jaccard/purity against best-matching Leiden clusters.
+    celltype_jaccard: dict[str, Any] = {}
+    if celltype_col is not None and celltype_col in ref_subset.obs.columns:
+        true_labels = ref_subset.obs[celltype_col].values
+        for rep in representations:
+            if rep is not None:
+                cluster_col_candidates = [
+                    col for col in test_subset.obs.columns
+                    if col.startswith("leiden_") and "_clusters" in col and f"_{rep}" in col
+                ]
+            else:
+                cluster_col_candidates = [
+                    col for col in test_subset.obs.columns
+                    if col.startswith("leiden_") and "_clusters" in col
+                    and "_pca" not in col and "_nmf" not in col
+                ]
+            if cluster_col_candidates:
+                def _extract_n(col: str) -> int:
+                    try:
+                        return int(col.split("_")[1])
+                    except (IndexError, ValueError):
+                        return 0
+                best_col = max(cluster_col_candidates, key=_extract_n)
+                jaccard_results = compute_celltype_jaccard_vs_leiden(
+                    true_labels, test_subset.obs[best_col].values
+                )
+                rep_key = rep if rep is not None else "default"
+                celltype_jaccard[rep_key] = jaccard_results
+
+    return {"ari": ari_scores, "nmi": nmi_scores, "celltype_jaccard": celltype_jaccard}
+
+
+def compute_celltype_jaccard_vs_leiden(
+    true_labels: np.ndarray,
+    cluster_labels: np.ndarray,
+) -> dict[str, dict[str, Any]]:
+    """Compute per-cell-type Jaccard similarity and purity against Leiden clusters.
+
+    For each true cell type T, finds the best-matching Leiden cluster (maximum
+    intersection), then computes Jaccard(T, C_best) and purity(T, C_best).
+
+    This complements global ARI/NMI by giving per-class clustering quality,
+    exposing poor recovery of rare cell types that global metrics mask.
+
+    Args:
+        true_labels: Ground-truth cell type annotation array (n_cells,).
+        cluster_labels: Leiden cluster label array (n_cells,) aligned with true_labels.
+
+    Returns:
+        Dictionary keyed by cell type name, each containing:
+            - jaccard: |T ∩ C_best| / |T ∪ C_best|
+            - purity: |T ∩ C_best| / |T|
+            - n_cells: number of cells belonging to this cell type
+            - best_cluster: label of the best-matching Leiden cluster
+    """
+    true_labels = np.asarray(true_labels)
+    cluster_labels = np.asarray(cluster_labels)
+
+    results: dict[str, dict[str, Any]] = {}
+    for ct in np.unique(true_labels):
+        ct_mask = true_labels == ct
+        ct_indices = set(np.where(ct_mask)[0])
+        n_ct = len(ct_indices)
+
+        best_cluster = None
+        best_overlap = -1
+        for cl in np.unique(cluster_labels):
+            cl_indices = set(np.where(cluster_labels == cl)[0])
+            overlap = len(ct_indices & cl_indices)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_cluster = cl
+                best_cl_indices = cl_indices
+
+        union = len(ct_indices | best_cl_indices)
+        jaccard = best_overlap / union if union > 0 else 0.0
+        purity = best_overlap / n_ct if n_ct > 0 else 0.0
+
+        results[str(ct)] = {
+            "jaccard": float(jaccard),
+            "purity": float(purity),
+            "n_cells": int(n_ct),
+            "best_cluster": str(best_cluster),
+        }
+
+    return results
 
 
 def evaluate_clustering_quality(
     sets: dict[str, sc.AnnData],
     reference_key: str = "full_transcriptome",
     dimensionality_reduction: str = "pca",
+    celltype_col: str | None = None,
 ) -> pd.DataFrame:
     """Evaluate clustering quality across all genesets.
 
@@ -502,9 +663,13 @@ def evaluate_clustering_quality(
         sets: Dictionary of AnnData objects for different genesets.
         reference_key: Key for the reference dataset in the sets dictionary.
         dimensionality_reduction: Which dimensionality reduction was used.
+        celltype_col: Optional column in obs with true cell type labels. When provided,
+            per-cell-type Jaccard and purity rows are appended to the result DataFrame.
 
     Returns:
         DataFrame with clustering similarity metrics for all genesets.
+        When celltype_col is given, additional rows have a "celltype" column with
+        "jaccard" and "purity" values.
     """
     # Initialize results storage
     results = []
@@ -519,10 +684,13 @@ def evaluate_clustering_quality(
 
         logger.info(f"\nEvaluating clustering quality for: {dataset_name}")
 
-        # Compute clustering similarity (returns dict with 'ari' and 'nmi' keys)
-        clustering_scores = compute_clustering_similarity(reference_data, dataset)
+        # Compute clustering similarity (returns dict with 'ari', 'nmi', 'celltype_jaccard')
+        clustering_scores = compute_clustering_similarity(
+            reference_data, dataset, celltype_col=celltype_col
+        )
         ari_scores = clustering_scores["ari"]
         nmi_scores = clustering_scores["nmi"]
+        celltype_jaccard_scores = clustering_scores.get("celltype_jaccard", {})
 
         # Determine which representation(s) were used
         # Check if we have both PCA and NMF embeddings to know if we used "both" mode
@@ -577,6 +745,21 @@ def evaluate_clustering_quality(
                         "ARI": ari,
                         "NMI": nmi,
                         "representation": representation,
+                    }
+                )
+
+        # Emit per-cell-type Jaccard/purity rows (one row per CT per representation)
+        for rep_key, ct_dict in celltype_jaccard_scores.items():
+            for ct, ct_metrics in ct_dict.items():
+                results.append(
+                    {
+                        "dataset": dataset_name,
+                        "representation": rep_key,
+                        "celltype": ct,
+                        "jaccard": ct_metrics["jaccard"],
+                        "purity": ct_metrics["purity"],
+                        "n_cells": ct_metrics["n_cells"],
+                        "best_cluster": ct_metrics["best_cluster"],
                     }
                 )
 
@@ -873,6 +1056,15 @@ def evaluate_celltype_identification(
             # Extract macro F1-score for display
             macro_f1 = class_report["macro avg"]["f1-score"]
 
+            # Compute inverse-frequency weighted F1 (amplifies rare cell types)
+            per_ct_f1 = {
+                ct: class_report[ct]["f1-score"]
+                for ct in dt_classifier.classes_
+                if ct in class_report
+            }
+            full_ct_counts = test_subset.obs[celltype_col].value_counts().to_dict()
+            inv_freq_f1 = calculate_inverse_frequency_weighted_f1(per_ct_f1, full_ct_counts)
+
             # Store results - include both macro and weighted F1 scores
             results.append(
                 {
@@ -884,6 +1076,7 @@ def evaluate_celltype_identification(
                     "weighted_f1": class_report["weighted avg"]["f1-score"],
                     "weighted_precision": class_report["weighted avg"]["precision"],
                     "weighted_recall": class_report["weighted avg"]["recall"],
+                    "inverse_freq_weighted_f1": inv_freq_f1,
                 }
             )
 
@@ -980,3 +1173,127 @@ def evaluate_celltype_identification(
             )
 
     return results_df
+
+
+def compute_rare_celltype_marker_coverage(
+    adata_ref: sc.AnnData,
+    panel_genes: list[str],
+    celltype_col: str,
+    rare_threshold_fraction: float = 0.01,
+    rare_threshold_absolute: int = 50,
+    top_n_deg: int = 50,
+    log2fc_threshold: float = 1.0,
+    pval_threshold: float = 0.05,
+    deg_key: str = "rank_genes_groups",
+    force_recompute: bool = False,
+) -> dict[str, Any]:
+    """Compute how many exclusive DEG markers for rare cell types are in the panel.
+
+    For each rare cell type (below frequency or absolute-count thresholds), counts
+    how many panel genes are exclusive markers (top DEGs with sufficient FC and
+    significance). Returns both per-CT counts and a panel-level coverage fraction.
+
+    Args:
+        adata_ref: Reference AnnData with expression in .X and cell type labels in obs.
+        panel_genes: List of gene names in the evaluated panel.
+        celltype_col: Column in adata_ref.obs with cell type labels.
+        rare_threshold_fraction: Cell types with < this fraction of total cells are rare.
+        rare_threshold_absolute: Cell types with fewer than this many cells are rare.
+        top_n_deg: Maximum number of top DEGs per cell type to consider.
+        log2fc_threshold: Minimum log2 fold-change for a gene to be an exclusive marker.
+        pval_threshold: Maximum adjusted p-value for a gene to be an exclusive marker.
+        deg_key: Key in adata_ref.uns where rank_genes_groups results are stored.
+        force_recompute: If True, recompute DEGs even if deg_key exists in adata_ref.uns.
+
+    Returns:
+        Dictionary with:
+            - rare_celltypes: list of rare cell type names
+            - n_rare_celltypes: count of rare cell types
+            - per_rare_ct: dict mapping each rare CT to coverage stats
+            - panel_fraction_rare_ct_covered: fraction of rare CTs with >=1 panel marker
+            - panel_n_rare_ct_covered: count of rare CTs with >=1 panel marker
+    """
+    if celltype_col not in adata_ref.obs.columns:
+        raise ValueError(f"celltype_col '{celltype_col}' not found in adata_ref.obs")
+
+    ct_counts = adata_ref.obs[celltype_col].value_counts()
+    n_total = int(ct_counts.sum())
+
+    rare_celltypes = [
+        ct for ct, n in ct_counts.items()
+        if n < rare_threshold_absolute or n < n_total * rare_threshold_fraction
+    ]
+
+    if not rare_celltypes:
+        logger.info("No rare cell types found with current thresholds.")
+        return {
+            "rare_celltypes": [],
+            "n_rare_celltypes": 0,
+            "per_rare_ct": {},
+            "panel_fraction_rare_ct_covered": float("nan"),
+            "panel_n_rare_ct_covered": 0,
+        }
+
+    # Obtain DEG results — compute on a copy if missing or forced
+    if deg_key not in adata_ref.uns or force_recompute:
+        logger.warning(
+            f"DEG key '{deg_key}' not found in adata_ref.uns (or force_recompute=True). "
+            "Computing DEGs via wilcoxon on a copy — this may be slow."
+        )
+        adata_copy = adata_ref.copy()
+        sc.tl.rank_genes_groups(
+            adata_copy,
+            groupby=celltype_col,
+            method="wilcoxon",
+            key_added=deg_key,
+            use_raw=False,
+        )
+        deg_uns = adata_copy.uns[deg_key]
+    else:
+        deg_uns = adata_ref.uns[deg_key]
+
+    panel_gene_set = set(panel_genes)
+    per_rare_ct: dict[str, dict[str, Any]] = {}
+
+    for ct in rare_celltypes:
+        ct_str = str(ct)
+        n_cells = int(ct_counts[ct])
+
+        try:
+            names = np.asarray(deg_uns["names"][ct_str])
+            logfcs = np.asarray(deg_uns["logfoldchanges"][ct_str])
+            pvals_adj = np.asarray(deg_uns["pvals_adj"][ct_str])
+        except (KeyError, TypeError):
+            logger.warning(f"DEG results not found for cell type '{ct_str}', skipping.")
+            per_rare_ct[ct_str] = {
+                "n_exclusive_markers_total": 0,
+                "n_exclusive_markers_in_panel": 0,
+                "n_cells": n_cells,
+                "fraction_cells": n_cells / n_total,
+            }
+            continue
+
+        # Select top-N DEGs passing FC and p-value thresholds
+        passing = (logfcs >= log2fc_threshold) & (pvals_adj < pval_threshold)
+        exclusive_markers = list(names[:top_n_deg][passing[:top_n_deg]])
+
+        n_exclusive_total = len(exclusive_markers)
+        n_in_panel = len([g for g in exclusive_markers if g in panel_gene_set])
+
+        per_rare_ct[ct_str] = {
+            "n_exclusive_markers_total": n_exclusive_total,
+            "n_exclusive_markers_in_panel": n_in_panel,
+            "n_cells": n_cells,
+            "fraction_cells": n_cells / n_total,
+        }
+
+    n_covered = sum(1 for v in per_rare_ct.values() if v["n_exclusive_markers_in_panel"] >= 1)
+    n_rare = len(rare_celltypes)
+
+    return {
+        "rare_celltypes": [str(ct) for ct in rare_celltypes],
+        "n_rare_celltypes": n_rare,
+        "per_rare_ct": per_rare_ct,
+        "panel_fraction_rare_ct_covered": n_covered / n_rare if n_rare > 0 else float("nan"),
+        "panel_n_rare_ct_covered": n_covered,
+    }

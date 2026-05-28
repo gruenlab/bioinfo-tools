@@ -1647,7 +1647,7 @@ def plot_neighborhood_preservation_by_k(results_df, output_dir, PNG_DPI=DEFAULT_
             
             plt.xlabel('Number of Neighbors (k)', fontsize=14)
             plt.ylabel('Neighborhood Preservation Score', fontsize=14)
-            plt.title(f'Jaccard similarity by k-value: Probe set vs full transcriptome (based on PCA-embedding)', fontsize=16)
+            plt.title(f'Jaccard similarity by k-value: Probe set vs full transcriptome (based on {rep.upper()}-embedding)', fontsize=16)
             plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
             plt.grid(True, alpha=0.3)
             
@@ -1687,7 +1687,8 @@ def plot_neighborhood_preservation_by_k(results_df, output_dir, PNG_DPI=DEFAULT_
         
         plt.xlabel('Number of Neighbors (k)', fontsize=14)
         plt.ylabel('Neighborhood Preservation Score', fontsize=14)
-        plt.title('Jaccard similarity by k-value: Probe set vs full transcriptome (based on PCA-embedding)', fontsize=16)
+        single_rep = numeric_results['representation'].iloc[0].upper() if 'representation' in numeric_results.columns else 'PCA'
+        plt.title(f'Jaccard similarity by k-value: Probe set vs full transcriptome (based on {single_rep}-embedding)', fontsize=16)
         plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.grid(True, alpha=0.3)
         
@@ -1833,7 +1834,8 @@ def plot_optimal_neighborhood_preservation(results_df, output_dir, PNG_DPI=DEFAU
         
         plt.xlabel('Geneset', fontsize=14)
         plt.ylabel('Optimal Neighborhood Preservation Score', fontsize=14)
-        plt.title('Optimal Neighborhood Preservation by Geneset', fontsize=16)
+        single_rep = summary_results['representation'].iloc[0].upper() if 'representation' in summary_results.columns else 'PCA'
+        plt.title(f'Optimal Neighborhood Preservation by Geneset ({single_rep})', fontsize=16)
         plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
         plt.ylim(0, 1.05)
@@ -1970,7 +1972,8 @@ def plot_neighborhood_preservation_heatmap(results_df, output_dir, PNG_DPI=DEFAU
         
         plt.figure(figsize=(14, 10))
         sns.heatmap(pivot_df, annot=True, cmap='viridis', fmt='.3f')
-        plt.title('Neighborhood Preservation Scores Across k Values', fontsize=16)
+        single_rep = numeric_results['representation'].iloc[0].upper() if 'representation' in numeric_results.columns else 'PCA'
+        plt.title(f'Neighborhood Preservation Scores Across k Values ({single_rep})', fontsize=16)
         plt.xlabel('k', fontsize=14)
         plt.ylabel('Geneset', fontsize=14)
         plt.tight_layout()
@@ -2208,19 +2211,19 @@ def plot_clustering_quality_ari(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
         plt.xticks(rotation=45, ha='right')  # Rotate x-axis labels for better readability
         
         # Create title with batch and gene_set info if provided
-        title_parts = ['Probe set vs full transcriptome (based on PCA-embedding)']
+        title_parts = [f'Probe set vs full transcriptome (based on {rep_label}-embedding)']
         if batch:
             title_parts.append(f'Batch {batch}')
         if gene_set:
             filter_text = "(Xenium Filter)" if with_filter else "(No Filter)"
             title_parts.append(f'{gene_set} {filter_text}')
         plt.title(' - '.join(title_parts), fontsize=16)
-        
+
         plt.grid(True, linestyle='--', alpha=0.7)
-        
+
         plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
         plt.subplots_adjust(right=0.65)
-        
+
         # Save figure
         filename_parts = ['clustering_quality_ari']
         if batch:
@@ -2470,19 +2473,19 @@ def plot_clustering_quality_nmi(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
         plt.xticks(rotation=45, ha='right')  # Rotate x-axis labels for better readability
         
         # Create title with batch and gene_set info if provided
-        title_parts = ['Probe set vs full transcriptome (based on PCA-embedding)']
+        title_parts = [f'Probe set vs full transcriptome (based on {rep_label}-embedding)']
         if batch:
             title_parts.append(f'Batch {batch}')
         if gene_set:
             filter_text = "(Xenium Filter)" if with_filter else "(No Filter)"
             title_parts.append(f'{gene_set} {filter_text}')
         plt.title(' - '.join(title_parts), fontsize=16)
-        
+
         plt.grid(True, linestyle='--', alpha=0.7)
-        
+
         plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
         plt.subplots_adjust(right=0.65)
-        
+
         # Save figure
         filename_parts = ['clustering_quality_nmi']
         if batch:

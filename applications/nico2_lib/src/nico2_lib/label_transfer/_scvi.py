@@ -1,5 +1,5 @@
 import numpy as np
-from anndata.typing import AnnData
+from anndata import AnnData
 from numpy.typing import NDArray
 
 

@@ -11,7 +11,6 @@ FILTERING ORDER (EXACT MATCH TO ORIGINAL):
 2. RUN SELECTION STRATEGY: Work on filtered adata
 3. XENIUM FILTER (POST-selection): Apply to ranked gene list, celltype-aware
 4. SELECT TOP N: From Xenium-filtered list
-5. ODT FILTER (POST-selection): Apply to top N genes with replacement
 
 This ensures all strategies use the exact same filtering logic as the original
 pipeline, maintaining consistency and reproducibility.
@@ -47,13 +46,9 @@ from _filtering import (
 from _constants import (
     COL_SELECTED_INITIAL,
     COL_PASSED_XENIUM,
-    COL_PASSED_ODT,
     COL_GENE,
     COL_SELECTION_SCORE,
 )
-
-from _odt_filtering import apply_odt_filter_with_replacement
-from _design_probes import CompleteProbeDesignPipeline
 
 from _deg_selection import select_DEGs
 from _baseline_selection import (
@@ -74,13 +69,10 @@ from _constants import (
     COL_CELLTYPE,
     DEFAULT_MIN_XENIUM_EXPRESSION,
     DEFAULT_MAX_XENIUM_EXPRESSION,
-    DEFAULT_ODT_METHOD,
-    DEFAULT_ODT_MIN_PROBES_THRESHOLD,
     DEFAULT_REDUCTION_TYPES,
     DEFAULT_ANALYSIS_TYPES,
     DEFAULT_PER_FACTOR_SELECTION,
-    DEFAULT_BLACKLIST_PATTERNS
-    
+    DEFAULT_BLACKLIST_PATTERNS,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,18 +96,6 @@ def run_single_selection(
     xenium_max_expr: float = DEFAULT_MAX_XENIUM_EXPRESSION,
     mean_expr_per_ct: Optional[dict] = None,
     global_mean_expr: Optional[dict] = None,
-    # ODT filter (POST-selection)
-    apply_odt_filter: bool = False,
-    odt_gtf_file: Optional[str] = None,
-    odt_genome_file: Optional[str] = None,
-    odt_species: str = "mus_musculus",
-    odt_method: str = DEFAULT_ODT_METHOD,
-    odt_annotation_source: str = "ensembl",
-    odt_annotation_release: str = "110",
-    odt_min_probes_threshold: int = DEFAULT_ODT_MIN_PROBES_THRESHOLD,
-    odt_n_jobs: int = 4,
-    odt_output_dir: Optional[str] = None,
-    odt_reference_dir: Optional[str] = None,
     # Strategy-specific parameters
     reduction_type: Optional[str] = DEFAULT_REDUCTION_TYPES,  # 'nmf' or 'pca'
     analysis_type: str = DEFAULT_ANALYSIS_TYPES,  # 'global' or 'per_celltype'
@@ -132,6 +112,7 @@ def run_single_selection(
     nmf_loadings_per_celltype: Optional[dict] = None,
     pca_loadings_global: Optional[pd.DataFrame] = None,
     pca_loadings_per_celltype: Optional[dict] = None,
+    nmf_counts_input: str = "raw",
     # cNMF options (only used when reduction_type == 'nmf')
     use_consensus_nmf: bool = False,
     k_min: int = 3,
@@ -152,7 +133,6 @@ def run_single_selection(
     2. Run selection strategy: Work on filtered adata
     3. Xenium filter (POST-selection): Apply to ranked genes, celltype-aware
     4. Select top N: From Xenium-filtered list
-    5. ODT filter (POST-selection): Apply to top N with replacement
 
     Args:
         adata: Annotated data matrix (will be modified if blacklist applied)
@@ -172,17 +152,6 @@ def run_single_selection(
         xenium_min_expr: Min expression threshold for Xenium
         xenium_max_expr: Max expression threshold for Xenium
         mean_expr_per_ct: Pre-computed per-celltype mean expression
-        apply_odt_filter: Whether to apply ODT designability filter
-        odt_gtf_file: Path to GTF file for ODT
-        odt_genome_file: Path to genome FASTA for ODT
-        odt_species: Species name for ODT (default: 'mus_musculus')
-        odt_method: ODT probe design method ('SCRINSHOT', 'MERFISH', 'SEQFISHPLUS')
-        odt_annotation_source: Annotation source ('ensembl' or 'ncbi')
-        odt_annotation_release: Annotation release version (default: '110')
-        odt_min_probes_threshold: Minimum successful probe sets required (default: 3)
-        odt_n_jobs: Number of parallel jobs for ODT (default: 4)
-        odt_output_dir: Custom ODT output directory (default: results_dir/odt_filtering)
-        odt_reference_dir: Shared ODT reference directory (default: parent of results_dir/odt_references_shared)
         reduction_type: 'nmf' or 'pca' (for dimred_only strategy)
         analysis_type: 'global' or 'per_celltype'
         dimred_method: Gene selection method (only 'method_a' — top genes by absolute factor loading)
@@ -210,15 +179,6 @@ def run_single_selection(
         ...     blacklist_patterns=['mt-', 'Rps', 'Rpl'],
         ...     apply_xenium_filter=True,
         ...     mean_expr_per_ct=mean_expr_dict
-        ... )
-
-        >>> # Random forest with DEG caching
-        >>> builder = run_single_selection(
-        ...     adata,
-        ...     strategy='rf_deg',
-        ...     deg_results=cached_deg_builder,  # Reuse DEGs
-        ...     apply_odt_filter=True,
-        ...     odt_gtf_file='genome.gtf'
         ... )
 
         >>> # NMF selection (per-celltype, Method A)
@@ -362,6 +322,7 @@ def run_single_selection(
                 results_dir=results_dir,
                 nmf_model_cache_dir=nmf_model_cache_dir,
                 mean_expr_per_ct=mean_expr_per_ct,
+                nmf_counts_input=nmf_counts_input,
                 use_consensus_nmf=use_consensus_nmf,
                 k_min=k_min,
                 k_max=k_max,
@@ -493,157 +454,11 @@ def run_single_selection(
 
     selected_genes = builder.get_selected_genes('initial')
 
-    # ========================================================================
-    # STEP 5: ODT DESIGNABILITY FILTER WITH REPLACEMENT
-    # ========================================================================
-    # Apply ODT filter to final selected genes, replacing failed genes
-    # with next-best candidates from the filtered list.
-    # ========================================================================
-
-    odt_filter_applied = False
-    if apply_odt_filter:
-        # Auto-download references if not provided or don't exist
-        download_needed = False
-        if odt_gtf_file is None or odt_genome_file is None:
-            logger.info("Reference files not provided, will attempt to download...")
-            download_needed = True
-        elif not os.path.exists(odt_gtf_file) or not os.path.exists(odt_genome_file):
-            logger.warning(
-                f"Provided reference files not found:\n"
-                f"  GTF: {odt_gtf_file} (exists: {os.path.exists(odt_gtf_file)})\n"
-                f"  Genome: {odt_genome_file} (exists: {os.path.exists(odt_genome_file)})\n"
-                f"Will attempt to download..."
-            )
-            download_needed = True
-        
-        if download_needed:
-            try:
-                if odt_reference_dir is None and results_dir:
-                    odt_reference_dir = os.path.join(
-                        os.path.dirname(os.path.abspath(results_dir)),
-                        "odt_references_shared",
-                    )
-                elif odt_reference_dir is None:
-                    odt_reference_dir = "./odt_references"
-
-                os.makedirs(odt_reference_dir, exist_ok=True)
-
-                logger.info(
-                    f"Downloading reference genome for {odt_species} "
-                    f"(source: {odt_annotation_source}, release: {odt_annotation_release})"
-                )
-                # Initialize pipeline for downloading only
-                download_pipeline = CompleteProbeDesignPipeline(
-                    pipeline_type="merfish",  # Type doesn't matter for downloads
-                    output_dir=odt_reference_dir,
-                    species=odt_species,
-                    annotation_source=odt_annotation_source,
-                    annotation_release=odt_annotation_release,
-                    n_jobs=odt_n_jobs,
-                )
-                # Download references
-                odt_gtf_file, odt_genome_file = download_pipeline.download_references()
-                logger.info(
-                    f"✓ Successfully downloaded references:\n"
-                    f"  GTF: {odt_gtf_file}\n"
-                    f"  Genome: {odt_genome_file}"
-                )
-            except Exception as e:
-                logger.error(f"Failed to download reference files: {e}")
-                logger.warning("Skipping ODT filter due to missing references")
-                odt_gtf_file = None
-                odt_genome_file = None
-        
-        if odt_gtf_file and odt_genome_file:
-            # Prepare replacement pools and mappings for ODT (with factor awareness)
-            df_all = builder.to_dataframe()
-            
-            # Get all non-selected genes sorted by score as replacement pool
-            passed_filter = (df_all[COL_PASSED_XENIUM].fillna(True))
-            replacement_candidates = df_all[
-                (~df_all[COL_SELECTED_INITIAL]) & passed_filter
-            ].sort_values(COL_SELECTION_SCORE, ascending=False)
-            replacement_pool = replacement_candidates["gene"].tolist()
-            replacement_pool_celltype_mapping = dict(
-                zip(replacement_candidates["gene"], replacement_candidates["celltype"])
-            )
-            
-            # FACTOR AWARENESS: Extract component mappings if available
-            replacement_pool_component_mapping = None
-            if 'component' in df_all.columns:
-                replacement_pool_component_mapping = dict(
-                    zip(replacement_candidates["gene"], replacement_candidates["component"])
-                )
-                logger.info(f"Factor-aware ODT replacement enabled: {len(set(replacement_pool_component_mapping.values()))} components tracked")
-            
-            # For combination strategies, prepare separate RF replacement pool
-            rf_replacement_pool = None
-            gene_source_mapping = None
-            if "source" in df_all.columns:
-                gene_source_mapping = dict(zip(df_all["gene"], df_all["source"]))
-                
-                # Build RF-specific replacement pool
-                passed_filter = (df_all[COL_PASSED_XENIUM].fillna(True))
-                rf_candidates = df_all[
-                    (~df_all[COL_SELECTED_INITIAL]) & 
-                    passed_filter & 
-                    (df_all["source"].isin(["RF", "rf_deg"]))
-                ].sort_values(COL_SELECTION_SCORE, ascending=False)
-                
-                if len(rf_candidates) > 0:
-                    rf_replacement_pool = rf_candidates["gene"].tolist()
-                    logger.info(f"Prepared RF replacement pool: {len(rf_replacement_pool)} genes")
-            
-            # Apply factor-aware ODT filter
-            selected_genes = builder.get_selected_genes('initial')
-            odt_results = apply_odt_filter_with_replacement(
-                gene_list_builder=builder,
-                selected_genes=selected_genes,
-                replacement_pool=replacement_pool,
-                replacement_pool_celltype_mapping=replacement_pool_celltype_mapping,
-                replacement_pool_component_mapping=replacement_pool_component_mapping,  # FACTOR AWARENESS
-                rf_replacement_pool=rf_replacement_pool,
-                gene_source_mapping=gene_source_mapping,
-                odt_method=odt_method,
-                odt_output_dir=odt_output_dir,
-                species=odt_species,
-                annotation_source=odt_annotation_source,
-                annotation_release=odt_annotation_release,
-                gtf_file=odt_gtf_file,
-                genome_file=odt_genome_file,
-                min_probes_threshold=odt_min_probes_threshold,
-                max_iterations=1000,
-                n_jobs=odt_n_jobs,
-                results_dir=results_dir,
-                factor_aware=True  # Enable factor-aware replacement (Problem 3)
-            )
-            
-            # Update builder with ODT results
-            builder = odt_results['gene_list_builder']
-            odt_filter_applied = True
-            
-            # Log factor balance if available
-            if 'factor_balance_report' in odt_results:
-                logger.info(f"✓ ODT filter complete with factor balance maintained")
-            else:
-                logger.info(f"✓ ODT filter complete: {len(builder.get_selected_genes())} genes in final panel")
-    else:
-        logger.info("ODT filter disabled (apply_odt_filter=False)")
-
-    # If ODT is disabled (or could not be executed), keep final panel populated
-    # by promoting the current initial selection to final.
-    if (not apply_odt_filter) or (apply_odt_filter and not odt_filter_applied):
-        selected_initial = builder.get_selected_genes('initial')
-        if selected_initial:
-            builder.mark_selected(selected_initial, selection_type='final')
-            if not apply_odt_filter:
-                logger.info(
-                    f"✓ ODT disabled: promoted {len(selected_initial)} genes from initial to final"
-                )
-            else:
-                logger.warning(
-                    f"ODT requested but skipped/failed; promoted {len(selected_initial)} genes from initial to final"
-                )
+    # Promote initial selection to final
+    selected_initial = builder.get_selected_genes('initial')
+    if selected_initial:
+        builder.mark_selected(selected_initial, selection_type='final')
+        logger.info(f"✓ Promoted {len(selected_initial)} genes from initial to final")
 
     # ========================================================================
     # SAVE FINAL RESULTS
@@ -705,14 +520,11 @@ def run_single_selection(
             'target_size': probeset_size,
             'initial_selected': len(builder.get_genes_by_stage('initial')),
             'after_xenium': len(builder.get_genes_by_stage('post_xenium')) if apply_xenium_filter else len(builder.get_genes_by_stage('initial')),
-            'after_odt': len(builder.get_genes_by_stage('final')) if apply_odt_filter else len(builder.get_genes_by_stage('post_xenium') if apply_xenium_filter else builder.get_genes_by_stage('initial')),
             'final_selected': len(builder.get_selected_genes('final')),
             'xenium_failed': builder.count_filter_failures('xenium') if apply_xenium_filter else 0,
-            'odt_failed': builder.count_filter_failures('odt') if apply_odt_filter else 0,
             'replacements': len(builder.get_replacement_genes()),
             'filters_applied': {
                 'xenium': apply_xenium_filter,
-                'odt': apply_odt_filter,
                 'blacklist_custom_patterns': blacklist_patterns or [],
                 'blacklist_use_default': use_default_blacklist,
                 'blacklist_any_active': bool(blacklist_patterns or use_default_blacklist),

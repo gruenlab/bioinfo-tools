@@ -63,7 +63,7 @@ except ImportError:
     psutil = None
 import scanpy as sc
 import scipy.sparse
-from sklearn.decomposition import NMF
+from nico2_lib.predictors._nmf._nmf_pred import NmfPredictor
 from tqdm import tqdm
 
 # Configure pandas to use object dtype for strings instead of ArrowStringArray
@@ -84,6 +84,7 @@ from _clustering import (
     evaluate_celltype_identification,
     evaluate_clustering_quality,
     evaluate_neighborhood_preservation,
+    compute_rare_celltype_marker_coverage,
 )
 from _filters import (
     filter_datasets_by_args,
@@ -142,7 +143,14 @@ _UTILITY_DIR = _MODULE_DIR.parent / "Utility-module"
 if _UTILITY_DIR.exists():
     sys.path.insert(0, str(_UTILITY_DIR))
 try:
-    from _validation import convert_ensembl_to_gene_symbols  # type: ignore[import]
+    from _validation import is_anndata_raw, is_anndata_raw_layer  # type: ignore[import]
+except ImportError:
+    def is_anndata_raw(adata) -> bool:  # type: ignore[misc]
+        return True
+    def is_anndata_raw_layer(adata, layer_name: str) -> bool:  # type: ignore[misc]
+        return True
+try:
+    from _utils import convert_ensembl_to_gene_symbols  # type: ignore[import]
 except ImportError:
     def convert_ensembl_to_gene_symbols(adata: sc.AnnData, inplace: bool = True) -> None:  # type: ignore[misc]
         """Stub – utility module not found."""
@@ -298,6 +306,9 @@ class EvaluationConfig:
     run_deg_based_filling: str = ""
     preferred_strategy: str = ""
 
+    # NMF / Tangram count input
+    nmf_counts_input: str = "raw"
+
 
 def _save_evaluation_parameters(config: EvaluationConfig) -> None:
     """Save all evaluation parameter settings to a JSON file in the output directory."""
@@ -372,6 +383,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include_tangram", action="store_true", default=False,
                    help="Run optional Tangram reconstruction check.")
     p.add_argument("--tangram_n_epochs", type=int, default=1000)
+
+    # NMF / Tangram count input
+    p.add_argument(
+        "--nmf_counts_input",
+        type=str,
+        default="raw",
+        choices=["raw", "lognorm"],
+        help=(
+            "Count matrix used as NMF and Tangram input. "
+            "'raw' (default): raw integer counts from adata.raw or adata.layers['counts']. "
+            "'lognorm': log-normalised counts from adata.X."
+        ),
+    )
 
     # External panels
     p.add_argument("--external_panels", nargs="*", default=[])
@@ -453,6 +477,7 @@ def _args_to_config(args: argparse.Namespace) -> EvaluationConfig:
         run_global_gene_filling=args.run_global_gene_filling or "",
         run_deg_based_filling=args.run_deg_based_filling or "",
         preferred_strategy=args.preferred_strategy or "",
+        nmf_counts_input=args.nmf_counts_input,
     )
 
 
@@ -653,9 +678,11 @@ def _compute_full_nmf_baseline(
         variance.
     """
     def _fit(X: np.ndarray) -> dict[str, Any]:
-        model = NMF(n_components=n_components, max_iter=1000, random_state=random_state)
-        W = model.fit_transform(X)
-        H = model.components_
+        pred = NmfPredictor(
+            embedding_size=n_components, seed=random_state, max_iter=1000,
+            beta_loss="frobenius", init=None, alpha_W=0.0, alpha_H=0.0, l1_ratio=0.0,
+        ).fit(X)
+        W, H = pred.ref_embedding, pred.h_reference
         X_recon = W @ H
         return {
             "W": W, "H": H, "X_recon": X_recon,
@@ -687,10 +714,15 @@ def _compute_full_nmf_baseline_swapped(
         Dictionary with ``"training"`` and ``"testing"`` sub-dicts.
     """
     def _fit_swapped(X: np.ndarray) -> dict[str, Any]:
-        model = NMF(n_components=n_components, max_iter=1000, random_state=random_state)
-        # Fit on transposed matrix so components_ spans gene space
-        H = model.fit_transform(X.T).T   # (n_components × n_genes)
-        W = model.components_.T           # (n_cells × n_components)
+        # Fit on transposed matrix so ref_embedding spans gene space.
+        # pred.ref_embedding  ≡ model.fit_transform(X.T)  — shape (n_genes × n_components)
+        # pred.h_reference    ≡ model.components_          — shape (n_components × n_cells)
+        pred = NmfPredictor(
+            embedding_size=n_components, seed=random_state, max_iter=1000,
+            beta_loss="frobenius", init=None, alpha_W=0.0, alpha_H=0.0, l1_ratio=0.0,
+        ).fit(X.T)
+        H = pred.ref_embedding.T    # model.fit_transform(X.T).T  → (n_components × n_genes)
+        W = pred.h_reference.T      # model.components_.T          → (n_cells × n_components)
         X_recon = W @ H
         return {
             "W": W, "H": H, "X_recon": X_recon,
@@ -809,6 +841,7 @@ def run_preprocessing_stage(config: EvaluationConfig) -> None:
                 dataset_name=panel_name,
                 dimensionality_reduction=config.dim_reduction_preprocess,
                 filter_genes=False,
+                nmf_counts_input=config.nmf_counts_input,
             )
             adata_panel = _convert_arrow_strings_to_object(adata_panel)
 
@@ -882,6 +915,7 @@ def run_baseline_evaluation(
             preprocessed_datasets,
             reference_key="full_transcriptome",
             dimensionality_reduction=dimensionality_reduction,
+            celltype_col=celltype_col,
         )
         results["neighborhood"] = nb_results
         _save_results_per_dataset(nb_results, results_dir / "neighborhood", "Neighbourhood")
@@ -899,6 +933,7 @@ def run_baseline_evaluation(
             preprocessed_datasets,
             reference_key="full_transcriptome",
             dimensionality_reduction=dimensionality_reduction,
+            celltype_col=celltype_col,
         )
         results["clustering"] = cl_results
         _save_results_per_dataset(cl_results, results_dir / "clustering", "Clustering")
@@ -923,6 +958,52 @@ def run_baseline_evaluation(
         logger.warning("Cell-type identification failed: %s", exc, exc_info=True)
     gc.collect()
     _log_memory("after cell-type evaluation")
+
+    # ── 4. Rare cell type marker coverage ────────────────────────────
+    logger.info("-" * 60)
+    logger.info("4. RARE CELL TYPE MARKER COVERAGE")
+    logger.info("-" * 60)
+    try:
+        adata_full = preprocessed_datasets["full_transcriptome"]
+        rare_rows = []
+        for dataset_name, dataset in preprocessed_datasets.items():
+            if dataset_name == "full_transcriptome":
+                continue
+            panel_genes = list(dataset.var_names)
+            coverage = compute_rare_celltype_marker_coverage(
+                adata_full,
+                panel_genes=panel_genes,
+                celltype_col=celltype_col,
+            )
+            # Summary row
+            rare_rows.append(
+                {
+                    "dataset": dataset_name,
+                    "celltype": None,
+                    "n_rare_celltypes": coverage["n_rare_celltypes"],
+                    "panel_n_rare_ct_covered": coverage["panel_n_rare_ct_covered"],
+                    "panel_fraction_rare_ct_covered": coverage["panel_fraction_rare_ct_covered"],
+                }
+            )
+            # Per-CT rows
+            for ct, ct_info in coverage["per_rare_ct"].items():
+                rare_rows.append(
+                    {
+                        "dataset": dataset_name,
+                        "celltype": ct,
+                        "n_cells": ct_info["n_cells"],
+                        "fraction_cells": ct_info["fraction_cells"],
+                        "n_exclusive_markers_total": ct_info["n_exclusive_markers_total"],
+                        "n_exclusive_markers_in_panel": ct_info["n_exclusive_markers_in_panel"],
+                    }
+                )
+        rare_df = pd.DataFrame(rare_rows)
+        results["rare_coverage"] = rare_df
+        _save_results_per_dataset(rare_df, results_dir / "rare_coverage", "Rare CT Coverage")
+    except Exception as exc:
+        logger.warning("Rare cell type coverage evaluation failed: %s", exc, exc_info=True)
+    gc.collect()
+    _log_memory("after rare coverage evaluation")
 
     logger.info("Baseline evaluation complete.")
     return results
@@ -993,6 +1074,7 @@ def run_variability_evaluation(
     celltype_col: str = "cluster",
     random_state: int = 42,
     external_names: list[str] | None = None,
+    nmf_counts_input: str = "raw",
 ) -> dict[str, Any]:
     """Run NMF-based variability evaluation using pre-generated train/test splits.
 
@@ -1027,10 +1109,38 @@ def run_variability_evaluation(
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Get expression matrix ────────────────────────────────────────
-    if "counts" in adata_full.layers:
-        X_full = adata_full.layers["counts"]
-    else:
+    if nmf_counts_input == "raw":
+        if "counts" in adata_full.layers:
+            if not is_anndata_raw_layer(adata_full, "counts"):
+                raise ValueError(
+                    "nmf_counts_input='raw': adata_full.layers['counts'] does not contain "
+                    "raw integer counts. Check preprocessing."
+                )
+            X_full = adata_full.layers["counts"]
+            logger.info("run_variability_evaluation: using layers['counts'] (verified raw counts)")
+        elif hasattr(adata_full, "raw") and adata_full.raw is not None:
+            if not is_anndata_raw(adata_full.raw):
+                raise ValueError(
+                    "nmf_counts_input='raw': adata_full.raw.X does not contain raw integer counts."
+                )
+            X_full = adata_full.raw.X
+            logger.info("run_variability_evaluation: using adata.raw.X (verified raw counts)")
+        else:
+            raise ValueError(
+                "nmf_counts_input='raw': no raw counts found in adata.layers['counts'] or adata.raw"
+            )
+    elif nmf_counts_input == "lognorm":
+        if is_anndata_raw(adata_full):
+            raise ValueError(
+                "nmf_counts_input='lognorm': adata_full.X appears to contain raw integer counts, "
+                "not log-normalized data. Normalize before evaluation."
+            )
         X_full = adata_full.X
+        logger.info("run_variability_evaluation: using adata.X (log-normalized, verified)")
+    else:
+        raise ValueError(
+            f"Unknown nmf_counts_input='{nmf_counts_input}'. Choose 'raw' or 'lognorm'."
+        )
     if scipy.sparse.issparse(X_full):
         X_full = X_full.toarray()
     X_full = np.asarray(X_full, dtype=np.float32)
@@ -1089,6 +1199,7 @@ def run_variability_evaluation(
                     nmf_rows=all_nmf_rows,
                     per_celltype_splits=ct_splits_idx,
                     fold=fold,
+                    nmf_counts_input=nmf_counts_input,
                 )
             except Exception as exc:
                 logger.warning("Fold %d: Evaluation failed for '%s': %s. Skipping.", fold, panel_name, exc, exc_info=True)
@@ -1136,6 +1247,7 @@ def _evaluate_single_panel_variability(
     nmf_rows: list[dict[str, Any]],
     per_celltype_splits: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
     fold: int | None = None,
+    nmf_counts_input: str = "raw",
 ) -> None:
     """Run NMF evaluation for one panel.
 
@@ -1158,6 +1270,7 @@ def _evaluate_single_panel_variability(
         nmf_rows: NMF result rows output list (mutated in place).
         per_celltype_splits: Per-cell-type index splits.
         fold: Fold number (optional, for k-fold evaluation).
+        nmf_counts_input: Which count matrix to use (``"raw"`` or ``"lognorm"``).
     """
     # Lazily compute global NMF baseline
     if n_components not in cached_full_nmf:
@@ -1226,6 +1339,7 @@ def _evaluate_single_panel_variability(
             n_components=n_components,
             cached_full_nmf_by_celltype=cached_ct_nmf,
             per_celltype_splits=per_celltype_splits,
+            nmf_counts_input=nmf_counts_input,
         )
         for ct, res in (mech_ct or {}).items():
             row = {**res, "dataset": panel_name, "gene_list": panel_name, "celltype": ct, "analysis_type": "per_celltype"}
@@ -2119,6 +2233,7 @@ def run_tangram_stage(
                     train_idx=train_idx,
                     test_idx=test_idx,
                     per_celltype_splits=per_celltype_splits,
+                    nmf_counts_input=config.nmf_counts_input,
                 )
             except Exception as exc:
                 logger.warning(
@@ -2240,6 +2355,7 @@ def main() -> None:
             celltype_col=config.celltype_col,
             random_state=config.random_state,
             external_names=external_names,
+            nmf_counts_input=config.nmf_counts_input,
         )
         _log_memory("after variability evaluation")
         generate_variability_evaluation_plots(output_dir=config.output_dir)

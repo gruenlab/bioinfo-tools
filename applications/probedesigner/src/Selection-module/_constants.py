@@ -71,15 +71,6 @@ DEFAULT_XENIUM_ENABLED = True  # Enabled by default
 DEFAULT_MIN_XENIUM_EXPRESSION = 0.1
 DEFAULT_MAX_XENIUM_EXPRESSION = 100.0
 
-# ODT probe design filter
-DEFAULT_ODT_ENABLED = False  # Disabled by default (computationally expensive)
-DEFAULT_ODT_METHOD = "SCRINSHOT"  # Options: 'SCRINSHOT', 'MERFISH', 'SEQFISHPLUS'
-DEFAULT_ODT_MIN_PROBES_THRESHOLD = 8
-DEFAULT_ODT_SPECIES = "mus_musculus"  
-
-# Aliases for backward compatibility
-MIN_ODT_PROBES_THRESHOLD = DEFAULT_ODT_MIN_PROBES_THRESHOLD
-
 # =============================================================================
 # INTERNAL ALGORITHM PARAMETERS
 # =============================================================================
@@ -171,11 +162,6 @@ GENE_SOURCE_GAP_FILL_CELLTYPE = 'gap_fill_celltype'
 GENE_SOURCE_GAP_FILL_GLOBAL = 'gap_fill_global'
 GENE_SOURCE_GAP_FILL_DEG = 'gap_fill_deg'
 
-# -------------------- Filtering --------------------
-
-# Maximum iterations for ODT filtering with replacement
-MAX_ODT_FILTER_ITERATIONS = 1000
-
 # -------------------- Random Forest (RF) --------------------
 
 # Cross-validation folds
@@ -237,10 +223,8 @@ COL_CELLTYPE = 'celltype'
 COL_MEAN_EXPRESSION = 'mean_expression'
 COL_SELECTED_INITIAL = 'selected_initial'
 COL_PASSED_XENIUM = 'passed_xenium'
-COL_PASSED_ODT = 'passed_odt'
 COL_FINAL_SELECTION = 'final_selection'
 COL_XENIUM_FAILURE_REASON = 'xenium_failure_reason'
-COL_ODT_FAILURE_REASON = 'odt_failure_reason'
 COL_REPLACED_BY = 'replaced_by'
 COL_REPLACES_GENE = 'replaces_gene'
 COL_REPLACEMENT_REASON = 'replacement_reason'
@@ -262,6 +246,8 @@ COL_COMPONENT_LOADING = 'component_loading'
 COL_MAX_LOADING = 'max_loading'
 COL_SUM_LOADING = 'sum_loading'
 COL_N_COMPONENTS_REPRESENTED = 'n_components_represented'
+COL_N_CELLTYPES_SELECTED = 'n_celltypes_selected'
+COL_CONTRIBUTING_CELLTYPES = 'contributing_celltypes'
 
 # Combination strategy columns
 COL_GENE_SOURCE = 'gene_source'

@@ -50,21 +50,36 @@ __all__ = [
 # ===================================================================
 
 try:
-    from utils._validation import is_anndata_raw, is_anndata_raw_layer, convert_ensembl_to_gene_symbols
+    from _validation import is_anndata_raw, is_anndata_raw_layer
 except ImportError:
-    logger.warning("Could not import validation utilities; using stubs. Pipeline will inject these at runtime.")
+    try:
+        _util_dir = Path(__file__).parent.parent / "Utility-module"
+        if _util_dir.exists() and str(_util_dir) not in sys.path:
+            sys.path.insert(0, str(_util_dir))
+        from _validation import is_anndata_raw, is_anndata_raw_layer
+    except ImportError:
+        logger.warning("Could not import validation utilities; using stubs. Pipeline will inject these at runtime.")
 
-    def is_anndata_raw(adata: object) -> bool:
-        """Stub: Check if AnnData appears to contain raw counts."""
-        return True
+        def is_anndata_raw(adata: object) -> bool:
+            """Stub: assume raw — conservative default when validation module is unavailable."""
+            return True
 
-    def is_anndata_raw_layer(adata: object, layer: str) -> bool:
-        """Stub: Check if a layer appears to contain raw counts."""
-        return True
+        def is_anndata_raw_layer(adata: object, layer: str) -> bool:
+            """Stub: assume raw."""
+            return True
 
-    def convert_ensembl_to_gene_symbols(adata: object, inplace: bool = True) -> None:
-        """Stub: Convert ENSEMBL IDs to gene symbols."""
-        pass
+try:
+    from _utils import convert_ensembl_to_gene_symbols
+except ImportError:
+    try:
+        _util_dir = Path(__file__).parent.parent / "Utility-module"
+        if _util_dir.exists() and str(_util_dir) not in sys.path:
+            sys.path.insert(0, str(_util_dir))
+        from _utils import convert_ensembl_to_gene_symbols
+    except ImportError:
+        def convert_ensembl_to_gene_symbols(adata: object, inplace: bool = True) -> None:
+            """Stub: no-op."""
+            pass
 
 
 # ===================================================================
@@ -615,7 +630,8 @@ def process_data_for_panel_evaluation(
     scale: bool = False,
     dataset_name: str | None = None,
     dimensionality_reduction: str = "pca",
-    filter_genes: bool = True
+    filter_genes: bool = True,
+    nmf_counts_input: str = "raw",
 ) -> object:
     """
     Process and preprocess AnnData object for panel evaluation.
@@ -635,11 +651,16 @@ def process_data_for_panel_evaluation(
         dimensionality_reduction: Which method to use: "pca", "nmf", or "both" (default: "pca").
         filter_genes: Whether to filter lowly expressed genes (default: True).
             Set to True for reference preprocessing, False for panel evaluation.
+        nmf_counts_input: Count matrix to use as NMF input. ``"raw"`` (default):
+            raw integer counts from ``adata.raw`` or ``adata.layers['counts']``
+            (validated with ``is_anndata_raw_layer``). ``"lognorm"``: log-normalised
+            counts from ``adata.X``.
 
     Returns:
         Processed AnnData object with embeddings, clusterings, and neighbor graphs.
 
     Raises:
+        ValueError: If ``nmf_counts_input`` is unknown or requested raw counts are missing.
         Exception: If critical processing steps fail.
 
     Example:
@@ -784,32 +805,44 @@ def process_data_for_panel_evaluation(
     if dimensionality_reduction in ["nmf", "both"]:
         print("Running NMF")
 
-        is_raw_X = is_anndata_raw(adata)
-        has_counts_layer = 'counts' in adata.layers
-        if has_counts_layer:
-            counts_is_raw = is_anndata_raw_layer(adata, 'counts')
-        else:
-            counts_is_raw = False
-
-        if is_raw_X:
-            print("Using .X for NMF (raw counts)")
-            X_nmf_input = adata.X.copy()
-            data_source = "X"
-        elif has_counts_layer and counts_is_raw:
-            print("Using layers['counts'] for NMF (raw counts)")
-            X_nmf_input = adata.layers['counts'].copy()
-            data_source = "counts_layer"
-        else:
-            print("WARNING: No raw count data available!")
-            print("NMF requires raw count data for proper analysis.")
-            if has_counts_layer:
-                print("Using layers['counts'] despite it not being raw (not ideal)")
+        if nmf_counts_input == "raw":
+            if hasattr(adata, 'raw') and adata.raw is not None:
+                if not is_anndata_raw(adata.raw):
+                    raise ValueError(
+                        "nmf_counts_input='raw': adata.raw.X does not contain raw integer counts."
+                    )
+                X_nmf_input = adata.raw.X.copy() if hasattr(adata.raw.X, 'copy') else np.array(adata.raw.X)
+                data_source = "raw"
+                print("Using adata.raw.X for NMF (verified as raw counts)")
+            elif 'counts' in adata.layers:
+                if not is_anndata_raw_layer(adata, 'counts'):
+                    raise ValueError(
+                        "nmf_counts_input='raw': adata.layers['counts'] does not contain raw integer counts"
+                    )
                 X_nmf_input = adata.layers['counts'].copy()
-                data_source = "counts_layer_not_raw"
+                data_source = "counts_layer"
+                print("Using layers['counts'] for NMF (verified as raw counts)")
             else:
-                print("Using .X despite it not being raw (not ideal)")
-                X_nmf_input = adata.X.copy()
-                data_source = "X_not_raw"
+                raise ValueError(
+                    "nmf_counts_input='raw': no raw counts found in adata.raw or adata.layers['counts']"
+                )
+        elif nmf_counts_input == "lognorm":
+            # Only guard when the data arrived already log-normalised (is_log=True).
+            # When is_log=False, normalize_total+log1p ran above and X is guaranteed
+            # to be log-normalised — no need to re-check (and the stub always returns
+            # True, which would cause a false positive in that case).
+            if is_log and is_anndata_raw(adata):
+                raise ValueError(
+                    "nmf_counts_input='lognorm': adata.X appears to contain raw integer counts, "
+                    "not log-normalized data. Normalize adata.X before evaluation."
+                )
+            X_nmf_input = adata.X.copy() if hasattr(adata.X, 'copy') else np.array(adata.X)
+            data_source = "X_lognorm"
+            print("Using adata.X (log-normalized, verified) for NMF")
+        else:
+            raise ValueError(
+                f"Unknown nmf_counts_input='{nmf_counts_input}'. Choose 'raw' or 'lognorm'."
+            )
 
         if issparse(X_nmf_input):
             X_nmf_input = X_nmf_input.toarray()
@@ -1049,8 +1082,27 @@ def preprocess_reference_dataset(
 
     logger.info("Ensuring counts layer exists")
     if 'counts' not in adata.layers:
-        logger.info("Creating 'counts' layer from X")
-        adata.layers['counts'] = adata.X.copy()
+        if is_anndata_raw(adata):
+            logger.info("Creating 'counts' layer from X (verified as raw counts)")
+            adata.layers['counts'] = adata.X.copy()
+        elif adata.raw is not None:
+            import anndata
+            raw_X = adata.raw[:, adata.var_names].X
+            tmp = anndata.AnnData(X=raw_X)
+            if not is_anndata_raw(tmp):
+                raise ValueError(
+                    "preprocess_reference_dataset: adata.X is not raw counts and adata.raw.X "
+                    "also does not appear to contain raw counts. Cannot create layers['counts']."
+                )
+            logger.info("Restoring 'counts' layer from adata.raw.X (adata.X appears normalized)")
+            adata.layers['counts'] = raw_X.copy()
+        else:
+            raise ValueError(
+                "preprocess_reference_dataset: adata.X does not appear to contain raw counts "
+                "(is_anndata_raw=False) and adata.raw is None. Cannot create layers['counts'] "
+                "from normalized data. Pre-populate adata.layers['counts'] with raw counts "
+                "before calling this function."
+            )
 
     all_genes = adata.var_names.tolist()
     logger.info(f"\nPreprocessing reference with {len(all_genes)} genes...")

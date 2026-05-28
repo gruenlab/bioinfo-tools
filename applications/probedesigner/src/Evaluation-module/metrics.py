@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 import scipy.sparse
-from sklearn.metrics import mean_squared_error
+from nico2_lib.metrics import explained_variance_metric_v2, mse_metric
 
 __all__ = [
     "calculate_mse",
@@ -29,6 +29,7 @@ __all__ = [
     "calculate_weighted_explained_variance",
     "calculate_weighted_mse_baseline",
     "calculate_weighted_explained_variance_baseline",
+    "calculate_inverse_frequency_weighted_f1",
     "compute_standardized_score",
 ]
 
@@ -51,7 +52,7 @@ def calculate_mse(
     if scipy.sparse.issparse(X_reconstructed):
         X_reconstructed = X_reconstructed.toarray()
 
-    return float(mean_squared_error(X_original, X_reconstructed))
+    return float(mse_metric(np.asarray(X_original).ravel(), np.asarray(X_reconstructed).ravel()))
 
 
 def calculate_explained_variance(
@@ -80,13 +81,7 @@ def calculate_explained_variance(
     if scipy.sparse.issparse(X_reconstructed):
         X_reconstructed = X_reconstructed.toarray()
 
-    mse = np.mean((X_original - X_reconstructed) ** 2)
-    total_variance = np.var(X_original)
-
-    if total_variance == 0:
-        return 0.0
-
-    return float(1 - (mse / total_variance))
+    return float(explained_variance_metric_v2(np.asarray(X_original).ravel(), np.asarray(X_reconstructed).ravel()))
 
 
 def calculate_macro_explained_variance(
@@ -225,6 +220,44 @@ def calculate_weighted_explained_variance_baseline(
     if total == 0:
         return np.nan
     return float(sum(r["expvar_test_baseline"] * r["n_cells"] for r in valid.values()) / total)
+
+
+def calculate_inverse_frequency_weighted_f1(
+    per_celltype_f1: dict[str, float],
+    per_celltype_n_cells: dict[str, int],
+    weighting: str = "inverse",
+) -> float:
+    """Calculate inverse-frequency weighted F1, amplifying rare cell types.
+
+    Standard macro F1 gives equal weight per cell type; weighted F1 upweights
+    abundant cell types. This function inverts that: rare cell types receive
+    higher weights so panels that identify them well score higher.
+
+    Args:
+        per_celltype_f1: F1 score per cell type (NaN values are skipped).
+        per_celltype_n_cells: Number of cells per cell type in the full dataset.
+        weighting: "inverse" for 1/n_cells weights, "log" for log(N_total/n_CT).
+
+    Returns:
+        Inverse-frequency weighted F1 score, or np.nan if no valid cell types.
+    """
+    valid_cts = [
+        ct for ct in per_celltype_f1
+        if ct in per_celltype_n_cells
+        and not np.isnan(per_celltype_f1[ct])
+        and per_celltype_n_cells[ct] > 0
+    ]
+    if not valid_cts:
+        return float(np.nan)
+
+    n_total = sum(per_celltype_n_cells[ct] for ct in valid_cts)
+    if weighting == "log":
+        raw_weights = {ct: np.log(n_total / per_celltype_n_cells[ct]) for ct in valid_cts}
+    else:
+        raw_weights = {ct: 1.0 / per_celltype_n_cells[ct] for ct in valid_cts}
+
+    weight_sum = sum(raw_weights.values())
+    return float(sum(raw_weights[ct] / weight_sum * per_celltype_f1[ct] for ct in valid_cts))
 
 
 def compute_standardized_score(

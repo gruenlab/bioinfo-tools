@@ -24,6 +24,7 @@ import pandas as pd
 import scipy.sparse
 from anndata import AnnData
 from sklearn.decomposition import NMF, PCA
+from nico2_lib.predictors._nmf._nmf_pred import NmfPredictor
 
 # Import utility functions for data validation
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -132,6 +133,7 @@ def compute_nmf_global(
     solver: str = DEFAULT_NMF_SOLVER,
     max_iter: int = DEFAULT_NMF_MAX_ITER,
     cache_dir: Optional[str] = None,
+    nmf_counts_input: str = "raw",
     # cNMF options
     use_consensus_nmf: bool = False,
     k_min: int = 3,
@@ -142,7 +144,13 @@ def compute_nmf_global(
     use_consensus_H: bool = False,
     cnmf_plot_dir: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, Optional[dict]]:
-    """Compute global NMF on raw counts.
+    """Compute global NMF on the selected count matrix.
+
+    Args:
+        nmf_counts_input: Which count matrix to use as NMF input.
+            ``"raw"`` (default): raw integer counts from ``adata.raw.X`` or
+            ``adata.layers["counts"]`` (validated with ``is_anndata_raw_layer``).
+            ``"lognorm"``: log-normalised counts from ``adata.X``.
 
     Args:
         adata: Annotated data matrix (must have raw counts)
@@ -162,7 +170,7 @@ def compute_nmf_global(
     
     # Check for cached model
     if cache_dir:
-        cache_file = os.path.join(cache_dir, 'nmf_models', 'global_nmf.pkl')
+        cache_file = os.path.join(cache_dir, 'nmf_models', f'global_nmf_{nmf_counts_input}.pkl')
         if os.path.exists(cache_file):
             logger.info(f"Loading cached NMF model from {cache_file}")
             try:
@@ -173,20 +181,38 @@ def compute_nmf_global(
             except Exception as e:
                 logger.warning(f"Failed to load cached model: {e}. Recomputing...")
 
-    # Get raw counts
-    if hasattr(adata, 'raw') and adata.raw is not None:
-        counts = adata.raw.X
-        gene_names = adata.raw.var_names
-        logger.info("Using adata.raw.X for NMF (should contain raw counts)")
-    elif 'counts' in adata.layers:
-        counts = adata.layers['counts']
-        gene_names = adata.var_names
-        # Verify layer contains raw counts
-        if not is_anndata_raw_layer(adata, 'counts'):
-            logger.warning("Layer 'counts' does not appear to contain raw integer counts!")
-        logger.info("Using adata.layers['counts'] for NMF")
+    # Select count input matrix
+    if nmf_counts_input == "raw":
+        if hasattr(adata, 'raw') and adata.raw is not None:
+            if not is_anndata_raw(adata.raw):
+                raise ValueError(
+                    "nmf_counts_input='raw': adata.raw.X does not contain raw integer counts"
+                )
+            counts, gene_names = adata.raw.X, adata.raw.var_names
+            logger.info("Using adata.raw.X for NMF (verified as raw counts)")
+        elif 'counts' in adata.layers:
+            if not is_anndata_raw_layer(adata, 'counts'):
+                raise ValueError(
+                    "nmf_counts_input='raw': adata.layers['counts'] does not contain raw integer counts"
+                )
+            counts, gene_names = adata.layers['counts'], adata.var_names
+            logger.info("Using adata.layers['counts'] for NMF (verified as raw counts)")
+        else:
+            raise ValueError(
+                "nmf_counts_input='raw': no raw counts found in adata.raw or adata.layers['counts']"
+            )
+    elif nmf_counts_input == "lognorm":
+        if is_anndata_raw(adata):
+            raise ValueError(
+                "nmf_counts_input='lognorm': adata.X appears to contain raw integer counts, "
+                "not log-normalized data. Normalize before selection."
+            )
+        counts, gene_names = adata.X, adata.var_names
+        logger.info("Using adata.X (log-normalized, verified) for NMF")
     else:
-        raise ValueError("No raw counts found (need adata.raw or adata.layers['counts'])")
+        raise ValueError(
+            f"Unknown nmf_counts_input='{nmf_counts_input}'. Choose 'raw' or 'lognorm'."
+        )
 
     # Convert to dense if sparse
     if scipy.sparse.issparse(counts):
@@ -301,22 +327,22 @@ def compute_nmf_global(
 
     if not use_consensus_nmf:
         # Run NMF
-        nmf = NMF(n_components=n_components,
-                init=init,
-                random_state=random_state,
-                beta_loss=beta_loss,
-                solver=solver,
-                max_iter=max_iter,
-                alpha_W=0.0,
-                alpha_H=0.0,
-                l1_ratio=0)
+        _predictor = NmfPredictor(
+            embedding_size=n_components,
+            seed=random_state,
+            beta_loss=beta_loss,
+            solver=solver,
+            init=init,
+            max_iter=max_iter,
+            alpha_W=0.0,
+            alpha_H=0.0,
+            l1_ratio=0.0,
+        ).fit(counts_dense)
 
-        W = nmf.fit_transform(counts_dense)  # Cell × factors
-        H = nmf.components_  # Factors × genes
+        W = _predictor.ref_embedding   # Cell × factors
+        H = _predictor.h_reference     # Factors × genes
         model_meta.update({
-            'reconstruction_err': nmf.reconstruction_err_,
-            'n_iter': nmf.n_iter_,
-            'model': nmf,
+            'model': _predictor,
         })
 
     # Create loadings DataFrame (genes × factors)
@@ -340,7 +366,7 @@ def compute_nmf_global(
     if cache_dir:
         model_dir = os.path.join(cache_dir, 'nmf_models')
         os.makedirs(model_dir, exist_ok=True)
-        cache_file = os.path.join(model_dir, 'global_nmf.pkl')
+        cache_file = os.path.join(model_dir, f'global_nmf_{nmf_counts_input}.pkl')
         try:
             with open(cache_file, 'wb') as f:
                 pickle.dump({'loadings_df': loadings_df, 'model_data': model_data}, f)
@@ -451,6 +477,7 @@ def compute_nmf_per_celltype(
     n_jobs: int = 1,
     parallel_backend: str = 'process',
     cache_dir: Optional[str] = None,
+    nmf_counts_input: str = "raw",
     # cNMF options
     use_consensus_nmf: bool = False,
     k_min: int = 3,
@@ -461,7 +488,13 @@ def compute_nmf_per_celltype(
     use_consensus_H: bool = False,
     cnmf_plot_dir: Optional[str] = None,
 ) -> Tuple[dict[str, pd.DataFrame], dict[str, pd.Series]]:
-    """Compute per-celltype NMF on raw counts.
+    """Compute per-celltype NMF on the selected count matrix.
+
+    Args:
+        nmf_counts_input: Which count matrix to use as NMF input.
+            ``"raw"`` (default): raw integer counts from ``adata.raw.X`` or
+            ``adata.layers["counts"]`` (validated with ``is_anndata_raw_layer``).
+            ``"lognorm"``: log-normalised counts from ``adata.X``.
 
     Args:
         adata: Annotated data matrix
@@ -485,7 +518,7 @@ def compute_nmf_per_celltype(
     
     # Check for cached model
     if cache_dir:
-        cache_file = os.path.join(cache_dir, 'nmf_models', 'per_celltype_nmf.pkl')
+        cache_file = os.path.join(cache_dir, 'nmf_models', f'per_celltype_nmf_{nmf_counts_input}.pkl')
         if os.path.exists(cache_file):
             logger.info(f"Loading cached per-celltype NMF models from {cache_file}")
             try:
@@ -506,36 +539,38 @@ def compute_nmf_per_celltype(
     if celltype_column not in adata.obs.columns:
         raise ValueError(f"Column '{celltype_column}' not in adata.obs")
 
-    # ROBUST RAW COUNTS DETECTION
-    # Always compare to raw counts for metrics
-    # Test if adata.X is raw, else use counts layer
-    is_log = not is_anndata_raw(adata)
-    
-    if is_log:
-        # Data is normalized/log-transformed, need to find raw counts
-        logger.info("adata.X appears to be normalized/log-transformed, searching for raw counts...")
-        
-        if 'counts' in adata.layers:
-            counts_is_raw = is_anndata_raw_layer(adata, 'counts')
-            if not counts_is_raw:
-                logger.error("Counts layer is not raw data! Cannot compute metrics correctly.")
-                raise ValueError("Counts layer does not contain raw data")
-            
-            counts_full = adata.layers['counts']
-            gene_names = adata.var_names
+    # Select count input matrix
+    if nmf_counts_input == "raw":
+        if hasattr(adata, 'raw') and adata.raw is not None:
+            if not is_anndata_raw(adata.raw):
+                raise ValueError(
+                    "nmf_counts_input='raw': adata.raw.X does not contain raw integer counts"
+                )
+            counts_full, gene_names = adata.raw.X, adata.raw.var_names
+            logger.info("Using adata.raw.X for per-celltype NMF (verified as raw counts)")
+        elif 'counts' in adata.layers:
+            if not is_anndata_raw_layer(adata, 'counts'):
+                raise ValueError(
+                    "nmf_counts_input='raw': adata.layers['counts'] does not contain raw integer counts"
+                )
+            counts_full, gene_names = adata.layers['counts'], adata.var_names
             logger.info("Using adata.layers['counts'] for per-celltype NMF (verified as raw counts)")
         else:
-            logger.error("No 'counts' layer found! Cannot compute metrics correctly.")
-            raise ValueError("No raw counts layer found - cannot compute metrics")
-    else:
-        # If not log, check that adata.X is actually raw, else error
+            raise ValueError(
+                "nmf_counts_input='raw': no raw counts found in adata.raw or adata.layers['counts']"
+            )
+    elif nmf_counts_input == "lognorm":
         if is_anndata_raw(adata):
-            counts_full = adata.X
-            gene_names = adata.var_names
-            logger.info("Using adata.X for per-celltype NMF (detected as raw counts)")
-        else:
-            logger.error("Data is not raw and no counts layer is available! Cannot compute metrics.")
-            raise ValueError("No raw data available for metrics computation.")
+            raise ValueError(
+                "nmf_counts_input='lognorm': adata.X appears to contain raw integer counts, "
+                "not log-normalized data. Normalize before selection."
+            )
+        counts_full, gene_names = adata.X, adata.var_names
+        logger.info("Using adata.X (log-normalized, verified) for per-celltype NMF")
+    else:
+        raise ValueError(
+            f"Unknown nmf_counts_input='{nmf_counts_input}'. Choose 'raw' or 'lognorm'."
+        )
 
     celltype_loadings = {}
     celltype_explained_variance = {}
@@ -751,7 +786,7 @@ def compute_nmf_per_celltype(
     if cache_dir:
         model_dir = os.path.join(cache_dir, 'nmf_models')
         os.makedirs(model_dir, exist_ok=True)
-        cache_file = os.path.join(model_dir, 'per_celltype_nmf.pkl')
+        cache_file = os.path.join(model_dir, f'per_celltype_nmf_{nmf_counts_input}.pkl')
         try:
             cache_data = {
                 'loadings': celltype_loadings,
@@ -795,19 +830,19 @@ def _compute_single_celltype_nmf(
 
     counts_dense = counts_dense[:, nonzero_index]
 
-    nmf = NMF(
-        n_components=n_components,
-        init=nmf_params['init'],
-        random_state=random_state,
+    _predictor = NmfPredictor(
+        embedding_size=n_components,
+        seed=random_state,
         beta_loss=nmf_params['beta_loss'],
         solver=nmf_params['solver'],
+        init=nmf_params['init'],
         max_iter=nmf_params['max_iter'],
         alpha_W=0.0,
         alpha_H=0.0,
-        l1_ratio=0,
-    )
-    W = nmf.fit_transform(counts_dense)
-    H = nmf.components_
+        l1_ratio=0.0,
+    ).fit(counts_dense)
+    W = _predictor.ref_embedding
+    H = _predictor.h_reference
 
     factor_names = [f"{celltype}_NMF_{i+1}" for i in range(n_components)]
     factor_r2 = {}
@@ -1068,6 +1103,7 @@ def select_genes_from_nmf(
     results_dir: Optional[str] = None,
     nmf_model_cache_dir: Optional[str] = None,
     mean_expr_per_ct: Optional[dict] = None,
+    nmf_counts_input: str = "raw",
     # cNMF options
     use_consensus_nmf: bool = False,
     k_min: int = 3,
@@ -1135,6 +1171,7 @@ def select_genes_from_nmf(
             n_components=n_components,
             random_state=random_state,
             cache_dir=_nmf_cache_dir,
+            nmf_counts_input=nmf_counts_input,
             use_consensus_nmf=use_consensus_nmf,
             k_min=k_min,
             k_max=k_max,
@@ -1157,6 +1194,7 @@ def select_genes_from_nmf(
             n_jobs=nmf_n_jobs,
             parallel_backend=nmf_parallel_backend,
             cache_dir=_nmf_cache_dir,
+            nmf_counts_input=nmf_counts_input,
             use_consensus_nmf=use_consensus_nmf,
             k_min=k_min,
             k_max=k_max,
@@ -1697,7 +1735,7 @@ def _select_genes_global(
 
     # ============================================================================
     # ADD GENES TO BUILDER
-    # Add ALL Phase 2 pool genes so ODT has a large replacement pool.
+    # Add ALL Phase 2 pool genes to provide a large replacement pool.
     # Only Phase 3 final genes are marked as selected_initial.
     # ============================================================================
     logger.info("")
@@ -1705,7 +1743,7 @@ def _select_genes_global(
     logger.info(
         f"Adding Phase 2 pool to builder: {len(pool_genes)} genes "
         f"({len(final_selected_genes)} selected + "
-        f"{len(pool_genes) - len(selected_set)} ODT replacement candidates)"
+        f"{len(pool_genes) - len(selected_set)} replacement candidates)"
     )
 
     for gene in pool_genes:
@@ -1729,7 +1767,7 @@ def _select_genes_global(
     logger.info(
         f"✓ Added {len(pool_genes)} pool genes; "
         f"{len(final_selected_genes)} marked selected, "
-        f"{len(pool_genes) - len(selected_set)} available as ODT replacement candidates"
+        f"{len(pool_genes) - len(selected_set)} available as replacement candidates"
     )
     logger.info(f"=" * 80)
 
@@ -1747,18 +1785,23 @@ def _select_genes_per_celltype(
     mean_expr_per_ct: Optional[dict] = None,
 ) -> None:
     """Select genes from per-celltype dimension reduction with 3-phase pool-based architecture.
-    
-    **NEW POOL-BASED ARCHITECTURE:**
-    - Phase 1: Create large pool (pool_size_per_celltype genes/celltype, e.g., 200)
-    - Phase 2: Resolve cross-celltype duplicates using R²×loading contribution
-    - Phase 3: Select final probeset_size genes from duplicate-free pool
-    
-    This eliminates the gap-filling problem where cross-celltype duplicates were lost.
+
+    Architecture:
+    - Phase 1: Create large oversampled pool per celltype-factor
+    - Phase 2: Resolve within-celltype duplicates: assign each gene to the factor with
+      highest abs(loading); pull next-best candidates for factors that lose a gene.
+      Cross-celltype shared genes are tracked (not removed).
+    - Phase 3:
+        Step 1 — Strict per-CT-factor selection: top genes/combo by abs(loading).
+                 Cross-celltype shared genes count once, so unique count may be < target.
+        Step 2 — Fill gap (if < probeset_size): remaining pool sorted by
+                 (n_celltypes desc, abs(loading) desc), preferring multi-CT genes.
+        Step 3 — Trim (if > probeset_size from rounding): remove lowest-loading genes.
 
     Args:
         builder: GeneListBuilder to populate
         celltype_loadings: Dict mapping celltype -> loadings DataFrame
-        celltype_explained_variance: Explained variance (R²) per celltype
+        celltype_explained_variance: Unused; kept for backward compatibility with callers
         method: Gene selection method (only 'method_a')
         n_components: Number of components per celltype
         pool_size_per_celltype: Genes per celltype in Phase 1 pool (e.g., 200)
@@ -1872,64 +1915,51 @@ def _select_genes_per_celltype(
         logger.info(f"✓ Pool cached to: {pool_cache_file}")
 
     # ============================================================================
-    # PHASE 2: DUPLICATE RESOLUTION (Create duplicate-free pool)
+    # PHASE 2: DUPLICATE RESOLUTION (within-celltype dedup + cross-CT tracking)
     # ============================================================================
     logger.info("")
     logger.info("─" * 80)
-    logger.info("PHASE 2: Resolving cross-celltype duplicates")
+    logger.info("PHASE 2: Resolving within-celltype duplicates; tracking cross-CT sharing")
     logger.info("─" * 80)
 
-    # Validate explained variance availability
-    if celltype_explained_variance is None:
-        logger.error(
-            "No explained variance provided - duplicate resolution requires R² values!\n"
-            "Provide celltype_explained_variance from compute_nmf_per_celltype or compute_pca_per_celltype."
-        )
-        raise ValueError("celltype_explained_variance required for pool-based selection")
-
-    celltype_factor_explained_variance = celltype_explained_variance
-    
-    # Log variance statistics
-    for celltype, factor_r2_series in celltype_factor_explained_variance.items():
-        logger.debug(
-            f"  {celltype}: {len(factor_r2_series)} factors, "
-            f"mean R²={factor_r2_series.mean():.4f}"
-        )
-
-    # Apply factor-aware duplicate resolution
-    logger.info("Resolving duplicates using R² × loading contribution...")
+    # Resolve within-celltype duplicates; track which celltypes selected each gene
     resolved = resolve_duplicates_factor_aware_per_celltype(
         celltype_genes_per_factor=celltype_genes_per_factor,
-        celltype_factor_explained_variance=celltype_factor_explained_variance,
     )
 
-    pool_genes = resolved["selected_genes"]  # Duplicate-free pool
+    pool_genes = resolved["selected_genes"]  # Unique-gene pool (cross-CT sharing preserved)
     pool_factor_assignments = resolved["factor_assignments"]
     pool_celltype_assignments = resolved["celltype_assignments"]
+    gene_celltype_mapping = resolved["gene_celltype_mapping"]
+    n_celltypes_per_gene = resolved["n_celltypes_per_gene"]
 
     logger.info(
         f"✓ Phase 2 complete: {len(pool_genes)} unique genes "
-        f"({resolved['duplicates_resolved']} duplicates resolved)"
+        f"({resolved['duplicates_resolved']} within-celltype duplicates resolved, "
+        f"{sum(1 for n in n_celltypes_per_gene.values() if n > 1)} genes shared across celltypes)"
     )
 
-    # Cache duplicate-free pool to disk
+    # Cache pool to disk
     if results_dir:
         import pandas as pd
         from pathlib import Path
-        
+
         pool_cache_dir = Path(results_dir) / "nmf_pools"
-        
-        # Save as CSV for easy inspection
+
         pool_df = pd.DataFrame({
             "gene": pool_genes,
             "celltype": [pool_celltype_assignments.get(g) for g in pool_genes],
             "factor": [pool_factor_assignments.get(g) for g in pool_genes],
+            "n_celltypes_selected": [n_celltypes_per_gene.get(g, 1) for g in pool_genes],
+            "contributing_celltypes": [
+                ', '.join(sorted(gene_celltype_mapping.get(g, [pool_celltype_assignments.get(g, '')])))
+                for g in pool_genes
+            ],
         })
         resolved_pool_file = pool_cache_dir / "resolved_pool.csv"
         pool_df.to_csv(resolved_pool_file, index=False)
         logger.info(f"✓ Resolved pool saved to: {resolved_pool_file}")
-        
-        # Save duplicate resolution statistics
+
         import json
         stats_file = pool_cache_dir / "resolution_stats.json"
         with open(stats_file, "w") as f:
@@ -1944,237 +1974,186 @@ def _select_genes_per_celltype(
         logger.info(f"✓ Resolution stats saved to: {stats_file}")
 
     # ============================================================================
-    # PHASE 3: FINAL SELECTION (Factor-aware selection from duplicate-free pool)
+    # PHASE 3: FINAL SELECTION
+    # Step 1: Strict per-CT-factor selection (top N per combo by abs(loading))
+    # Step 2: If below target (cross-CT sharing reduces unique count):
+    #         fill from remaining pool sorted by (n_celltypes desc, abs(loading) desc)
+    # Step 3: If above target (rounding up created over-count): trim lowest loading
     # ============================================================================
     logger.info("")
     logger.info("─" * 80)
-    logger.info("PHASE 3: Selecting final genes from duplicate-free pool")
+    logger.info("PHASE 3: Strict CT-factor selection; fill by (n_celltypes, abs(loading))")
     logger.info("─" * 80)
 
-    # Calculate genes per celltype-factor combo for FINAL selection (round UP)
-    # Example: 100 genes ÷ 16 celltypes ÷ 5 factors = 1.25 → 2 genes per combo
-    import math
-    genes_per_celltype_final = probeset_size / len(celltype_loadings)
-    genes_per_combo_final = genes_per_celltype_final / n_components
-    genes_per_combo_final_rounded = math.ceil(genes_per_combo_final)  # ROUND UP
-    
-    logger.info(
-        f"Final allocation: {genes_per_celltype_final:.2f} genes/celltype, "
-        f"{genes_per_combo_final:.2f} genes/combo (rounded UP to {genes_per_combo_final_rounded})"
-    )
-
-    # Select genes from pool per celltype-factor combo
-    final_selected_genes = []
-    final_factor_assignments = {}
-    final_celltype_assignments = {}
     abs_loadings_per_celltype = {
         celltype: loadings_df.abs()
         for celltype, loadings_df in celltype_loadings.items()
     }
 
+    # ---- Step 1: Strict per-CT-factor selection (no R²) ----------------------
+    genes_per_celltype_final = probeset_size / len(celltype_loadings)
+    genes_per_combo_final = genes_per_celltype_final / n_components
+    genes_per_combo_final_rounded = math.ceil(genes_per_combo_final)
+
+    logger.info(
+        f"Strict allocation: {genes_per_combo_final_rounded} genes/combo "
+        f"(target {genes_per_celltype_final:.2f}/CT, {genes_per_combo_final:.2f}/combo)"
+    )
+
+    final_selected_genes: list[str] = []
+    final_factor_assignments: dict[str, str] = {}
+    final_celltype_assignments: dict[str, str] = {}
+
     for celltype in celltype_loadings.keys():
         abs_loadings_df = abs_loadings_per_celltype[celltype]
         component_cols = celltype_loadings[celltype].columns[:n_components]
-        factor_r2_series = celltype_explained_variance[celltype]
 
         for factor in component_cols:
-            # Get pool genes for this celltype-factor combo
             combo_pool_genes = [
                 g for g in pool_genes
                 if pool_celltype_assignments.get(g) == celltype
                 and pool_factor_assignments.get(g) == factor
             ]
 
-            if len(combo_pool_genes) == 0:
-                phase1_count = celltype_genes_per_factor[celltype].get(factor, 0)
-                logger.warning(
-                    f"No pool genes for {celltype}/{factor} - empty after Phase 2 duplicate resolution "
-                    f"(Phase 1: {phase1_count} genes → {resolved['duplicates_resolved']} total duplicates resolved; "
-                    f"need {genes_per_combo_final_rounded}/combo for Phase 3)"
-                )
+            if not combo_pool_genes:
+                logger.warning(f"No pool genes for {celltype}/{factor} after Phase 2")
                 continue
 
-            # Calculate variance-weighted contributions for ranking
-            gene_contributions = {}
-            for gene in combo_pool_genes:
-                if gene in abs_loadings_df.index:
-                    loading = float(abs_loadings_df.at[gene, factor])
-                    factor_r2 = factor_r2_series.get(factor, 0.0)
-                    gene_contributions[gene] = loading * factor_r2
-                else:
-                    gene_contributions[gene] = 0.0
-
-            # Select top N genes by contribution
-            sorted_genes = sorted(gene_contributions.items(), key=lambda x: x[1], reverse=True)
-            n_to_select = min(genes_per_combo_final_rounded, len(sorted_genes))
-            selected_genes_combo = [g for g, _ in sorted_genes[:n_to_select]]
-
-            # Add to final selection
-            for gene in selected_genes_combo:
+            sorted_combo = sorted(
+                combo_pool_genes,
+                key=lambda g: float(abs_loadings_df.at[g, factor])
+                if g in abs_loadings_df.index else 0.0,
+                reverse=True,
+            )
+            for gene in sorted_combo[:genes_per_combo_final_rounded]:
                 if gene not in final_selected_genes:
                     final_selected_genes.append(gene)
-                    final_factor_assignments[gene] = factor
-                    final_celltype_assignments[gene] = celltype
+                final_factor_assignments[gene] = factor
+                final_celltype_assignments[gene] = celltype
 
-    logger.info(f"✓ Phase 3 complete: {len(final_selected_genes)} genes selected from pool")
+    logger.info(
+        f"Strict selection: {len(final_selected_genes)} unique genes "
+        f"(target: {probeset_size})"
+    )
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # PANEL TRIMMING: Reduce to exactly probeset_size (factor-balanced removal)
-    #
-    # Rules:
-    #  - Only remove from celltypes that have >10% more genes than the target
-    #    (target = probeset_size / n_celltypes).  Celltypes at or below
-    #    target * 1.1 are protected from removal.
-    #  - Within an eligible celltype, a gene is only removable when its factor
-    #    would still have >= MIN_FACTOR_CONTRIBUTION genes after removal.
-    #  - Per iteration, among ALL eligible genes across ALL over-represented
-    #    celltypes, remove the one with the lowest selection score.
-    #  - If no eligible gene exists (all celltypes at/below threshold, or
-    #    all remaining genes are factor-contribution floors), fall back to
-    #    global lowest-score removal without floor protection (with a warning).
-    # ──────────────────────────────────────────────────────────────────────────
-    if len(final_selected_genes) > probeset_size:
-        from collections import Counter
-        n_to_remove = len(final_selected_genes) - probeset_size
-        n_celltypes_with_genes = len(celltype_loadings)
-        target_per_ct = probeset_size / n_celltypes_with_genes  # float, e.g. 6.25
-        overage_threshold = target_per_ct * 1.1
+    # ---- Step 2: Fill gap if below target ------------------------------------
+    selected_set = set(final_selected_genes)
+    if len(final_selected_genes) < probeset_size:
+        gap = probeset_size - len(final_selected_genes)
         logger.info(
-            f"Trimming {len(final_selected_genes)} → {probeset_size} genes "
-            f"({n_to_remove} to remove, factor-balanced; "
-            f"target/CT={target_per_ct:.2f}, overage threshold={overage_threshold:.2f})"
+            f"Below target by {gap} genes (cross-celltype sharing reduces unique count). "
+            f"Filling from remaining pool sorted by n_celltypes desc "
+            f"(loadings not used — not comparable across independent per-CT NMF runs)."
         )
+        fill_candidates = []
+        for gene in pool_genes:
+            if gene in selected_set:
+                continue
+            best_ct = pool_celltype_assignments[gene]
+            best_factor = pool_factor_assignments[gene]
+            fill_candidates.append((n_celltypes_per_gene.get(gene, 1), gene, best_ct, best_factor))
 
-        fallback_used = 0
-        while len(final_selected_genes) > probeset_size:
-            # Current per-celltype gene counts
-            ct_counts = Counter(
-                final_celltype_assignments.get(g, '__unknown__')
-                for g in final_selected_genes
-            )
-            # Current per-(celltype, factor) gene counts
-            ct_factor_counts: dict[tuple, int] = Counter(
-                (final_celltype_assignments.get(g, '__unknown__'),
-                 final_factor_assignments.get(g, '__unknown__'))
-                for g in final_selected_genes
-            )
+        # Sort by n_celltypes only — abs(loading) is NOT used here because loadings
+        # come from independent per-CT NMF runs and are not comparable across celltypes.
+        fill_candidates.sort(key=lambda x: x[0], reverse=True)
 
-            # Celltypes eligible for removal (>10% over target)
-            eligible_cts = {
-                ct for ct, cnt in ct_counts.items()
-                if cnt > overage_threshold
-            }
+        for n_cts, gene, best_ct, best_factor in fill_candidates:
+            if len(final_selected_genes) >= probeset_size:
+                break
+            final_selected_genes.append(gene)
+            final_factor_assignments[gene] = best_factor
+            final_celltype_assignments[gene] = best_ct
+            selected_set.add(gene)
 
-            # Build candidate list: (score, gene) for all removable genes
-            candidates: list[tuple[float, str]] = []
-            for g in final_selected_genes:
-                ct = final_celltype_assignments.get(g, '__unknown__')
-                if ct not in eligible_cts:
-                    continue
-                fac = final_factor_assignments.get(g, '__unknown__')
-                # Guard: after removal this factor must still meet MIN_FACTOR_CONTRIBUTION
-                if ct_factor_counts[(ct, fac)] <= MIN_FACTOR_CONTRIBUTION:
-                    continue
-                ct_abs_loadings_df = abs_loadings_per_celltype[ct]
-                factor_r2_series = celltype_explained_variance[ct]
-                if fac and g in ct_abs_loadings_df.index:
-                    loading = float(ct_abs_loadings_df.at[g, fac])
-                    r2 = factor_r2_series.get(fac, 0.0)
-                    score = loading * r2
-                else:
-                    score = 0.0
-                candidates.append((score, g))
+        logger.info(f"After fill: {len(final_selected_genes)} genes")
 
-            if candidates:
-                worst_gene = min(candidates, key=lambda x: x[0])[1]
-            else:
-                # Fallback: no cell type is sufficiently over threshold or all
-                # remaining genes are at the factor floor — remove global worst
-                fallback_used += 1
-                fallback_candidates: list[tuple[float, str]] = []
-                for g in final_selected_genes:
-                    ct = final_celltype_assignments.get(g, '__unknown__')
-                    fac = final_factor_assignments.get(g, '__unknown__')
-                    ct_abs_loadings_df = abs_loadings_per_celltype.get(ct)
-                    if ct_abs_loadings_df is not None and fac and g in ct_abs_loadings_df.index:
-                        loading = float(ct_abs_loadings_df.at[g, fac])
-                        r2 = celltype_explained_variance[ct].get(fac, 0.0)
-                        score = loading * r2
-                    else:
-                        score = 0.0
-                    fallback_candidates.append((score, g))
-                worst_gene = min(fallback_candidates, key=lambda x: x[0])[1]
+    # ---- Step 3: Trim if above target ----------------------------------------
+    elif len(final_selected_genes) > probeset_size:
+        n_to_remove = len(final_selected_genes) - probeset_size
+        logger.info(f"Above target by {n_to_remove} genes. Trimming lowest-loading genes.")
 
-            final_selected_genes.remove(worst_gene)
-            del final_factor_assignments[worst_gene]
-            del final_celltype_assignments[worst_gene]
+        gene_scores = []
+        for gene in final_selected_genes:
+            ct = final_celltype_assignments.get(gene)
+            fac = final_factor_assignments.get(gene)
+            abs_df = abs_loadings_per_celltype.get(ct)
+            score = float(abs_df.at[gene, fac]) if abs_df is not None and gene in abs_df.index else 0.0
+            gene_scores.append((score, gene))
 
-        if fallback_used:
-            logger.warning(
-                f"  {fallback_used} fallback removals were needed (no over-represented "
-                f"celltype with removable gene found — factor floor or threshold exhausted)"
-            )
-        logger.info(f"✓ Trimmed to exactly {len(final_selected_genes)} genes")
-    elif len(final_selected_genes) < probeset_size:
-        logger.warning(
-            f"Selected {len(final_selected_genes)} genes (target: {probeset_size}). "
-            f"Pool may need larger size or more balanced allocation."
+        gene_scores.sort(key=lambda x: x[0])  # ascending: lowest score first
+        to_remove = {g for _, g in gene_scores[:n_to_remove]}
+        final_selected_genes = [g for g in final_selected_genes if g not in to_remove]
+        for gene in to_remove:
+            del final_factor_assignments[gene]
+            del final_celltype_assignments[gene]
+
+        logger.info(f"✓ Trimmed to {len(final_selected_genes)} genes")
+
+    logger.info(f"✓ Phase 3 complete: {len(final_selected_genes)} genes selected")
+
+    # Build gene_details for ALL pool genes in (n_celltypes, loading) order.
+    # Insertion order into the builder determines gap-fill priority.
+    gene_details = []
+    for gene in pool_genes:
+        best_ct = pool_celltype_assignments[gene]
+        best_factor = pool_factor_assignments[gene]
+        abs_df = abs_loadings_per_celltype.get(best_ct)
+        best_loading = (
+            float(abs_df.at[gene, best_factor])
+            if abs_df is not None and gene in abs_df.index else 0.0
         )
+        n_cts = n_celltypes_per_gene.get(gene, 1)
+        contributing = gene_celltype_mapping.get(gene, [best_ct])
 
-    # Log final celltype distribution
-    final_genes_per_ct = {}
-    for ct in celltype_loadings.keys():
-        ct_genes = [g for g in final_selected_genes if final_celltype_assignments.get(g) == ct]
-        final_genes_per_ct[ct] = len(ct_genes)
+        gene_details.append({
+            'gene': gene,
+            'n_celltypes': n_cts,
+            'contributing_celltypes': ', '.join(sorted(contributing)),
+            'best_celltype': best_ct,
+            'best_factor': best_factor,
+            'best_loading': best_loading,
+        })
 
-    logger.info(f"Final celltype distribution (target: {probeset_size} genes):")
-    for ct, count in sorted(final_genes_per_ct.items(), key=lambda x: x[1], reverse=True):
-        logger.info(f"  {ct}: {count} genes")
+    # Sort by n_celltypes only — loadings not used for cross-CT ordering.
+    gene_details.sort(key=lambda x: x['n_celltypes'], reverse=True)
 
     # ============================================================================
     # ADD GENES TO BUILDER
-    # Add ALL Phase 2 pool genes so ODT has a large replacement pool.
+    # Add ALL pool genes in n_celltypes-descending order.
     # Only Phase 3 final genes are marked as selected_initial.
-    # Non-selected pool genes automatically become ODT replacement candidates.
+    # Non-selected pool genes become replacement candidates; since get_all_genes()
+    # preserves insertion order for tied ranks, gap-filling picks multi-CT genes first.
     # ============================================================================
     logger.info("")
     logger.info(
         f"Adding Phase 2 pool to builder: {len(pool_genes)} genes "
         f"({len(final_selected_genes)} selected + "
-        f"{len(pool_genes) - len(final_selected_genes)} ODT replacement candidates)"
+        f"{len(pool_genes) - len(final_selected_genes)} replacement candidates)"
     )
 
     selected_set = set(final_selected_genes)
 
-    for gene in pool_genes:
-        celltype = pool_celltype_assignments.get(gene)
-        factor = pool_factor_assignments.get(gene)
-
-        if not celltype or not factor:
-            logger.warning(f"Gene {gene} missing celltype/factor assignment - skipping")
-            continue
-
-        abs_loadings_df = abs_loadings_per_celltype[celltype]
-
-        if gene not in abs_loadings_df.index:
-            logger.warning(f"Gene {gene} not found in {celltype} loadings - skipping")
-            continue
-
-        loading = float(abs_loadings_df.at[gene, factor])
-        factor_r2 = celltype_explained_variance[celltype].get(factor, 0.0)
-        selection_score = loading * factor_r2
+    # gene_details is already sorted by (n_celltypes desc, abs(loading) desc) from Phase 3
+    for d in gene_details:
+        gene = d['gene']
+        celltype = d['best_celltype']
+        factor = d['best_factor']
+        loading = d['best_loading']
+        n_cts = d['n_celltypes']
+        contributing = d['contributing_celltypes']
 
         builder.add_gene(
             gene=gene,
-            selection_score=selection_score,
+            selection_score=loading,  # abs(loading); no R² weighting
             rank=None,
             celltype=celltype,
             component=str(factor),
             metadata={
                 "loading": float(loading),
-                "factor_r2": float(factor_r2),
                 "pool_size_per_celltype": pool_size_per_celltype,
                 "phase": "pool_based",
+                "n_celltypes_selected": n_cts,
+                "contributing_celltypes": contributing,
             },
         )
 
@@ -2183,9 +2162,9 @@ def _select_genes_per_celltype(
         builder.mark_selected(gene)
 
     logger.info(
-        f"✓ Added {len(pool_genes)} pool genes; "
+        f"✓ Added {len(gene_details)} pool genes; "
         f"{len(final_selected_genes)} marked selected, "
-        f"{len(pool_genes) - len(selected_set)} available as ODT replacement candidates"
+        f"{len(gene_details) - len(selected_set)} available as replacement candidates"
     )
     logger.info(f"=" * 80)
 

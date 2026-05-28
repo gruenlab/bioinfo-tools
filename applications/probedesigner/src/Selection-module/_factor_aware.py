@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import logging
 import math
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Set
 
 import numpy as np
 import pandas as pd
@@ -191,15 +191,15 @@ def resolve_duplicates_factor_aware_global(
 
 def resolve_duplicates_factor_aware_per_celltype(
     celltype_genes_per_factor: Dict[str, Dict],
-    celltype_factor_explained_variance: Optional[Dict[str, pd.Series]] = None
 ) -> Dict[str, any]:
     """
     Resolve duplicate genes with celltype-factor awareness.
-    
+
     This function accepts the celltype_genes_per_factor dict directly from
-    _select_genes_per_celltype and handles both within-celltype and cross-
-    celltype duplicates.
-    
+    _select_genes_per_celltype and handles within-celltype duplicates.
+    Cross-celltype shared genes are intentionally kept and tracked via
+    gene_celltype_mapping so the caller can rank by n_celltypes.
+
     Args:
         celltype_genes_per_factor: Dict with structure:
             {celltype: {
@@ -207,19 +207,17 @@ def resolve_duplicates_factor_aware_per_celltype(
                 "loadings_df": pd.DataFrame (genes × factors),
                 "component_cols": [factor1, factor2, ...]
             }}
-        celltype_factor_explained_variance: Optional R² per factor per celltype.
-            Format: {celltype: pd.Series([r2_factor1, r2_factor2, ...])}
-            If provided, uses R²-weighted assignment for cross-celltype duplicates.
-            If None, falls back to normalized loading comparison.
-        
+
     Returns:
         Dictionary containing:
             - 'selected_genes': List of final selected gene names
             - 'factor_assignments': Dict mapping gene to component
             - 'celltype_assignments': Dict mapping gene to celltype
-            - 'duplicates_resolved': Total duplicates resolved
+            - 'duplicates_resolved': Total within-celltype duplicates resolved
             - 'replacements_made': Number of replacement genes added
-            
+            - 'gene_celltype_mapping': Dict mapping gene to all celltypes that selected it
+            - 'n_celltypes_per_gene': Dict mapping gene to count of celltypes
+
     Examples:
         >>> celltype_data = {
         ...     'T_cells': {
@@ -228,9 +226,7 @@ def resolve_duplicates_factor_aware_per_celltype(
         ...         'component_cols': ['NMF1', 'NMF2']
         ...     }
         ... }
-        >>> result = resolve_duplicates_factor_aware_per_celltype(
-        ...     celltype_data, 100
-        ... )
+        >>> result = resolve_duplicates_factor_aware_per_celltype(celltype_data)
     """
     # Extract loadings and component cols
     loadings_per_celltype = {
@@ -297,42 +293,27 @@ def resolve_duplicates_factor_aware_per_celltype(
         f"Within-celltype resolution: {within_ct_duplicates} duplicates, "
         f"{total_replacements} replacements"
     )
-    
-    # Step 2: Resolve cross-celltype duplicates with iterative replacement
-    all_selected_genes = [
-        gene
-        for ct_factors in celltype_factor_to_genes.values()
-        for genes in ct_factors.values()
-        for gene in genes
-    ]
-    
-    cross_ct_dups = _find_cross_celltype_duplicates(all_selected_genes)
-    cross_ct_duplicates_initial = len(cross_ct_dups)
-    
-    if cross_ct_duplicates_initial > 0:
-        logger.info(
-            f"Found {cross_ct_duplicates_initial} cross-celltype duplicates "
-            f"(genes selected by multiple celltypes)"
-        )
-        logger.info("Resolving cross-celltype duplicates with variance-weighted assignment...")
-        
-        # Resolve with iterative replacement
-        celltype_factor_to_genes, cross_ct_replacements = _resolve_cross_celltype_duplicates(
-            celltype_factor_to_genes=celltype_factor_to_genes,
-            loadings_per_celltype=loadings_per_celltype,
-            celltype_factor_explained_variance=celltype_factor_explained_variance
-        )
-        
-        total_replacements += cross_ct_replacements
-        cross_ct_duplicates = cross_ct_duplicates_initial  # Track for output
-    else:
-        logger.info("No cross-celltype duplicates found")
-    
-    # Step 3: Build simple assignments for caller
+
+    # Step 2: Build gene_celltype_mapping from original input (captures all
+    # contributions before within-CT resolution trimmed genes).
+    # Cross-celltype shared genes are tracked here, not removed — the caller
+    # ranks genes by n_celltypes to prefer multi-celltype genes.
+    gene_celltype_mapping: Dict[str, List[str]] = {}
+    for celltype, data in celltype_genes_per_factor.items():
+        for factor, genes in data["genes_per_factor"].items():
+            for gene in genes:
+                if gene not in gene_celltype_mapping:
+                    gene_celltype_mapping[gene] = []
+                if celltype not in gene_celltype_mapping[gene]:
+                    gene_celltype_mapping[gene].append(celltype)
+
+    n_celltypes_per_gene = {gene: len(cts) for gene, cts in gene_celltype_mapping.items()}
+
+    # Step 3: Build simple assignments for caller (best celltype = first assignment)
     selected_genes = []
     factor_assignments = {}
     celltype_assignments = {}
-    
+
     for celltype, factor_to_genes in celltype_factor_to_genes.items():
         for factor, genes in factor_to_genes.items():
             for gene in genes:
@@ -340,21 +321,25 @@ def resolve_duplicates_factor_aware_per_celltype(
                     selected_genes.append(gene)
                 factor_assignments[gene] = factor
                 celltype_assignments[gene] = celltype
-    
+
+    cross_ct_count = sum(1 for n in n_celltypes_per_gene.values() if n > 1)
+
     result = {
         'selected_genes': selected_genes,
         'factor_assignments': factor_assignments,
         'celltype_assignments': celltype_assignments,
-        'duplicates_resolved': within_ct_duplicates + cross_ct_duplicates,
+        'duplicates_resolved': within_ct_duplicates,
         'replacements_made': total_replacements,
+        'gene_celltype_mapping': gene_celltype_mapping,
+        'n_celltypes_per_gene': n_celltypes_per_gene,
     }
-    
+
     logger.info(
-        f"✓ Per-celltype resolution complete: {len(selected_genes)} genes, "
-        f"{within_ct_duplicates} within-celltype duplicates, "
-        f"{cross_ct_duplicates} cross-celltype duplicates"
+        f"✓ Per-celltype resolution complete: {len(selected_genes)} unique genes "
+        f"({within_ct_duplicates} within-celltype duplicates resolved, "
+        f"{cross_ct_count} genes shared across multiple celltypes)"
     )
-    
+
     return result
 
 
@@ -718,151 +703,6 @@ def _validate_factor_balance(
                     f"target is {target_per_factor} "
                     f"(deviation: {deviation:.1%} > {FACTOR_BALANCE_TOLERANCE:.1%})"
                 )
-
-
-def _resolve_cross_celltype_duplicates(
-    celltype_factor_to_genes: Dict[str, Dict[str, List[str]]],
-    loadings_per_celltype: Dict[str, pd.DataFrame],
-    celltype_factor_explained_variance: Optional[Dict[str, pd.Series]]
-) -> Tuple[Dict[str, Dict[str, List[str]]], int]:
-    """
-    Resolve cross-celltype duplicates with iterative replacement.
-    
-    For each duplicate gene, assigns to celltype/factor with highest contribution
-    (loading × R² if available, else normalized loading). Losing celltypes pull
-    next-best candidates from their candidate pools.
-    
-    Returns:
-        Updated celltype_factor_to_genes dict and number of replacements made
-    """
-    # Build candidate pools (sorted by loading descending)
-    candidate_pools = {}
-    abs_loadings_per_celltype = {
-        ct: loadings_df.abs() for ct, loadings_df in loadings_per_celltype.items()
-    }
-    for ct, factors in celltype_factor_to_genes.items():
-        candidate_pools[ct] = {}
-        abs_loadings_df = abs_loadings_per_celltype[ct]
-        for factor, genes in factors.items():
-            # Sort all genes by loading on this factor (vectorized — avoids
-            # ~20k Python-level .at[] calls per factor per celltype)
-            sorted_genes = abs_loadings_df[factor].sort_values(
-                ascending=False
-            ).index.tolist()
-            # Remove already selected genes
-            selected_set = set(genes)
-            candidate_pools[ct][factor] = [
-                g for g in sorted_genes if g not in selected_set
-            ]
-    
-    # Track assignments
-    gene_to_assignments = {}  # gene -> [(ct, factor)]
-    for ct, factors in celltype_factor_to_genes.items():
-        for factor, genes in factors.items():
-            for gene in genes:
-                if gene not in gene_to_assignments:
-                    gene_to_assignments[gene] = []
-                gene_to_assignments[gene].append((ct, factor))
-    
-    # Find duplicates
-    duplicates = {g: cts for g, cts in gene_to_assignments.items() if len(cts) > 1}
-    
-    if not duplicates:
-        return celltype_factor_to_genes, 0
-    
-    logger.info(f"Resolving {len(duplicates)} cross-celltype duplicates...")
-    
-    replacements_made = 0
-    
-    # Resolve each duplicate
-    for gene, candidates in duplicates.items():
-        # Find best celltype/factor for this gene
-        best_score = 0
-        best_ct = None
-        best_factor = None
-        
-        for ct, factor in candidates:
-            abs_loadings_df = abs_loadings_per_celltype[ct]
-            
-            if gene not in abs_loadings_df.index:
-                continue
-            
-            loading = float(abs_loadings_df.at[gene, factor])
-            
-            if celltype_factor_explained_variance is None:
-                raise ValueError(
-                    "celltype_factor_explained_variance is required for cross-celltype duplicate resolution. "
-                    "Ensure compute_nmf_per_celltype or compute_pca_per_celltype returns explained variance "
-                    "and it is passed to resolve_duplicates_factor_aware_per_celltype."
-                )
-            
-            # Use R²-weighted contribution
-            factor_r2 = celltype_factor_explained_variance[ct][factor]
-            contribution = loading * factor_r2
-            
-            if contribution > best_score:
-                best_score = contribution
-                best_ct = ct
-                best_factor = factor
-        
-        # Assign to winner, replace in losers
-        for ct, factor in candidates:
-            if ct == best_ct and factor == best_factor:
-                # Winner keeps the gene
-                continue
-            else:
-                # Loser: remove gene and pull replacement
-                celltype_factor_to_genes[ct][factor].remove(gene)
-                
-                # Pull next candidate
-                if candidate_pools[ct][factor]:
-                    replacement = candidate_pools[ct][factor].pop(0)
-                    celltype_factor_to_genes[ct][factor].append(replacement)
-                    replacements_made += 1
-                    # Log replacement gene with loading and r2*loading contribution
-                    repl_loading = float(abs_loadings_per_celltype[ct].at[replacement, factor]) \
-                        if replacement in abs_loadings_per_celltype[ct].index else 0.0
-                    repl_r2 = float(celltype_factor_explained_variance[ct].get(factor, 0.0)) \
-                        if celltype_factor_explained_variance else 0.0
-                    repl_contribution = repl_loading * repl_r2
-                    # Also log removed gene metrics for comparison
-                    try:
-                        old_loading = float(abs_loadings_per_celltype[ct].at[gene, factor]) \
-                            if gene in abs_loadings_per_celltype[ct].index else 0.0
-                        old_r2 = repl_r2  # Same R² for same factor/celltype
-                        old_contribution = old_loading * old_r2
-                    except (KeyError, ValueError):
-                        old_loading = 0.0
-                        old_r2 = 0.0
-                        old_contribution = 0.0
-                    logger.info(
-                        f"  Cross-CT gap-fill [{ct}/{factor}]: {gene}(loading={old_loading:.4f}, "
-                        f"r2={old_r2:.4f}, contribution={old_contribution:.4f}) replaced by "
-                        f"{replacement}(loading={repl_loading:.4f}, r2={repl_r2:.4f}, "
-                        f"contribution={repl_contribution:.4f})"
-                    )
-                else:
-                    logger.warning(
-                        f"  No replacement available for {ct}/{factor} "
-                        f"(gene {gene} removed)"
-                    )
-        
-        logger.info(
-            f"  {gene}: assigned to {best_ct}/{best_factor} "
-            f"(contribution={best_score:.4f})"
-        )
-    
-    logger.info(
-        f"Cross-celltype resolution complete: {replacements_made} replacements made"
-    )
-    
-    return celltype_factor_to_genes, replacements_made
-
-
-def _find_cross_celltype_duplicates(all_genes: List[str]) -> Set[str]:
-    """Find genes that appear multiple times (cross-celltype duplicates)."""
-    gene_counts = Counter(all_genes)
-    return {gene for gene, count in gene_counts.items() if count > 1}
 
 
 def _get_next_best_genes_for_component(

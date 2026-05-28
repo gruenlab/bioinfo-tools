@@ -1,4 +1,4 @@
-from anndata.typing import AnnData
+from anndata import AnnData
 from nico2_lib.predictors._scvi._model import recVAE
 from scvi import REGISTRY_KEYS
 from scvi.data import AnnDataManager

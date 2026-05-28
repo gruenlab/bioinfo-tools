@@ -3,8 +3,7 @@ from functools import reduce
 from typing import Callable, TypeVar
 
 import numpy as np
-from anndata.typing import AnnData
-from kneed import KneeLocator
+from anndata import AnnData
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 
@@ -65,6 +64,7 @@ def find_components(
         models[k] = km
         inertias.append(km.inertia_)
 
+    from kneed import KneeLocator
     elbow = KneeLocator(
         list(cluster_range), inertias, curve="convex", direction="decreasing"
     ).elbow

@@ -1,5 +1,9 @@
+from __future__ import annotations
+
+from typing import TypeAlias
+
 from numpy import intp, number
 from numpy.typing import NDArray
 
-type NumericArray = NDArray[number]
-type IndexArray = NDArray[intp]
+NumericArray: TypeAlias = NDArray[number]
+IndexArray: TypeAlias = NDArray[intp]

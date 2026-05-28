@@ -31,8 +31,11 @@ NORMALIZE_TARGET_SUM: float = 1e4
 # Gene Selection
 # =============================================================================
 
-DEFAULT_N_HVG: int = 2000
+DEFAULT_N_HVG: int = 8000
 """Default number of highly variable genes to select."""
+
+DEFAULT_HVG_FLAVOR: str = "cell_ranger"
+"""Scanpy HVG flavor for highly variable gene computation."""
 
 # =============================================================================
 # Filtering
@@ -67,6 +70,7 @@ __all__ = [
     'DEFAULT_RANDOM_STATE',
     'NORMALIZE_TARGET_SUM',
     'DEFAULT_N_HVG',
+    'DEFAULT_HVG_FLAVOR',
     'DEFAULT_MIN_GENES_PER_CELL',
     'DEFAULT_MIN_CELLS_PER_GENE',
     'FILTER_METHODS',

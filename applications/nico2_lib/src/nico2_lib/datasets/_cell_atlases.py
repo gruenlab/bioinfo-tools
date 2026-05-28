@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Literal, Optional
 import anndata as ad  # type: ignore
-from anndata.typing import AnnData  # type: ignore
+from anndata import AnnData  # type: ignore
 import pandas as pd
 import scipy.io
 
