@@ -8,12 +8,16 @@ from sklearn.decomposition import PCA
 
 @dataclass(frozen=True)
 class PcaPredictor:
-    embedding_size: int | None = None
+    n_components: int | None = None
     preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
 
     _feature_embeddings: NumericArray | None = None
     _mean: NumericArray | None = None
     _explained_variance: NumericArray | None = None
+
+    @property
+    def embedding_size(self) -> int:
+        return self.n_components or 3
 
     def fit(self, x: NumericArray) -> "PcaPredictor":
         if self.preprocessing_steps is not None:

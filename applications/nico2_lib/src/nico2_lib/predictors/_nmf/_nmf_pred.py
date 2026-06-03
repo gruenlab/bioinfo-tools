@@ -8,8 +8,114 @@ import scanpy as sc
 from nico2_lib.predictors.utils import preprocess_counts
 from nico2_lib.typing import IndexArray, NumericArray
 from numpy.random import RandomState
+from scipy.cluster.hierarchy import cophenet, linkage
+from scipy.spatial.distance import pdist
 from sklearn.cluster import KMeans
 from sklearn.decomposition import NMF, non_negative_factorization
+
+
+def find_k_by_inflection(
+    x: NumericArray,
+    k_range: range,
+    max_iter: int,
+) -> tuple[int, list[float]]:
+    """
+    Finds the optimal k by identifying the inflection point of
+    reconstruction error (Explained Variability).
+    """
+    ev_scores: list[float] = []
+    total_var = np.var(x) * x.size
+    for k in k_range:
+        model = NMF(
+            n_components=k,  # type: ignore
+            init="nndsvd",
+            max_iter=max_iter,
+            random_state=42,
+        )
+        W = model.fit_transform(x)
+        H = model.components_
+        reconstruction = np.dot(W, H)
+        error = np.sum((x - reconstruction) ** 2)
+        explained_var = 1 - (error / total_var)
+        ev_scores.append(explained_var)
+    best_k = detect_knee(
+        x=np.array(k_range),
+        y=np.array(ev_scores),
+    )
+
+    return best_k, ev_scores
+
+
+def detect_knee(
+    x: NumericArray,
+    y: NumericArray,
+) -> int:
+    """
+    Simple geometric knee detection: finds the point furthest from
+    the line connecting the first and last points.
+    """
+    x = np.array(x)
+    y = np.array(y)
+
+    # Line connecting first and last points
+    first_pt = np.array([x[0], y[0]])
+    last_pt = np.array([x[-1], y[-1]])
+    line_vec = last_pt - first_pt
+    line_vec_norm = line_vec / np.sqrt(np.sum(line_vec**2))
+
+    distances = []
+    for i in range(len(x)):
+        pt = np.array([x[i], y[i]])
+        start_to_pt = pt - first_pt
+        # Calculate perpendicular distance to the line
+        dist = np.linalg.norm(
+            start_to_pt - np.dot(start_to_pt, line_vec_norm) * line_vec_norm
+        )
+        distances.append(dist)
+
+    return x[np.argmax(distances)]
+
+
+def consensus_nmf(
+    x: NumericArray,
+    k_range: range,
+    n_runs: int,
+    max_iter: int,
+) -> int:
+    """
+    Determines the best number of NMF components by testing stability.
+    Returns the k with the highest Cophenetic Correlation Coefficient.
+    """
+    stability_scores = {}
+
+    for k in k_range:
+        consensus_accumulator = np.zeros((x.shape[0], x.shape[0]))
+        for seed in range(n_runs):
+            model = NMF(
+                n_components=k,  # type: ignore
+                init="random",
+                random_state=seed,
+                max_iter=max_iter,
+            )
+            W = model.fit_transform(x)
+            clusters = np.argmax(W, axis=1)
+            connectivity = (clusters[:, None] == clusters[None, :]).astype(int)
+            consensus_accumulator += connectivity
+        consensus_matrix = consensus_accumulator / n_runs
+        dist_matrix = 1 - consensus_matrix
+        condensed_dist = pdist(dist_matrix)
+        if np.all(condensed_dist == 0):  # Handle edge cases
+            stability_scores[k] = 0
+            continue
+        Z = linkage(condensed_dist, method="average")
+        coph_corr, _ = cophenet(Z, condensed_dist)
+        stability_scores[k] = coph_corr
+        print(f"k={k}: Stability Score = {stability_scores[k]:.4f}")
+    best_k = max(  # type: ignore
+        stability_scores,
+        key=stability_scores.get,  # type: ignore
+    )
+    return best_k
 
 
 def init_nmf_matrices(
@@ -81,7 +187,12 @@ def robust_init_nmf_matrices(X, n_components: int) -> tuple[np.ndarray, np.ndarr
 class NmfPredictor:
     """NMF-based predictor using ProtocolN (fit on X, predict all fit-time features)."""
 
-    embedding_size: int | None = None
+    n_components: int | Callable[[NumericArray], int] | None = lambda x: consensus_nmf(
+        x=x,
+        k_range=range(2, 11),
+        n_runs=10,
+        max_iter=200,
+    )
     init: Literal["random", "nndsvd", "nndsvda", "nndsvdar", "custom"] | None = None
     random_state: int | RandomState | None = None
     max_iter: int = 200
@@ -92,23 +203,29 @@ class NmfPredictor:
     pre_init: bool = False
     solver: Literal["cd", "mu"] = "cd"
     beta_loss: str = "frobenius"
-    max_iter: int = 1000
-    init: str | None = None
-    alpha_W: float = 0.0
-    alpha_H: float = 0.0
-    l1_ratio: float = 0.0
     h_reference: NumericArray | None = None
     n_shared_features: int | None = None
     ref_embedding: NumericArray | None = None
+    embedding_size: int | None = None
+
+    def _resolve_components(self, x: NumericArray) -> int | None:
+        match self.n_components:
+            case None:
+                return None
+            case int():
+                return self.n_components
+            case Callable():
+                return self.n_components(x)
 
     def fit(self, x: NumericArray) -> "NmfPredictor":
         x = preprocess_counts(x, self.preprocessing_steps)
+        embedding_size = self._resolve_components(x)
         w_init, h_init = (None, None)
-        if self.pre_init and self.embedding_size is not None:
-            w_init, h_init = robust_init_nmf_matrices(x, self.embedding_size)
+        if self.pre_init is not None and embedding_size is not None:
+            w_init, h_init = robust_init_nmf_matrices(x, embedding_size)
 
         model = NMF(
-            n_components=self.embedding_size or 3,
+            n_components=embedding_size,  # type: ignore
             init="custom" if w_init is not None else "nndsvd",
             solver=self.solver,
             max_iter=self.max_iter,
@@ -131,6 +248,7 @@ class NmfPredictor:
             self,
             h_reference=h_reference,
             ref_embedding=w_reference,
+            embedding_size=embedding_size,
         )
 
     def predict(
@@ -152,8 +270,12 @@ class NmfPredictor:
             for step in self.preprocessing_steps:
                 x = step(x)
         w_query, _, _ = non_negative_factorization(
-            X=x, H=self.h_reference[:, indexer], init="custom", update_H=False,
-            n_components=self.embedding_size, max_iter=self.max_iter,
+            X=x,
+            H=self.h_reference[:, indexer],
+            init="custom",
+            update_H=False,
+            n_components=self.embedding_size,
+            max_iter=self.max_iter,
         )
         return w_query, w_query @ self.h_reference
 
