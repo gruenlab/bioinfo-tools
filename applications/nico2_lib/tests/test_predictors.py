@@ -1,4 +1,5 @@
 import nico2_lib as n2l
+from functools import partial
 import numpy as np
 import pytest
 from nico2_lib.typing import NumericArray
@@ -38,13 +39,39 @@ def _assert_reconstruction_shape(full_reconstruction: NumericArray):
     )
 
 
+def _assert_embedding_size(
+    cell_embedding: NumericArray,
+    gene_embedding: NumericArray | None,
+    embedding_size: int,
+):
+    assert cell_embedding.shape[1] == embedding_size, (
+        f"Expected cell embedding size: {embedding_size}, got: {cell_embedding.shape[1]}"
+    )
+    if gene_embedding is not None:
+        assert gene_embedding.shape[0] == embedding_size, (
+            f"Expected gene embedding size: {embedding_size}, got: {gene_embedding.shape[0]}"
+        )
+
+
 @pytest.mark.parametrize("embedding_size", [3, 5])
 def test_pca_predictor(embedding_size: int):
     pca_predictor = n2l.pd.PcaPredictor(n_components=embedding_size).fit(
         counts[cell_train_idx]
     )
-    pca_predictor, (_, full_reconstruction) = _run_predictor(pca_predictor)
-    _assert_reconstruction_shape(full_reconstruction)
+    pca_predictor, (cell_embedding, full_reconstruction) = _run_predictor(
+        pca_predictor,
+    )
+    _assert_reconstruction_shape(
+        full_reconstruction,
+    )
+    assert pca_predictor.embedding_size is not None, (
+        f"Expected embedding size to be set, got: {pca_predictor.embedding_size}"
+    )
+    _assert_embedding_size(
+        cell_embedding,
+        pca_predictor.feature_embedding,
+        pca_predictor.embedding_size,
+    )
 
 
 @pytest.mark.parametrize(
@@ -52,22 +79,25 @@ def test_pca_predictor(embedding_size: int):
     [
         3,
         5,
-        lambda x: n2l.pd.consensus_nmf(
-            x=x,
-            k_range=range(2, 11),
-            n_runs=5,
-            max_iter=500,
-        ),
-        lambda x: n2l.pd.find_k_by_inflection(
-            x=x,
-            k_range=range(2, 11),
-            max_iter=500,
-        )[0],
+        partial(n2l.pd.consensus_nmf, k_range=range(2, 11), n_runs=5, max_iter=500),
+        lambda x: partial(n2l.pd.find_k_by_inflection, k_range=range(2, 11), max_iter=500)(x)[0],
     ],
 )
 def test_nmf_predictor(embedding_size: int):
     nmf_predictor = n2l.pd.NmfPredictor(n_components=embedding_size).fit(
         counts[cell_train_idx]
     )
-    nmf_predictor, (_, full_reconstruction) = _run_predictor(nmf_predictor)
-    _assert_reconstruction_shape(full_reconstruction)
+    nmf_predictor, (cell_embedding, full_reconstruction) = _run_predictor(
+        nmf_predictor,
+    )
+    _assert_reconstruction_shape(
+        full_reconstruction,
+    )
+    assert nmf_predictor.embedding_size is not None, (
+        f"Expected embedding size to be set, got: {nmf_predictor.embedding_size}"
+    )
+    _assert_embedding_size(
+        cell_embedding,
+        nmf_predictor.feature_embedding,
+        nmf_predictor.embedding_size,
+    )

@@ -32,9 +32,9 @@ def find_k_by_inflection(
             max_iter=max_iter,
             random_state=42,
         )
-        W = model.fit_transform(x)
-        H = model.components_
-        reconstruction = np.dot(W, H)
+        w = model.fit_transform(x)
+        h = model.components_
+        reconstruction = np.dot(w, h)
         error = np.sum((x - reconstruction) ** 2)
         explained_var = 1 - (error / total_var)
         ev_scores.append(explained_var)
@@ -57,7 +57,6 @@ def detect_knee(
     x = np.array(x)
     y = np.array(y)
 
-    # Line connecting first and last points
     first_pt = np.array([x[0], y[0]])
     last_pt = np.array([x[-1], y[-1]])
     line_vec = last_pt - first_pt
@@ -67,7 +66,6 @@ def detect_knee(
     for i in range(len(x)):
         pt = np.array([x[i], y[i]])
         start_to_pt = pt - first_pt
-        # Calculate perpendicular distance to the line
         dist = np.linalg.norm(
             start_to_pt - np.dot(start_to_pt, line_vec_norm) * line_vec_norm
         )
@@ -241,7 +239,8 @@ class NmfPredictor:
             )
         else:
             w_reference = model.fit_transform(x)
-
+            
+        embedding_size = model.n_components
         h_reference = model.components_
 
         return replace(
