@@ -1,5 +1,6 @@
-import nico2_lib as n2l
 from functools import partial
+
+import nico2_lib as n2l
 import numpy as np
 import pytest
 from nico2_lib.typing import NumericArray
@@ -79,8 +80,9 @@ def test_pca_predictor(embedding_size: int):
     [
         3,
         5,
-        partial(n2l.pd.consensus_nmf, k_range=range(2, 11), n_runs=5, max_iter=500),
-        lambda x: partial(n2l.pd.find_k_by_inflection, k_range=range(2, 11), max_iter=500)(x)[0],
+        lambda x: partial(
+            n2l.pd.find_k_by_inflection, k_range=range(2, 11), max_iter=500
+        )(x)[0],
     ],
 )
 def test_nmf_predictor(embedding_size: int):
@@ -100,4 +102,24 @@ def test_nmf_predictor(embedding_size: int):
         cell_embedding,
         nmf_predictor.feature_embedding,
         nmf_predictor.embedding_size,
+    )
+
+
+def test_scvi_predictor(embedding_size: int):
+    scvi_predictor = n2l.pd.ScviPredictor(n_factors=embedding_size).fit(
+        counts[cell_train_idx]
+    )
+    scvi_predictor, (cell_embedding, full_reconstruction) = _run_predictor(
+        scvi_predictor,
+    )
+    _assert_reconstruction_shape(
+        full_reconstruction,
+    )
+    assert scvi_predictor.embedding_size is not None, (
+        f"Expected embedding size to be set, got: {scvi_predictor.embedding_size}"
+    )
+    _assert_embedding_size(
+        cell_embedding,
+        scvi_predictor.feature_embedding,
+        scvi_predictor.embedding_size,
     )

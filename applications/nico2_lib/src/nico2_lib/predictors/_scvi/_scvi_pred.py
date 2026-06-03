@@ -78,6 +78,10 @@ class ScviPredictor:
     def feature_embedding(self) -> NumericArray | None:
         return None
 
+    @property
+    def embedding_size(self) -> int | None:
+        return self.n_factors
+
 
 def _validate_indexer(
     indexer: IndexArray,
