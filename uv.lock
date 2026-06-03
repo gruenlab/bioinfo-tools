@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'emscripten'",
@@ -2678,22 +2678,6 @@ wheels = [
 name = "probedesigner"
 version = "0.1.0"
 source = { virtual = "applications/probedesigner" }
-dependencies = [
-    { name = "numpy" },
-    { name = "scanpy" },
-    { name = "scikit-learn" },
-    { name = "scipy" },
-    { name = "tangram-sc" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "numpy", specifier = ">=2.4.6" },
-    { name = "scanpy", specifier = ">=1.11.2" },
-    { name = "scikit-learn", specifier = ">=1.8.0" },
-    { name = "scipy", specifier = ">=1.17.1" },
-    { name = "tangram-sc", specifier = ">=1.0.4" },
-]
 
 [[package]]
 name = "prompt-toolkit"

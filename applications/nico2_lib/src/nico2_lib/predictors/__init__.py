@@ -1,4 +1,10 @@
-from __future__ import annotations
+from nico2_lib.predictors._baselines import shuffle_by_embedding_neighbors
+from nico2_lib.predictors._mofaflex._mofaflex_pred import MofaFlexPredictor
+from nico2_lib.predictors._nmf._nmf_pred import NmfPredictor
+from nico2_lib.predictors._pca._pca_pred import PcaPredictor
+from nico2_lib.predictors._protocol import PredictorProtocol
+from nico2_lib.predictors._scvi._scvi_pred import ScviPredictor
+from nico2_lib.predictors._tangram._tangram_pred import TangramPredictor
 
 __all__ = [
     "PcaPredictor",
@@ -9,17 +15,3 @@ __all__ = [
     "MofaFlexPredictor",
     "ScviPredictor",
 ]
-
-
-def __getattr__(name: str):
-    if name == "NmfPredictor":
-        from nico2_lib.predictors._nmf._nmf_pred import NmfPredictor
-        return NmfPredictor
-    if name == "TangramPredictor":
-        from nico2_lib.predictors._tangram._tangram_pred import TangramPredictor
-        return TangramPredictor
-    if name in ("PredictorProtocol", "shuffle_by_embedding_neighbors", "MofaFlexPredictor", "ScviPredictor"):
-        raise ImportError(
-            f"'{name}' requires optional dependencies not installed in this environment."
-        )
-    raise AttributeError(f"module 'nico2_lib.predictors' has no attribute {name!r}")

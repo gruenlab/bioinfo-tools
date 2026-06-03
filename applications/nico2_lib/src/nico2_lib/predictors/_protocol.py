@@ -13,8 +13,12 @@ class PredictorProtocol(Protocol):
       feature indices; return all fit-time features in their original order.
     """
 
-    embedding_size: int | None
-    preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
+    @property
+    def embedding_size(self) -> int | None: ...
+    @property
+    def preprocessing_steps(
+        self,
+    ) -> Sequence[Callable[[NumericArray], NumericArray]] | None: ...
 
     def fit(self, x: NumericArray) -> "PredictorProtocol":
         """Fits a model using X only.
