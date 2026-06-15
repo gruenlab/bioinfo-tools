@@ -1,9 +1,10 @@
 from collections.abc import Callable, Sequence
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from nico2_lib.typing import IndexArray, NumericArray
 
 
+@runtime_checkable
 class PredictorProtocol(Protocol):
     """Protocol for predictors fit on X and predicting X across feature sets.
 
