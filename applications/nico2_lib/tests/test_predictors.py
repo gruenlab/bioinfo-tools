@@ -127,3 +127,29 @@ def test_scvi_predictor(embedding_size: int):
         scvi_predictor.feature_embedding,
         scvi_predictor.embedding_size,
     )
+
+
+@pytest.mark.parametrize(
+    "n_components",
+    [3],
+)
+def test_fastica_predictor(n_components: int):
+    fastica_predictor = n2l.pd.FastIcaPredictor(n_components=n_components).fit(
+        counts[cell_train_idx]
+    )
+    fastica_predictor, (cell_embedding, full_reconstruction) = _run_predictor(
+        fastica_predictor,
+    )
+    _assert_reconstruction_shape(
+        full_reconstruction,
+    )
+    assert fastica_predictor.embedding_size is not None, (
+        f"Expected embedding size to be set, got: {fastica_predictor.embedding_size}"
+    )
+    _assert_embedding_size(
+        cell_embedding,
+        fastica_predictor.feature_embedding,
+        fastica_predictor.embedding_size,
+    )
+
+
