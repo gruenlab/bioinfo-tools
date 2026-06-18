@@ -8,7 +8,7 @@ from sklearn.model_selection import train_test_split
 
 rng = np.random.default_rng(0)
 n_obs, n_var = 100, 500
-counts = rng.poisson(lam=10, size=(n_obs, n_var))
+counts = rng.poisson(lam=10, size=(n_obs, n_var)).astype(np.float64)
 n_test_genes = 20
 gene_train_idx, gene_test_idx = train_test_split(
     np.arange(n_var),
@@ -105,6 +105,10 @@ def test_nmf_predictor(embedding_size: int):
     )
 
 
+@pytest.mark.parametrize(
+    "embedding_size",
+    [3],
+)
 def test_scvi_predictor(embedding_size: int):
     scvi_predictor = n2l.pd.ScviPredictor(n_factors=embedding_size).fit(
         counts[cell_train_idx]

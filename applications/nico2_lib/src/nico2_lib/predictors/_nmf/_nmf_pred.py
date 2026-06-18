@@ -143,11 +143,11 @@ def init_nmf_matrices(
     return w_init, h_init
 
 
-def robust_init_nmf_matrices(X, n_components: int) -> tuple[np.ndarray, np.ndarray]:
-    n_obs, n_vars = X.shape
+def robust_init_nmf_matrices(x, n_components: int) -> tuple[np.ndarray, np.ndarray]:
+    n_obs, n_vars = x.shape
 
     kmeans = KMeans(n_clusters=n_components, n_init="auto", random_state=42)
-    labels = kmeans.fit_predict(X)
+    labels = kmeans.fit_predict(x)
 
     counts = pd.Series(labels).value_counts()
     if counts.min() < 2:
@@ -156,9 +156,9 @@ def robust_init_nmf_matrices(X, n_components: int) -> tuple[np.ndarray, np.ndarr
             mask = labels == i
             if mask.any():
                 # Use the mean profile of the cluster if possible
-                h_init[i, :] = np.array(X[mask].mean(axis=0)).flatten()
+                h_init[i, :] = np.array(x[mask].mean(axis=0)).flatten()
     else:
-        adata = sc.AnnData(X.astype(np.float64))
+        adata = sc.AnnData(x.astype(np.float64))
         adata.obs["kmeans"] = pd.Series(labels).astype(str).astype("category").values
 
         try:
@@ -167,7 +167,7 @@ def robust_init_nmf_matrices(X, n_components: int) -> tuple[np.ndarray, np.ndarr
             for i in range(n_components):
                 scores_df = sc.get.rank_genes_groups_df(adata, group=str(i))
                 scores_df = scores_df.set_index("names").reindex(adata.var_names)
-                h_init[i, :] = scores_df["scores"].values
+                h_init[i, :] = scores_df["scores"].values  # type: ignore
         except Exception:
             h_init = np.random.rand(n_components, n_vars) * 0.1
 
@@ -220,13 +220,13 @@ class NmfPredictor:
 
     def fit(self, x: NumericArray) -> "NmfPredictor":
         x = preprocess_counts(x, self.preprocessing_steps)
-        embedding_size = self._resolve_components(x)
+        embedding_size_optional = self._resolve_components(x)
         w_init, h_init = (None, None)
-        if self.pre_init is not None and embedding_size is not None:
-            w_init, h_init = robust_init_nmf_matrices(x, embedding_size)
+        if self.pre_init is not None and embedding_size_optional is not None:
+            w_init, h_init = robust_init_nmf_matrices(x, embedding_size_optional)
 
         model = NMF(
-            n_components=embedding_size,  # type: ignore
+            n_components=embedding_size_optional,  # type: ignore
             init="custom" if w_init is not None else "nndsvd",
             solver=self.solver,
             max_iter=self.max_iter,
@@ -243,7 +243,7 @@ class NmfPredictor:
         else:
             w_reference = model.fit_transform(x)
 
-        embedding_size = model.n_components
+        embedding_size: int = model.n_components  # type: ignore
         h_reference = model.components_
 
         return replace(
@@ -268,6 +268,7 @@ class NmfPredictor:
             fit order, shape (n_samples, n_features_fit).
         """
         assert self.h_reference is not None
+        assert self.embedding_size is not None, "embedding_size must be set"
         if self.preprocessing_steps is not None:
             for step in self.preprocessing_steps:
                 x = step(x)
@@ -276,7 +277,7 @@ class NmfPredictor:
             H=self.h_reference[:, indexer],
             init="custom",
             update_H=False,
-            n_components=self.embedding_size,
+            n_components=self.embedding_size,  # type: ignore
             max_iter=self.max_iter,
         )
         return w_query, w_query @ self.h_reference
