@@ -117,12 +117,12 @@ def consensus_nmf(
 
 
 def init_nmf_matrices(
-    X: NumericArray,
+    x: NumericArray,
     n_components: int,
 ) -> tuple[NumericArray, NumericArray]:
-    n_obs, n_vars = X.shape
-    labels = KMeans(n_clusters=n_components).fit_predict(X)
-    adata = sc.AnnData(X)
+    n_obs, n_vars = x.shape
+    labels = KMeans(n_clusters=n_components).fit_predict(x)
+    adata = sc.AnnData(x)
     adata.obs["kmeans"] = pd.Series(labels).astype(str).astype("category").values
     sc.tl.rank_genes_groups(adata, "kmeans")
     groups_scores = adata.uns["rank_genes_groups"]["scores"]
@@ -138,7 +138,8 @@ def init_nmf_matrices(
         mask = labels == i
         w_init[mask, i] = 1.0
         w_init[~mask, i] = 0.1
-
+    w_init = w_init.astype(x.dtype)
+    h_init = h_init.astype(x.dtype)
     return w_init, h_init
 
 
@@ -178,6 +179,8 @@ def robust_init_nmf_matrices(X, n_components: int) -> tuple[np.ndarray, np.ndarr
     for i in range(n_components):
         w_init[labels == i, i] = 1.0
 
+    w_init = w_init.astype(x.dtype)
+    h_init = h_init.astype(x.dtype)
     return w_init, h_init
 
 
@@ -239,7 +242,7 @@ class NmfPredictor:
             )
         else:
             w_reference = model.fit_transform(x)
-            
+
         embedding_size = model.n_components
         h_reference = model.components_
 
