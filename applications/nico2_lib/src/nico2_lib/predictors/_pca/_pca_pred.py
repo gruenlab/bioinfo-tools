@@ -11,6 +11,7 @@ class PcaPredictor:
     n_components: int | None = None
     preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
 
+    _dtype: np.dtype | None = None
     _feature_embeddings: NumericArray | None = None
     _mean: NumericArray | None = None
     _explained_variance: NumericArray | None = None
@@ -26,6 +27,7 @@ class PcaPredictor:
         pca = PCA(n_components=self.embedding_size).fit(x)
         return replace(
             self,
+            _dtype=x.dtype,
             _feature_embeddings=pca.components_,
             _mean=pca.mean_,
             _explained_variance=pca.explained_variance_,
@@ -41,11 +43,12 @@ class PcaPredictor:
         assert self._feature_embeddings is not None and self._mean is not None, (
             "fit must be called before predict"
         )
+        x = x.astype(self._dtype)
         if self.preprocessing_steps is not None:
             for step in self.preprocessing_steps:
                 x = step(x)
-        components_subset = self._feature_embeddings[:, indexer]
-        mean_subset = self._mean[indexer]
+        components_subset = self._feature_embeddings[:, indexer]  # type: ignore
+        mean_subset = self._mean[indexer]  # type: ignore
         centered_X = x - mean_subset
         cell_embeddings = np.dot(centered_X, components_subset.T)
 
