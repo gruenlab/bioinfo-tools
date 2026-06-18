@@ -18,6 +18,7 @@ from torch.distributions import NegativeBinomial
 @dataclass(frozen=True)
 class ScviPredictor:
     n_factors: Optional[int] = None
+    max_epochs: int = 200
     preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
     _adata_reference: Optional[AnnData] = None
 
@@ -53,6 +54,7 @@ class ScviPredictor:
             adata=self._adata_reference.copy(),
             indexer=indexer_valid,
             n_factors=self.n_factors,
+            max_epochs=self.max_epochs,
         )
 
         adata_query = _build_query_anndata(
@@ -112,7 +114,12 @@ def _validate_indexer(
     return indexer_int
 
 
-def _train_scvi(adata: AnnData, indexer: IndexArray, n_factors: int) -> SCVI:
+def _train_scvi(
+    adata: AnnData,
+    indexer: IndexArray,
+    n_factors: int,
+    max_epochs: int,
+) -> SCVI:
     SCVI.setup_anndata(adata)
     model = SCVI(
         adata=adata,
@@ -121,7 +128,7 @@ def _train_scvi(adata: AnnData, indexer: IndexArray, n_factors: int) -> SCVI:
         beta=1,
         C=0,
     )
-    model.train(max_epochs=200)
+    model.train(max_epochs=max_epochs)
     return model
 
 
