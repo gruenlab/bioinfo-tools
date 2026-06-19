@@ -444,8 +444,18 @@ class TangramPredictor:
         )
 
         ad_ge = project_genes_unfiltered(ad_map, self.adata_reference)
+        cell_embeddings = ad_map.X
+        cell_embeddings = (
+            cell_embeddings
+            if isinstance(cell_embeddings, np.ndarray)
+            else cell_embeddings.toarray()
+        )
+        cell_embeddings = cell_embeddings.T
+        full_reconstruction = (
+            ad_ge.X if isinstance(ad_ge.X, np.ndarray) else ad_ge.X.toarray()
+        )
 
-        return ad_map.X, ad_ge.X
+        return cell_embeddings, full_reconstruction
 
     @property
     def embedding_size(self) -> int | None:
