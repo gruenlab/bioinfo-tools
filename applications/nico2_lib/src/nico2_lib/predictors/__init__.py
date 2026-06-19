@@ -1,6 +1,9 @@
 from nico2_lib.predictors._baselines import shuffle_by_embedding_neighbors
 from nico2_lib.predictors._fastica._fastica import FastIcaPredictor
-from nico2_lib.predictors._mofaflex._mofaflex_pred import MofaFlexPredictor
+from nico2_lib.predictors._mofaflex._mofaflex_pred import (
+    MofaFlexClassicPredictor,
+    MofaFlexPredictor,
+)
 from nico2_lib.predictors._nmf._nmf_pred import (
     NmfPredictor,
     consensus_nmf,
@@ -22,4 +25,5 @@ __all__ = [
     "MofaFlexPredictor",
     "ScviPredictor",
     "FastIcaPredictor",
+    "MofaFlexClassicPredictor",
 ]

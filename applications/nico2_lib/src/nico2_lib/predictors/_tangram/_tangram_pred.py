@@ -16,14 +16,13 @@ import pandas as pd
 import scanpy as sc
 import torch
 from anndata import AnnData
+from nico2_lib.predictors.utils import preprocess_counts
+from nico2_lib.typing import IndexArray, NumericArray
 from scipy.sparse.csc import csc_matrix
 from scipy.sparse.csr import csr_matrix
 from tangram import mapping_optimizer as mo
 from tangram import mapping_utils as mu
 from tangram import utils as ut
-
-from nico2_lib.predictors.utils import preprocess_counts
-from nico2_lib.typing import IndexArray, NumericArray
 
 
 def pp_adatas_unfiltered(adata_sc, adata_sp, genes=None, gene_to_lowercase=True):
@@ -446,4 +445,12 @@ class TangramPredictor:
 
         ad_ge = project_genes_unfiltered(ad_map, self.adata_reference)
 
-        return ad_ge.X, ad_map.X
+        return ad_map.X, ad_ge.X
+
+    @property
+    def embedding_size(self) -> int | None:
+        return None
+
+    @property
+    def feature_embedding(self) -> NumericArray | None:
+        return None

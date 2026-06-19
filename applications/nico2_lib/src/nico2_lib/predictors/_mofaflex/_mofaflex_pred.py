@@ -3,7 +3,9 @@ from dataclasses import dataclass, replace
 
 import anndata as ad
 import mofaflex
+import numpy as np
 import pandas as pd
+from anndata.typing import AnnData
 from mofaflex import priors
 from nico2_lib.predictors.utils import preprocess_counts
 from nico2_lib.typing import IndexArray, NumericArray
@@ -83,3 +85,90 @@ class MofaFlexPredictor:
     def feature_embeddings(self) -> NumericArray | None:
         assert self._model is not None, "Model not fitted"
         return self._model.get_weights()["view_1"].values.T
+
+
+def prepare_mofaflex_input(
+    query: AnnData,
+    reference: AnnData,
+) -> dict[str, dict[str, AnnData]]:
+    """Returns: Nested dict with group names as keys, view names as subkeys and AnnData objects as values (incompatible with `.group_by`)"""
+
+    target_features = sorted(list(set(reference.var_names).union(set(query.var_names))))
+
+    def reindex_adata(
+        adata: AnnData,
+        target_features: Sequence[str],
+    ) -> AnnData:
+        x_df = pd.DataFrame(
+            adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray(),  # type: ignore
+            index=adata.obs_names,
+            columns=adata.var_names,
+        )
+        x_reindexed = x_df.reindex(columns=target_features, fill_value=np.nan)
+        new_var = pd.DataFrame(index=target_features).join(adata.var, how="left")  # type: ignore
+        return ad.AnnData(
+            X=x_reindexed.values,
+            obs=adata.obs.copy(),  # type: ignore
+            var=new_var,
+        )
+
+    return {
+        "group_1": {
+            "view_1": reindex_adata(query, target_features),
+            "view_2": reindex_adata(reference, target_features),
+        }
+    }
+
+
+@dataclass(frozen=True)
+class MofaFlexClassicPredictor:
+    mofaflex_model: mofaflex.MOFAFLEX
+    max_epochs: int = 200
+
+    _reference_anndata: AnnData | None = None
+
+    def fit(
+        self,
+        x: NumericArray,
+    ) -> "MofaFlexClassicPredictor":
+        return replace(
+            self,
+            _reference_anndata=ad.AnnData(X=x),
+        )
+
+    def predict(
+        self,
+        x: NumericArray,
+        indexer: IndexArray,
+    ) -> tuple[NumericArray, NumericArray]:
+        assert self._reference_anndata is not None, "Reference not fitted"
+        data = prepare_mofaflex_input(
+            query=ad.AnnData(X=x),
+            reference=self._reference_anndata,
+        )
+        self.mofaflex_model.fit(
+            data,
+            max_epochs=self.max_epochs,
+            save_path=None,
+        )
+        cell_embeddings: NumericArray = (
+            self.mofaflex_model.get_factors()["group_1"].iloc[: x.shape[0]].values
+        )
+        feature_embeddings: NumericArray = self.mofaflex_model.get_weights(
+            views="view_1"
+        )["view_2"].values.T
+        return cell_embeddings, cell_embeddings @ feature_embeddings
+
+    @property
+    def feature_embedding(self) -> NumericArray | None:
+        return None
+
+    @property
+    def embedding_size(self) -> int | None:
+        return None
+
+    @property
+    def preprocessing_steps(
+        self,
+    ) -> Sequence[Callable[[NumericArray], NumericArray]] | None:
+        return None

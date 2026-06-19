@@ -54,25 +54,25 @@ def _assert_embedding_size(
         )
 
 
+def run_predictor_test_suite(predictor: n2l.pd.PredictorProtocol) -> None:
+    predictor = predictor.fit(counts[cell_train_idx])
+    predictor, (cell_embedding, full_reconstruction) = _run_predictor(predictor)
+    _assert_reconstruction_shape(full_reconstruction)
+    match predictor.embedding_size:
+        case int():
+            _assert_embedding_size(
+                cell_embedding,
+                predictor.feature_embedding,
+                predictor.embedding_size,
+            )
+        case None:
+            pass
+
+
 @pytest.mark.parametrize("embedding_size", [3, 5])
 def test_pca_predictor(embedding_size: int):
-    pca_predictor = n2l.pd.PcaPredictor(n_components=embedding_size).fit(
-        counts[cell_train_idx]
-    )
-    pca_predictor, (cell_embedding, full_reconstruction) = _run_predictor(
-        pca_predictor,
-    )
-    _assert_reconstruction_shape(
-        full_reconstruction,
-    )
-    assert pca_predictor.embedding_size is not None, (
-        f"Expected embedding size to be set, got: {pca_predictor.embedding_size}"
-    )
-    _assert_embedding_size(
-        cell_embedding,
-        pca_predictor.feature_embedding,
-        pca_predictor.embedding_size,
-    )
+    pca_predictor = n2l.pd.PcaPredictor(n_components=embedding_size)
+    run_predictor_test_suite(pca_predictor)
 
 
 @pytest.mark.parametrize(
@@ -86,23 +86,8 @@ def test_pca_predictor(embedding_size: int):
     ],
 )
 def test_nmf_predictor(embedding_size: int):
-    nmf_predictor = n2l.pd.NmfPredictor(n_components=embedding_size).fit(
-        counts[cell_train_idx]
-    )
-    nmf_predictor, (cell_embedding, full_reconstruction) = _run_predictor(
-        nmf_predictor,
-    )
-    _assert_reconstruction_shape(
-        full_reconstruction,
-    )
-    assert nmf_predictor.embedding_size is not None, (
-        f"Expected embedding size to be set, got: {nmf_predictor.embedding_size}"
-    )
-    _assert_embedding_size(
-        cell_embedding,
-        nmf_predictor.feature_embedding,
-        nmf_predictor.embedding_size,
-    )
+    nmf_predictor = n2l.pd.NmfPredictor(n_components=embedding_size)
+    run_predictor_test_suite(nmf_predictor)
 
 
 @pytest.mark.parametrize(
@@ -110,23 +95,8 @@ def test_nmf_predictor(embedding_size: int):
     [3],
 )
 def test_scvi_predictor(embedding_size: int):
-    scvi_predictor = n2l.pd.ScviPredictor(n_factors=embedding_size).fit(
-        counts[cell_train_idx]
-    )
-    scvi_predictor, (cell_embedding, full_reconstruction) = _run_predictor(
-        scvi_predictor,
-    )
-    _assert_reconstruction_shape(
-        full_reconstruction,
-    )
-    assert scvi_predictor.embedding_size is not None, (
-        f"Expected embedding size to be set, got: {scvi_predictor.embedding_size}"
-    )
-    _assert_embedding_size(
-        cell_embedding,
-        scvi_predictor.feature_embedding,
-        scvi_predictor.embedding_size,
-    )
+    scvi_predictor = n2l.pd.ScviPredictor(n_factors=embedding_size)
+    run_predictor_test_suite(scvi_predictor)
 
 
 @pytest.mark.parametrize(
@@ -134,22 +104,24 @@ def test_scvi_predictor(embedding_size: int):
     [3],
 )
 def test_fastica_predictor(n_components: int):
-    fastica_predictor = n2l.pd.FastIcaPredictor(n_components=n_components).fit(
-        counts[cell_train_idx]
-    )
-    fastica_predictor, (cell_embedding, full_reconstruction) = _run_predictor(
-        fastica_predictor,
-    )
-    _assert_reconstruction_shape(
-        full_reconstruction,
-    )
-    assert fastica_predictor.embedding_size is not None, (
-        f"Expected embedding size to be set, got: {fastica_predictor.embedding_size}"
-    )
-    _assert_embedding_size(
-        cell_embedding,
-        fastica_predictor.feature_embedding,
-        fastica_predictor.embedding_size,
-    )
+    fastica_predictor = n2l.pd.FastIcaPredictor(n_components=n_components)
+    run_predictor_test_suite(fastica_predictor)
 
 
+@pytest.mark.parametrize(
+    "n_factors",
+    [3],
+)
+def test_mofaflex_classic(n_factors: int):
+    import mofaflex
+
+    mofaflex_predictor = n2l.pd.MofaFlexClassicPredictor(
+        mofaflex_model=mofaflex.terms.MofaFlex(n_factors=n_factors),  # type: ignore
+        max_epochs=1,
+    )
+    run_predictor_test_suite(mofaflex_predictor)
+
+
+def test_tangram_predictor():
+    tangram_predictor = n2l.pd.TangramPredictor()
+    run_predictor_test_suite(tangram_predictor)
