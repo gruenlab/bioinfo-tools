@@ -122,7 +122,7 @@ def prepare_mofaflex_input(
 
 @dataclass(frozen=True)
 class MofaFlexClassicPredictor:
-    mofaflex_model: mofaflex.MOFAFLEX
+    n_components: int
     max_epochs: int = 200
 
     _reference_anndata: AnnData | None = None
@@ -146,17 +146,20 @@ class MofaFlexClassicPredictor:
             query=ad.AnnData(X=x),
             reference=self._reference_anndata,
         )
-        self.mofaflex_model.fit(
+        mofaflex_model = mofaflex.terms.MofaFlex(  # type: ignore
+            n_factors=self.n_components,
+        )
+        mofaflex_model.fit(
             data,
             max_epochs=self.max_epochs,
             save_path=None,
         )
         cell_embeddings: NumericArray = (
-            self.mofaflex_model.get_factors()["group_1"].iloc[: x.shape[0]].values
+            mofaflex_model.get_factors()["group_1"].iloc[: x.shape[0]].values
         )
-        feature_embeddings: NumericArray = self.mofaflex_model.get_weights(
-            views="view_1"
-        )["view_2"].values.T
+        feature_embeddings: NumericArray = mofaflex_model.get_weights(views="view_1")[
+            "view_2"
+        ].values.T
         return cell_embeddings, cell_embeddings @ feature_embeddings
 
     @property

@@ -55,7 +55,6 @@ def _assert_embedding_size(
 
 
 def run_predictor_test_suite(predictor: n2l.pd.PredictorProtocol) -> None:
-    predictor = predictor.fit(counts[cell_train_idx])
     predictor, (cell_embedding, full_reconstruction) = _run_predictor(predictor)
     _assert_reconstruction_shape(full_reconstruction)
     match predictor.embedding_size:
@@ -113,10 +112,9 @@ def test_fastica_predictor(n_components: int):
     [3],
 )
 def test_mofaflex_classic(n_factors: int):
-    import mofaflex
 
     mofaflex_predictor = n2l.pd.MofaFlexClassicPredictor(
-        mofaflex_model=mofaflex.terms.MofaFlex(n_factors=n_factors),  # type: ignore
+        n_components=n_factors,
         max_epochs=1,
     )
     run_predictor_test_suite(mofaflex_predictor)
