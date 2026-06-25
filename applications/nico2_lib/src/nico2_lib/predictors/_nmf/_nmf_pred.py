@@ -222,7 +222,7 @@ class NmfPredictor:
         x = preprocess_counts(x, self.preprocessing_steps)
         embedding_size_optional = self._resolve_components(x)
         w_init, h_init = (None, None)
-        if self.pre_init is not None and embedding_size_optional is not None:
+        if self.pre_init and embedding_size_optional is not None:
             w_init, h_init = robust_init_nmf_matrices(x, embedding_size_optional)
 
         model = NMF(
