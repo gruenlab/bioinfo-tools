@@ -273,7 +273,7 @@ class NmfPredictor:
             for step in self.preprocessing_steps:
                 x = step(x)
         w_query, _, _ = non_negative_factorization(
-            X=x,
+            X=x.astype(self.h_reference.dtype),
             H=self.h_reference[:, indexer],
             init="custom",
             update_H=False,
