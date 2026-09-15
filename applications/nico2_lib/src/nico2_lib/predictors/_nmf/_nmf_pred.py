@@ -196,9 +196,9 @@ class NmfPredictor:
     )
     init: Literal["random", "nndsvd", "nndsvda", "nndsvdar", "custom"] | None = None
     random_state: int | RandomState | None = None
-    max_iter: int = 200
+    max_iter: int = 1000
     alpha_W: float = 0.0
-    alpha_H: float | Literal["same"] = "same"
+    alpha_H: float = 0.0
     l1_ratio: float = 0.0
     preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
     pre_init: bool = False
@@ -225,13 +225,23 @@ class NmfPredictor:
         if self.pre_init and embedding_size_optional is not None:
             w_init, h_init = robust_init_nmf_matrices(x, embedding_size_optional)
 
+        if w_init is not None:
+            _init = "custom"
+        elif self.init is not None:
+            _init = self.init
+        elif self.solver == "mu":
+            # "mu" cannot escape nndsvd's exact zeros -- nndsvda is mandatory for it.
+            _init = "nndsvda"
+        else:
+            _init = "nndsvd"
+
         model = NMF(
             n_components=embedding_size_optional,  # type: ignore
-            init="custom" if w_init is not None else "nndsvd",
+            init=_init,
             solver=self.solver,
             max_iter=self.max_iter,
             random_state=self.random_state,
-            beta_loss="frobenius",
+            beta_loss=self.beta_loss,
         )
 
         if w_init is not None and h_init is not None:
@@ -272,14 +282,25 @@ class NmfPredictor:
         if self.preprocessing_steps is not None:
             for step in self.preprocessing_steps:
                 x = step(x)
-        w_query, _, _ = non_negative_factorization(
+        _nnf_kwargs: dict = dict(
             X=x.astype(self.h_reference.dtype),
             H=self.h_reference[:, indexer],
             init="custom",
             update_H=False,
             n_components=self.embedding_size,  # type: ignore
             max_iter=self.max_iter,
+            solver=self.solver,
+            beta_loss=self.beta_loss,
         )
+        if self.random_state is not None:
+            _nnf_kwargs["random_state"] = self.random_state
+        try:
+            w_query, _, _ = non_negative_factorization(**_nnf_kwargs)
+        except ValueError:
+            # "mu"+"custom" init can reject a supplied H-only init in some sklearn
+            # versions -- retry with the solver-appropriate init.
+            _nnf_kwargs["init"] = "nndsvda" if self.solver == "mu" else "nndsvd"
+            w_query, _, _ = non_negative_factorization(**_nnf_kwargs)
         return w_query, w_query @ self.h_reference
 
     @property
