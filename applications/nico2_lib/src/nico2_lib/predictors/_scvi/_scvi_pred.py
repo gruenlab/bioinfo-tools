@@ -29,7 +29,16 @@ class ScviPredictor:
             adata_reference, n_factors = _find_components(adata_reference)
         else:
             n_factors = self.n_factors
-        return ScviPredictor(n_factors=n_factors, _adata_reference=adata_reference)
+        # Preserve max_epochs/preprocessing_steps on the returned instance -- the
+        # previous version constructed a fresh ScviPredictor(n_factors=..., _adata_reference=...)
+        # without forwarding them, so any non-default max_epochs passed to the constructor
+        # was silently reverted to the dataclass default (200) as soon as fit() was called.
+        return ScviPredictor(
+            n_factors=n_factors,
+            max_epochs=self.max_epochs,
+            preprocessing_steps=self.preprocessing_steps,
+            _adata_reference=adata_reference,
+        )
 
     def predict(
         self, x: NumericArray, indexer: IndexArray

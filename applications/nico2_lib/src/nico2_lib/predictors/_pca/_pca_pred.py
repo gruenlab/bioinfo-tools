@@ -9,6 +9,10 @@ from sklearn.decomposition import PCA
 @dataclass(frozen=True)
 class PcaPredictor:
     n_components: int | None = None
+    # Optional: fit() previously always used sklearn's default (random_state=None),
+    # which can invoke the randomized SVD solver non-deterministically for typical
+    # matrix sizes. Left unset by default so this is purely additive.
+    random_state: int | None = None
     preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
 
     _dtype: np.dtype | None = None
@@ -24,7 +28,7 @@ class PcaPredictor:
         if self.preprocessing_steps is not None:
             for step in self.preprocessing_steps:
                 x = step(x)
-        pca = PCA(n_components=self.embedding_size).fit(x)
+        pca = PCA(n_components=self.embedding_size, random_state=self.random_state).fit(x)
         return replace(
             self,
             _dtype=x.dtype,
@@ -50,7 +54,18 @@ class PcaPredictor:
         components_subset = self._feature_embeddings[:, indexer]  # type: ignore
         mean_subset = self._mean[indexer]  # type: ignore
         centered_X = x - mean_subset
-        cell_embeddings = np.dot(centered_X, components_subset.T)
+        # Least-squares solve, not a direct projection: `centered_X @ components_subset.T`
+        # is only the least-squares-optimal reconstruction when components_subset has
+        # orthonormal columns, which holds when `indexer` covers every fit-time feature
+        # but not in general for a genuine subset (e.g. scoring a probe gene panel
+        # against loadings learned on the full transcriptome). This lstsq solve is exact
+        # in both cases, and reduces to the same formula as before whenever the subset
+        # happens to be orthonormal -- so it shouldn't change anything for full-feature
+        # -set callers, only genuine subset-feature predictions.
+        cell_embeddings, _, _, _ = np.linalg.lstsq(
+            components_subset.T, centered_X.T, rcond=None
+        )
+        cell_embeddings = cell_embeddings.T
 
         full_reconstruction = (
             np.dot(cell_embeddings, self._feature_embeddings) + self._mean

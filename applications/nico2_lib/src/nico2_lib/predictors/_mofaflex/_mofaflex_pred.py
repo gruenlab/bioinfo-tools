@@ -1,14 +1,38 @@
+from __future__ import annotations
+
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 import anndata as ad
-import mofaflex
 import numpy as np
 import pandas as pd
 from anndata.typing import AnnData
-from mofaflex import priors
 from nico2_lib.predictors.utils import preprocess_counts
 from nico2_lib.typing import IndexArray, NumericArray
+
+# mofaflex is a heavy optional dependency, not installed in every environment that
+# otherwise only needs PcaPredictor/NmfPredictor/FastIcaPredictor from this package.
+# predictors/__init__.py already guards importing this module at the package level,
+# but that doesn't protect a direct
+# `from nico2_lib.predictors._mofaflex._mofaflex_pred import ...` -- guard here too,
+# and defer the type annotations (via `from __future__ import annotations` above) so
+# `mofaflex.MOFAFLEX`-typed fields/signatures don't evaluate eagerly at class/def time.
+try:
+    import mofaflex
+    from mofaflex import priors
+    _MOFAFLEX_AVAILABLE = True
+except ImportError:
+    mofaflex = None  # type: ignore[assignment]
+    priors = None  # type: ignore[assignment]
+    _MOFAFLEX_AVAILABLE = False
+
+
+def _require_mofaflex() -> None:
+    if not _MOFAFLEX_AVAILABLE:
+        raise ImportError(
+            "mofaflex is not installed. Install it to use MofaFlexPredictor / "
+            "MofaFlexClassicPredictor."
+        )
 
 
 def slice_mofaflex_weights(
@@ -51,6 +75,7 @@ class MofaFlexPredictor:
         self,
         x: NumericArray,
     ) -> "MofaFlexPredictor":
+        _require_mofaflex()
         x = preprocess_counts(x, self.preprocessing_steps)
         model: mofaflex.MOFAFLEX = mofaflex.terms.MofaFlex(  # type: ignore
             n_factors=self.embedding_size,
@@ -131,6 +156,7 @@ class MofaFlexClassicPredictor:
         self,
         x: NumericArray,
     ) -> "MofaFlexClassicPredictor":
+        _require_mofaflex()
         return replace(
             self,
             _reference_anndata=ad.AnnData(X=x),

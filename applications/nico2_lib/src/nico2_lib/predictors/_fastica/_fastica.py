@@ -4,6 +4,7 @@ Uses sklearn.decomposition.FastICA for Independent Component Analysis.
 Finds latent factors that are statistically independent (non-Gaussian).
 """
 
+import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -11,6 +12,7 @@ from typing import Literal
 import numpy as np
 from nico2_lib.typing import IndexArray, NumericArray
 from sklearn.decomposition import FastICA as SklearnFastICA
+from sklearn.exceptions import ConvergenceWarning
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,10 @@ class FastIcaPredictor:
     Args:
         n_components: Number of ICA components (embedding dimension).
         algorithm: Algorithm type ('parallel' or 'deflation').
+        whiten: Whitening strategy forwarded to sklearn's FastICA. Left unset
+            (None) by default, which preserves sklearn's own installed-version
+            default; set explicitly (e.g. "unit-variance") for a pinned,
+            reproducible whitening mode.
         fun: Function used to approximate negentropy ('logcosh', 'exp', 'cube').
         max_iter: Maximum number of iterations.
         tol: Tolerance for convergence.
@@ -39,6 +45,7 @@ class FastIcaPredictor:
 
     n_components: int | None = None
     algorithm: Literal["parallel", "deflation"] = "parallel"
+    whiten: bool | str | None = None
     fun: Literal["logcosh", "exp", "cube"] = "logcosh"
     max_iter: int = 200
     tol: float = 0.0001
@@ -46,7 +53,7 @@ class FastIcaPredictor:
     preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
 
     _dtype: np.dtype | None = None
-    _mixing: NumericArray | None = None  # A: unmixing matrix (n_features, n_components)
+    _mixing: NumericArray | None = None  # A: mixing matrix (n_features, n_components)
     _mean: NumericArray | None = None
     _n_iter: int | None = None
 
@@ -67,7 +74,7 @@ class FastIcaPredictor:
             for step in self.preprocessing_steps:
                 x = step(x)
 
-        ica = SklearnFastICA(
+        ica_kwargs: dict[str, object] = dict(
             n_components=self.n_components,
             algorithm=self.algorithm,
             fun=self.fun,
@@ -75,22 +82,32 @@ class FastIcaPredictor:
             tol=self.tol,
             random_state=self.random_state,
         )
+        if self.whiten is not None:
+            ica_kwargs["whiten"] = self.whiten
+        ica = SklearnFastICA(**ica_kwargs)
 
-        # fit_transform returns S = X @ A.T where A is the unmixing matrix
-        ica.fit_transform(x)
+        # Promote a non-convergence warning to a raised exception rather than
+        # silently accepting a non-converged fit.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ConvergenceWarning)
+            # fit_transform returns S = X @ A.T where A is the unmixing matrix
+            ica.fit_transform(x)
+        if any(issubclass(w.category, ConvergenceWarning) for w in caught):
+            raise RuntimeError(
+                f"FastICA did not converge within {self.max_iter} iterations "
+                f"(n_components={self.n_components}, n_samples={x.shape[0]})."
+            )
 
         # sklearn stores the unmixing matrix in ica.components_ (n_components, n_features)
-        # The mixing matrix for reconstruction is the pseudoinverse: A @ (S.T @ S)^-1
-        # or more simply, for whitened data: A @ S.T
-        #
-        # Standard ICA model: X = S @ A where S are sources, A is mixing
-        # sklearn stores A.T in components_ (n_components, n_features)
-        components = ica.components_  # (n_components, n_features)
-
+        # and its pseudo-inverse -- the correct mixing/reconstruction basis -- in
+        # ica.mixing_ (n_features, n_components). `components_.T` only equals `mixing_`
+        # when components_ has orthonormal rows, which FastICA's whitening step doesn't
+        # generally guarantee, so use `mixing_` directly rather than transposing
+        # `components_`.
         return replace(
             self,
             _dtype=x.dtype,
-            _mixing=components.T if components is not None else None,  # (n_features, n_components)
+            _mixing=ica.mixing_ if hasattr(ica, "mixing_") else None,  # (n_features, n_components)
             _mean=ica.mean_ if hasattr(ica, 'mean_') else None,
             _n_iter=ica.n_iter_ if hasattr(ica, 'n_iter_') else None,
         )
@@ -143,5 +160,5 @@ class FastIcaPredictor:
 
     @property
     def feature_embedding(self) -> NumericArray | None:
-        """Returns the unmixing matrix (feature loadings for independent components)."""
+        """Returns the mixing matrix (feature loadings for independent components)."""
         return self._mixing.T
