@@ -13,10 +13,9 @@ Usage:
         --input_dir /path/to/results \\
         --output_dir /path/to/plots \\
         --plot_types reconstruction,stability,metrics \\
-        [--dpi 600] \\
+        [--dpi 300] \\
         [--format png] \\
-        [--color_scheme nmf:#1f77b4,cnmf:#ff7f0e] \\
-        [--font_sizes title:20,label:18,tick:16] \\
+        [--color_scheme nmf:#1f77b4] \\
         [--metric_filter mse,expvar]
 
 Examples:
@@ -31,7 +30,7 @@ Examples:
         --analysis_type stability \\
         --input_dir results/stability_5iter \\
         --output_dir plots/stability \\
-        --dpi 600 --format pdf
+        --dpi 600 --format pdf   # override the 300 default for publication
 
     # Plot only MSE metrics
     python plot_pipeline_results.py \\
@@ -47,9 +46,8 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
-import numpy as np
 import pandas as pd
 
 _MODULE_DIR = Path(__file__).parent.absolute()
@@ -70,8 +68,16 @@ from _stability_plots import (
     plot_gene_overlap,
     plot_metrics_summary,
 )
-from _selection_plots import plot_gene_source_distribution
+from _selection_plots import plot_gene_source_distribution, plot_genes_per_celltype
 from plot_evaluation import create_baseline_plots
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 from _constants import ANALYSIS_PNG_DPI
 
 # Configure logging
@@ -118,8 +124,8 @@ def parse_color_scheme(color_string: str) -> Dict[str, str]:
 
     Examples
     --------
-    >>> parse_color_scheme('nmf:#1f77b4,cnmf:#ff7f0e')
-    {'nmf': '#1f77b4', 'cnmf': '#ff7f0e'}
+    >>> parse_color_scheme('nmf:#1f77b4')
+    {'nmf': '#1f77b4'}
     """
     colors = {}
     for pair in color_string.split(','):
@@ -127,35 +133,6 @@ def parse_color_scheme(color_string: str) -> Dict[str, str]:
             key, value = pair.split(':', 1)
             colors[key.strip()] = value.strip()
     return colors
-
-
-def parse_font_sizes(font_string: str) -> Dict[str, int]:
-    """Parse font sizes from command line argument.
-
-    Parameters
-    ----------
-    font_string : str
-        Font size specification as 'key1:value1,key2:value2'
-
-    Returns
-    -------
-    dict
-        Dictionary mapping font type to size
-
-    Examples
-    --------
-    >>> parse_font_sizes('title:20,label:18,tick:16')
-    {'title': 20, 'label': 18, 'tick': 16}
-    """
-    fonts = {}
-    for pair in font_string.split(','):
-        if ':' in pair:
-            key, value = pair.split(':', 1)
-            try:
-                fonts[key.strip()] = int(value.strip())
-            except ValueError:
-                logger.warning(f"Invalid font size '{value}' for '{key}' - skipping")
-    return fonts
 
 
 def load_k_varying_data(input_dir: Path) -> Dict[str, Optional[pd.DataFrame]]:
@@ -238,15 +215,14 @@ def load_k_varying_per_celltype_data(
             if not iter_dir.exists():
                 continue
 
-            for sel_method, eval_method in [("nmf", "nmf"), ("cnmf", "cnmf")]:
-                csv_file = iter_dir / f"{sel_method}_sel_{eval_method}_eval_per_celltype.csv"
-                if not csv_file.exists():
-                    continue
+            csv_file = iter_dir / "nmf_sel_nmf_eval_per_celltype.csv"
+            if not csv_file.exists():
+                continue
 
-                try:
-                    all_data.append(pd.read_csv(csv_file))
-                except Exception as exc:  # pragma: no cover - defensive read path
-                    logger.warning(f"Skipping unreadable per-celltype file {csv_file}: {exc}")
+            try:
+                all_data.append(pd.read_csv(csv_file))
+            except Exception as exc:  # pragma: no cover - defensive read path
+                logger.warning(f"Skipping unreadable per-celltype file {csv_file}: {exc}")
 
     if not all_data:
         raise ValueError("No per-celltype detailed_results CSV files found")
@@ -279,7 +255,7 @@ def aggregate_per_celltype(
     for celltype in celltypes:
         ct_df = df[df["celltype"] == celltype].copy()
         ct_df["method"] = ct_df["selection_method"] + "-" + ct_df["eval_method"]
-        ct_df = ct_df[ct_df["method"].isin(["nmf-nmf", "cnmf-cnmf"])]
+        ct_df = ct_df[ct_df["method"] == "nmf-nmf"]
 
         agg_df = ct_df.groupby(["k_value", "method"]).agg(
             mse_mean=("mse", "mean"),
@@ -370,6 +346,7 @@ def plot_baseline_evaluation_results(
 def plot_selection_results(
     input_dir: Path,
     output_dir: Path,
+    dpi: int = ANALYSIS_PNG_DPI,
 ) -> None:
     """Generate selection plots from ranked gene list or provenance files."""
     logger.info("=" * 80)
@@ -379,12 +356,22 @@ def plot_selection_results(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     candidate_files = [
+        input_dir / "selection" / "RecoVar_panel_information.csv",
+        input_dir / "RecoVar_panel_information.csv",
         input_dir / "selection" / "ranked_gene_list.csv",
         input_dir / "ranked_gene_list.csv",
         input_dir / "selection" / "final_panel_with_provenance.csv",
         input_dir / "final_panel_with_provenance.csv",
     ]
     input_file = next((p for p in candidate_files if p.exists()), None)
+    if input_file is None:
+        # Single-strategy output (deg_only/hvg/random/rf_simple/rf_deg/nmf/pca) -- filename
+        # is strategy-specific, e.g. rf_deg_panel_information.csv.
+        for _base in (input_dir / "selection", input_dir):
+            _matches = sorted(_base.glob("*_panel_information.csv")) if _base.exists() else []
+            if _matches:
+                input_file = _matches[0]
+                break
 
     if input_file is None:
         raise FileNotFoundError(f"No selection summary CSV found in {input_dir}")
@@ -393,6 +380,11 @@ def plot_selection_results(
     if summary_df.empty:
         logger.warning(f"Selection summary is empty: {input_file}")
         return
+
+    # RecoVar_panel_information.csv (unlike the old panel-only ranked_gene_list.csv) also
+    # lists non-panel candidate genes -- restrict to the final panel before plotting.
+    if "in_panel" in summary_df.columns:
+        summary_df = summary_df[summary_df["in_panel"].fillna(False).astype(bool)].reset_index(drop=True)
 
     if "gene_source" not in summary_df.columns:
         if "selection_strategy" in summary_df.columns:
@@ -410,6 +402,18 @@ def plot_selection_results(
     )
     if result is None:
         logger.warning("Selection plot generation returned no output (input may be missing required columns)")
+
+    try:
+        coverage_path = plot_genes_per_celltype(
+            summary_df=summary_df,
+            results_dir=str(output_dir),
+            strategy_name=input_dir.name,
+            png_dpi=dpi,
+        )
+        if coverage_path is None:
+            logger.warning("genes-per-cell-type plot returned no output")
+    except Exception as exc:  # never let a diagnostic plot fail the run
+        logger.warning(f"genes-per-cell-type plot failed: {exc}")
 
 
 def detect_directory_signatures(input_dir: Path) -> Set[str]:
@@ -433,12 +437,18 @@ def detect_directory_signatures(input_dir: Path) -> Set[str]:
         signatures.add("evaluation")
 
     selection_candidates = [
+        input_dir / "selection" / "RecoVar_panel_information.csv",
+        input_dir / "RecoVar_panel_information.csv",
         input_dir / "selection" / "ranked_gene_list.csv",
         input_dir / "ranked_gene_list.csv",
         input_dir / "selection" / "final_panel_with_provenance.csv",
         input_dir / "final_panel_with_provenance.csv",
     ]
-    if any(path.exists() for path in selection_candidates):
+    has_panel_info_glob = any(
+        base.exists() and any(base.glob("*_panel_information.csv"))
+        for base in (input_dir / "selection", input_dir)
+    )
+    if any(path.exists() for path in selection_candidates) or has_panel_info_glob:
         signatures.add("selection")
 
     return signatures
@@ -704,6 +714,7 @@ def run_auto_detection_plotting(
             plot_selection_results(
                 target,
                 target_output / "selection",
+                dpi=dpi,
             )
 
     if not any_detected:
@@ -864,12 +875,7 @@ def main():
     parser.add_argument(
         "--color_scheme",
         type=str,
-        help="Custom colors as 'key1:color1,key2:color2' (e.g., 'nmf:#1f77b4,cnmf:#ff7f0e')",
-    )
-    parser.add_argument(
-        "--font_sizes",
-        type=str,
-        help="Custom font sizes as 'key1:size1,key2:size2' (e.g., 'title:20,label:18,tick:16')",
+        help="Custom colors as 'key1:color1,key2:color2' (e.g., 'nmf:#1f77b4')",
     )
     parser.add_argument(
         "--metric_filter",
@@ -900,7 +906,6 @@ def main():
     # Parse optional arguments
     plot_types = args.plot_types.split(',') if args.plot_types else None
     colors = parse_color_scheme(args.color_scheme) if args.color_scheme else None
-    font_sizes = parse_font_sizes(args.font_sizes) if args.font_sizes else None
     metric_filter = args.metric_filter.split(',') if args.metric_filter else None
 
     # Log configuration
@@ -956,6 +961,7 @@ def main():
             plot_selection_results(
                 input_dir,
                 output_dir,
+                dpi=args.dpi,
             )
 
         logger.info("All plots generated successfully!")

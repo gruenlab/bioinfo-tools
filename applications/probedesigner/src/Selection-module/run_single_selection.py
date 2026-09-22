@@ -1,22 +1,14 @@
 """
-Refactored Gene Selection Wrapper with Filtering Pipeline
-==========================================================
+Single gene selection strategy wrapper with the standardized filtering pipeline.
 
-This module provides a clean wrapper for running single gene selection strategies
-with the standardized filtering pipeline:
-
-FILTERING ORDER (EXACT MATCH TO ORIGINAL):
-------------------------------------------
+FILTERING ORDER:
+----------------
 1. BLACKLIST FILTER (PRE-selection): Remove genes from adata before selection
 2. RUN SELECTION STRATEGY: Work on filtered adata
 3. XENIUM FILTER (POST-selection): Apply to ranked gene list, celltype-aware
 4. SELECT TOP N: From Xenium-filtered list
 
-This ensures all strategies use the exact same filtering logic as the original
-pipeline, maintaining consistency and reproducibility.
-
-Author: Refactored from run-selection.py
-Date: 2026-02-08
+All strategies share this filtering logic for consistency and reproducibility.
 """
 
 from __future__ import annotations
@@ -27,7 +19,6 @@ import os
 from pathlib import Path
 from typing import Optional
 
-import pandas as pd
 from anndata import AnnData
 
 # Support script execution by adding module directory to sys.path
@@ -37,12 +28,20 @@ if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 
 # Import refactored selection modules - use absolute imports
-from _gene_list_builder import GeneListBuilder
+from _gene_list_builder import GeneListBuilder, derive_informative_celltypes, panel_information_filename
 from _filtering import (
     apply_blacklist_filter,
     apply_xenium_filter_to_genelist,
     apply_xenium_filter_global_to_genelist,
 )
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 from _constants import (
     COL_SELECTED_INITIAL,
     COL_PASSED_XENIUM,
@@ -50,16 +49,16 @@ from _constants import (
     COL_SELECTION_SCORE,
 )
 
-from _deg_selection import select_DEGs
+from _deg_selection import select_degs
 from _baseline_selection import (
     select_highly_variable_genes,
     select_random_genes,
-    select_random_genes_bootstrap,
 )
-from _rf_selection import select_genes_with_rf
+from _rf_selection import select_genes_with_rf, format_rf_ranked_df
 from _dimred_selection import (
     select_genes_from_nmf,
     select_genes_from_pca,
+    format_dimred_ranked_df,
 )
 # Use absolute imports (for script execution)
 from _constants import (
@@ -69,13 +68,53 @@ from _constants import (
     COL_CELLTYPE,
     DEFAULT_MIN_XENIUM_EXPRESSION,
     DEFAULT_MAX_XENIUM_EXPRESSION,
-    DEFAULT_REDUCTION_TYPES,
-    DEFAULT_ANALYSIS_TYPES,
-    DEFAULT_PER_FACTOR_SELECTION,
-    DEFAULT_BLACKLIST_PATTERNS,
+    DEFAULT_REDUCTION_TYPE,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_gene_mean_expression(
+    builder: GeneListBuilder,
+    mean_expr_per_ct: Optional[dict],
+    global_mean_expr: Optional[dict],
+) -> dict:
+    """Build a ``{gene: mean_expression}`` map for every gene the builder tracks.
+
+    Prefers the per-celltype means (each gene scored in its assigned celltype;
+    genes without a specific celltype get their highest per-celltype mean) and
+    falls back to the pooled global means. Returns an empty dict when neither
+    source is available (Xenium filtering disabled).
+    """
+    df = builder.to_dataframe()
+    if df.empty:
+        return {}
+
+    resolved: dict = {}
+    if mean_expr_per_ct:
+        for _, row in df.iterrows():
+            gene = row[COL_GENE]
+            ct_expr = mean_expr_per_ct.get(row.get(COL_CELLTYPE, 'global'))
+            if ct_expr is not None and gene in ct_expr:
+                resolved[gene] = ct_expr[gene]
+            else:
+                vals = [d[gene] for d in mean_expr_per_ct.values() if gene in d]
+                if vals:
+                    resolved[gene] = max(vals)
+    elif global_mean_expr:
+        for gene in df[COL_GENE]:
+            if gene in global_mean_expr:
+                resolved[gene] = global_mean_expr[gene]
+    return resolved
+
+
+def _json_safe_panel_metadata(builder: GeneListBuilder) -> dict:
+    """Return JSON-safe run-level metadata, excluding private cache payloads."""
+    return {
+        key: value
+        for key, value in builder.metadata.items()
+        if not str(key).startswith("_")
+    }
 
 
 def run_single_selection(
@@ -97,30 +136,21 @@ def run_single_selection(
     mean_expr_per_ct: Optional[dict] = None,
     global_mean_expr: Optional[dict] = None,
     # Strategy-specific parameters
-    reduction_type: Optional[str] = DEFAULT_REDUCTION_TYPES,  # 'nmf' or 'pca'
-    analysis_type: str = DEFAULT_ANALYSIS_TYPES,  # 'global' or 'per_celltype'
-    dimred_method: str = DEFAULT_PER_FACTOR_SELECTION,  # only 'method_a'
+    reduction_type: Optional[str] = DEFAULT_REDUCTION_TYPE,  # 'nmf' or 'pca'
     n_components: int = 50,
-    pool_size_per_celltype: int = 200,  # Pool size per celltype for Phase 1 in per_celltype mode
-    pool_size_per_factor: int = 200,      # Pool size per factor for Phase 1 in global mode
+    pool_size_per_celltype: int = 200,  # Pool size per celltype for Phase 1
+    dimred_n_jobs: int = 1,  # workers for per-celltype NMF/PCA fits (1=seq, -1=all cores)
     # NOTE: Dimred strategies (dimred_only) handle gap-filling internally via factor-aware
-    # duplicate resolution. Gap-filling is automatic for both global and per-celltype analysis.
+    # duplicate resolution. NMF/PCA is always fitted per cell type.
     # Caching (optional pre-computed results)
     deg_results: Optional[GeneListBuilder] = None,
     rf_simple_results: Optional[GeneListBuilder] = None,
-    nmf_loadings_global: Optional[pd.DataFrame] = None,
     nmf_loadings_per_celltype: Optional[dict] = None,
-    pca_loadings_global: Optional[pd.DataFrame] = None,
     pca_loadings_per_celltype: Optional[dict] = None,
-    nmf_counts_input: str = "raw",
-    # cNMF options (only used when reduction_type == 'nmf')
-    use_consensus_nmf: bool = False,
-    k_min: int = 3,
-    k_max: int = 15,
-    k_step: int = 2,
-    cnmf_n_iter: int = 20,
-    k_selection_method: str = "silhouette",
-    use_consensus_H: bool = False,
+    dimred_counts_input: str = "raw",
+    require_nmf_model_cache: bool = False,
+    nmf_objective: str = "auto",
+    rf_score_cache_file: Optional[str] = None,
     # Output
     results_dir: Optional[str] = None,
     # Shared NMF/PCA model cache (independent of results_dir, reused across probeset sizes)
@@ -128,7 +158,7 @@ def run_single_selection(
 ) -> GeneListBuilder:
     """Run a single gene selection strategy with standardized filtering pipeline.
 
-    This function implements the EXACT filtering order from the original pipeline:
+    Filtering order:
     1. Blacklist filter (PRE-selection): Remove blacklisted genes from adata
     2. Run selection strategy: Work on filtered adata
     3. Xenium filter (POST-selection): Apply to ranked genes, celltype-aware
@@ -148,21 +178,35 @@ def run_single_selection(
         min_cells_per_celltype: Minimum cells per cell type
         random_state: Random seed
         blacklist_patterns: List of gene patterns to exclude (e.g., ['mt-', 'Rps'])
+        use_default_blacklist: Also apply the built-in default blacklist patterns.
+        force_include_genes: Genes always kept, bypassing the blacklist.
         apply_xenium_filter: Whether to apply Xenium expression filter
+        xenium_celltype_aware: Use per-cell-type mean expression for the Xenium filter
+            (uses ``mean_expr_per_ct``); when False use the pooled ``global_mean_expr``.
         xenium_min_expr: Min expression threshold for Xenium
         xenium_max_expr: Max expression threshold for Xenium
-        mean_expr_per_ct: Pre-computed per-celltype mean expression
+        mean_expr_per_ct: Pre-computed per-celltype mean expression (celltype-aware mode).
+        global_mean_expr: Pre-computed pooled global mean expression (global Xenium mode).
         reduction_type: 'nmf' or 'pca' (for dimred_only strategy)
-        analysis_type: 'global' or 'per_celltype'
-        dimred_method: Gene selection method (only 'method_a' — top genes by absolute factor loading)
         n_components: Number of NMF/PCA components
+        pool_size_per_celltype: Phase-1 dimred pool size per cell type.
+        dimred_n_jobs: Workers for per-celltype NMF/PCA fitting.
+            1 (default) = sequential; -1 = all cores. Results are identical to sequential.
         deg_results: Pre-computed DEG results (for caching)
-        rf_simple_results: Pre-computed RF_simple results (for caching)
-        nmf_loadings_global: Pre-computed global NMF loadings
+        rf_simple_results: Pre-computed rf_simple GeneListBuilder reused as the rf_deg
+            candidate source (caching).
         nmf_loadings_per_celltype: Pre-computed per-celltype NMF loadings
-        pca_loadings_global: Pre-computed global PCA loadings
         pca_loadings_per_celltype: Pre-computed per-celltype PCA loadings
+        dimred_counts_input: Matrix for the dimred fit — 'raw' (default) or 'lognorm'.
+        require_nmf_model_cache: If True, raise instead of recomputing when a required
+            NMF/PCA model cache is missing.
+        nmf_objective: NMF factorization objective — 'auto' (default) derives the
+            solver/beta_loss from dimred_counts_input; 'frobenius'/'kl' force that
+            objective regardless of input. NMF only (ignored for reduction_type='pca').
+        rf_score_cache_file: Explicit pickled RF score cache to reuse (skips retraining).
         results_dir: Directory to save results
+        nmf_model_cache_dir: Shared NMF/PCA model cache directory, independent of
+            ``results_dir`` and reused across probeset sizes.
 
     Returns:
         GeneListBuilder with final selected genes after all filtering
@@ -181,13 +225,11 @@ def run_single_selection(
         ...     mean_expr_per_ct=mean_expr_dict
         ... )
 
-        >>> # NMF selection (per-celltype, Method A)
+        >>> # NMF selection (per-celltype)
         >>> builder = run_single_selection(
         ...     adata,
         ...     strategy='dimred_only',
         ...     reduction_type='nmf',
-        ...     analysis_type='per_celltype',
-        ...     dimred_method='method_a',
         ...     blacklist_patterns=['mt-']
         ... )
     """
@@ -240,7 +282,7 @@ def run_single_selection(
 
     if strategy == "deg_only":
         logger.info("Strategy: Differential Expression Genes (DEG)")
-        builder = select_DEGs(
+        builder = select_degs(
             adata=adata,
             probeset_size=probeset_size,
             celltype_column=celltype_column,
@@ -255,7 +297,9 @@ def run_single_selection(
             probeset_size=probeset_size,
             celltype_column=celltype_column,
             min_cells_per_celltype=min_cells_per_celltype,
+            random_state=random_state,
             use_deg_prefilter=False,
+            rf_score_cache_file=rf_score_cache_file,
             results_dir=results_dir,
         )
 
@@ -266,8 +310,10 @@ def run_single_selection(
             probeset_size=probeset_size,
             celltype_column=celltype_column,
             min_cells_per_celltype=min_cells_per_celltype,
+            random_state=random_state,
             use_deg_prefilter=True,
             deg_results=deg_results,  # Use cached DEGs if available
+            rf_score_cache_file=rf_score_cache_file,
             results_dir=results_dir,
         )
 
@@ -288,66 +334,50 @@ def run_single_selection(
             results_dir=results_dir,
         )
 
-    elif strategy == "random_bootstrap":
-        logger.info(f"Strategy: Random Bootstrap (seed={random_state})")
-        builder = select_random_genes_bootstrap(
-            adata=adata,
-            probeset_size=probeset_size,
-            n_bootstrap=10,
-            random_state=random_state,
-            results_dir=results_dir,
-        )
 
     elif strategy == "dimred_only":
         if reduction_type is None:
             raise ValueError("reduction_type required for dimred_only strategy (must be 'nmf' or 'pca')")
 
-        logger.info(f"Strategy: Dimensionality Reduction ({reduction_type.upper()})")
-        logger.info(f"  Analysis: {analysis_type}, Method: {dimred_method}")
+        logger.info(f"Strategy: Dimensionality Reduction ({reduction_type.upper()}, per cell type)")
 
         if reduction_type == "nmf":
             builder = select_genes_from_nmf(
                 adata=adata,
                 probeset_size=probeset_size,
-                analysis_type=analysis_type,
-                method=dimred_method,
                 celltype_column=celltype_column,
                 n_components=n_components,
                 pool_size_per_celltype=pool_size_per_celltype,
-                pool_size_per_factor=pool_size_per_factor,
+                nmf_n_jobs=dimred_n_jobs,
                 min_cells_per_celltype=min_cells_per_celltype,
                 random_state=random_state,
-                nmf_loadings_global=nmf_loadings_global,
                 nmf_loadings_per_celltype=nmf_loadings_per_celltype,
                 results_dir=results_dir,
                 nmf_model_cache_dir=nmf_model_cache_dir,
                 mean_expr_per_ct=mean_expr_per_ct,
-                nmf_counts_input=nmf_counts_input,
-                use_consensus_nmf=use_consensus_nmf,
-                k_min=k_min,
-                k_max=k_max,
-                k_step=k_step,
-                cnmf_n_iter=cnmf_n_iter,
-                k_selection_method=k_selection_method,
-                use_consensus_H=use_consensus_H,
+                xenium_min_expr=xenium_min_expr,
+                xenium_max_expr=xenium_max_expr,
+                dimred_counts_input=dimred_counts_input,
+                require_nmf_model_cache=require_nmf_model_cache,
+                nmf_objective=nmf_objective,
             )
         elif reduction_type == "pca":
             builder = select_genes_from_pca(
                 adata=adata,
                 probeset_size=probeset_size,
-                analysis_type=analysis_type,
-                method=dimred_method,
                 celltype_column=celltype_column,
                 n_components=n_components,
                 pool_size_per_celltype=pool_size_per_celltype,
-                pool_size_per_factor=pool_size_per_factor,
+                pca_n_jobs=dimred_n_jobs,
                 min_cells_per_celltype=min_cells_per_celltype,
                 random_state=random_state,
-                pca_loadings_global=pca_loadings_global,
                 pca_loadings_per_celltype=pca_loadings_per_celltype,
                 results_dir=results_dir,
                 nmf_model_cache_dir=nmf_model_cache_dir,
                 mean_expr_per_ct=mean_expr_per_ct,
+                xenium_min_expr=xenium_min_expr,
+                xenium_max_expr=xenium_max_expr,
+                dimred_counts_input=dimred_counts_input,
             )
         else:
             raise ValueError(f"Invalid reduction_type: {reduction_type} (must be 'nmf' or 'pca')")
@@ -355,7 +385,7 @@ def run_single_selection(
     else:
         raise ValueError(
             f"Invalid strategy: {strategy}. Must be one of: "
-            "deg_only, rf_simple, rf_deg, hvg, random, random_bootstrap, dimred_only"
+            "deg_only, rf_simple, rf_deg, hvg, random, dimred_only"
         )
 
     logger.info(f"✓ Selection complete: {len(builder.get_selected_genes('initial'))} genes selected")
@@ -401,6 +431,13 @@ def run_single_selection(
         logger.info("Skipping Step 3 Xenium filter for dimred_only (already applied in Phase 1 pool filtering)")
     else:
         logger.info("Xenium filter disabled (apply_xenium_filter=False)")
+
+    # Record per-gene mean expression (from the same data the Xenium filter uses)
+    # into the builder's `mean_expression` column, when that data is available.
+    mean_expr_map = _resolve_gene_mean_expression(builder, mean_expr_per_ct, global_mean_expr)
+    if mean_expr_map:
+        builder.set_mean_expression(mean_expr_map)
+        logger.info(f"✓ Recorded mean expression for {len(mean_expr_map)} genes")
 
     # ========================================================================
     # STEP 4: SELECT TOP N FROM FILTERED LIST
@@ -452,8 +489,6 @@ def run_single_selection(
                 f"after Xenium filter. Panel will be smaller than requested."
             )
 
-    selected_genes = builder.get_selected_genes('initial')
-
     # Promote initial selection to final
     selected_initial = builder.get_selected_genes('initial')
     if selected_initial:
@@ -464,10 +499,12 @@ def run_single_selection(
     # SAVE FINAL RESULTS
     # ========================================================================
     # Output files:
-    # 1. ranked_gene_list.csv  - Xenium-passing genes only:
-    #      • Panel genes (final_selection=True) at the top, ranked by score
-    #      • Remaining Xenium-passing genes below, ranked by score
-    #      • in_panel column added for clear membership indicator
+    # 1. {strategy}_panel_information.csv (see panel_information_filename()) - Every gene
+    #      the builder tracked (all candidates, including Xenium failures for the
+    #      strategies that still expose that column). deg_only/hvg/random keep the full
+    #      schema (panel genes at the top, ranked by score); rf_deg/rf_simple/dimred_only
+    #      are trimmed/reordered by their own format_rf_ranked_df()/format_dimred_ranked_df()
+    #      (see docs/doc-pipeline/audit_3.md, "Selection-module CSV output reorganization").
     # 2. filtering_summary.json - Statistics
     # ========================================================================
 
@@ -480,37 +517,61 @@ def run_single_selection(
         logger.info("=" * 80)
 
         # 1. Build unified ranked gene list -----------------------------------
-        #    Scope: genes that passed Xenium (or all genes when Xenium disabled).
-        #    Genes that failed Xenium are excluded — they cannot be in any panel.
+        #    Scope: every gene the builder tracked, including Xenium failures (kept with
+        #    passed_xenium=False + xenium_failure_reason rather than dropped).
         #    Layout: panel genes (in_panel=True) first, rest below; both groups
         #    sorted by rank ascending (rank 1 = highest scoring gene).
         full_df = builder.to_dataframe()
 
-        if apply_xenium_filter:
-            # Keep genes where passed_xenium is True or None (None → not tested,
-            # e.g. force-include genes that bypass the filter).
-            xenium_df = full_df[full_df['passed_xenium'].isin([True]) |
-                                full_df['passed_xenium'].isna()].copy()
-        else:
-            xenium_df = full_df.copy()
+        # Unified per-gene cell-type coverage column (genes-per-cell-type is then
+        # just full_df['informative_celltypes'].str.split('|').explode().value_counts()).
+        full_df['informative_celltypes'] = derive_informative_celltypes(full_df)
 
         # Insert in_panel as the second column for readability
-        xenium_df.insert(1, 'in_panel', xenium_df['final_selection'].fillna(False))
+        full_df.insert(1, 'in_panel', full_df['final_selection'].fillna(False))
 
-        # Panel genes first, within each group sort by rank (ascending)
-        xenium_df = xenium_df.sort_values(
-            ['in_panel', 'rank'],
-            ascending=[False, True],
-        ).reset_index(drop=True)
+        # Strategy-owned formatters trim/reorder/sort the columns each strategy's own
+        # module knows are non-redundant for its output (see docs/doc-pipeline/audit_3.md,
+        # "Selection-module CSV output reorganization"). deg_only/hvg/random keep today's
+        # full schema, sorted panel-genes-first then by rank ascending, unchanged.
+        if strategy == "dimred_only":
+            full_df = format_dimred_ranked_df(full_df)
+        elif strategy in ("rf_deg", "rf_simple"):
+            full_df = format_rf_ranked_df(full_df)
+        else:
+            full_df = full_df.sort_values(
+                ['in_panel', 'rank'],
+                ascending=[False, True],
+            ).reset_index(drop=True)
 
-        ranked_output = os.path.join(results_dir, "ranked_gene_list.csv")
-        xenium_df.to_csv(ranked_output, index=False)
-        n_panel    = int(xenium_df['in_panel'].sum())
-        n_remain   = len(xenium_df) - n_panel
+        ranked_output = os.path.join(
+            results_dir, panel_information_filename(strategy, reduction_type)
+        )
+        full_df.to_csv(ranked_output, index=False)
+        n_panel    = int(full_df['in_panel'].sum())
+        n_remain   = len(full_df) - n_panel
+        panel_metadata = _json_safe_panel_metadata(builder)
+        panel_metadata['requested_panel_size'] = probeset_size
+        panel_metadata['final_panel_size'] = n_panel
+        if n_panel >= probeset_size:
+            panel_metadata['panel_size_status'] = 'complete'
+            panel_metadata['short_panel_reason'] = None
+        elif panel_metadata.get('rf_short_panel_allowed'):
+            panel_metadata['panel_size_status'] = 'short'
+            if not panel_metadata.get('short_panel_reason'):
+                panel_metadata['short_panel_reason'] = 'rf_deg_candidate_pool_exhausted_after_retries'
+        else:
+            panel_metadata['panel_size_status'] = 'short'
+            if not panel_metadata.get('short_panel_reason'):
+                panel_metadata['short_panel_reason'] = 'insufficient_ranked_genes_after_filtering'
+
+        for key, value in panel_metadata.items():
+            builder.add_metadata(key, value)
+
         logger.info(
-            f"✓ Saved ranked_gene_list.csv: "
-            f"{n_panel} panel genes + {n_remain} remaining Xenium-passing genes "
-            f"({len(xenium_df)} total)"
+            f"✓ Saved {os.path.basename(ranked_output)}: "
+            f"{n_panel} panel genes + {n_remain} remaining candidate genes "
+            f"({len(full_df)} total)"
         )
 
         # 2. Save filtering summary statistics
@@ -518,17 +579,25 @@ def run_single_selection(
             'strategy': strategy,
             'analysis_type': builder.analysis_type,
             'target_size': probeset_size,
+            'requested_panel_size': probeset_size,
+            'final_panel_size': n_panel,
+            'panel_size_status': panel_metadata.get('panel_size_status'),
+            'short_panel_reason': panel_metadata.get('short_panel_reason'),
+            'rf_deg_recompute_attempts': panel_metadata.get('rf_deg_recompute_attempts'),
+            'rf_deg_candidate_pool_sizes': panel_metadata.get('rf_deg_candidate_pool_sizes'),
+            'rf_deg_cache_used': panel_metadata.get('rf_deg_cache_used'),
+            'rf_deg_cache_rejected_reason': panel_metadata.get('rf_deg_cache_rejected_reason'),
             'initial_selected': len(builder.get_genes_by_stage('initial')),
             'after_xenium': len(builder.get_genes_by_stage('post_xenium')) if apply_xenium_filter else len(builder.get_genes_by_stage('initial')),
             'final_selected': len(builder.get_selected_genes('final')),
             'xenium_failed': builder.count_filter_failures('xenium') if apply_xenium_filter else 0,
-            'replacements': len(builder.get_replacement_genes()),
             'filters_applied': {
                 'xenium': apply_xenium_filter,
                 'blacklist_custom_patterns': blacklist_patterns or [],
                 'blacklist_use_default': use_default_blacklist,
                 'blacklist_any_active': bool(blacklist_patterns or use_default_blacklist),
-            }
+            },
+            'metadata': panel_metadata,
         }
         summary_output = os.path.join(results_dir, "filtering_summary.json")
         with open(summary_output, 'w') as f:

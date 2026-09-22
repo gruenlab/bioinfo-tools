@@ -13,32 +13,57 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from types import SimpleNamespace
+from typing import List, Tuple
 
+import numpy as np
 import scanpy as sc
 from anndata import AnnData
 
-# Import from sibling modules
-_MODULES_DIR = Path(__file__).parent.parent
-_PREPROCESSING_DIR = Path(__file__).parent
+# Module constants — package-relative when imported as ``preprocessing.…``,
+# flat import when this file is run as a script from its own directory.
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
 
-# Import constants from local module using direct import
-import importlib.util
-_constants_path = _PREPROCESSING_DIR / "_constants.py"
-_constants_spec = importlib.util.spec_from_file_location("_preprocessing_constants", _constants_path)
-_preprocessing_constants = importlib.util.module_from_spec(_constants_spec)
-_constants_spec.loader.exec_module(_preprocessing_constants)
+# Canonical raw-count check from Utility-module (hard import — one implementation in the cut).
+_UTILITY_DIR = _cpath(__file__).resolve().parent.parent / "Utility-module"
+if str(_UTILITY_DIR) not in sys.path:
+    sys.path.insert(0, str(_UTILITY_DIR))
+from _validation import is_anndata_raw
 
-# Extract constants
-DEFAULT_N_COMPONENTS_PCA = _preprocessing_constants.DEFAULT_N_COMPONENTS_PCA
-DEFAULT_RANDOM_STATE = _preprocessing_constants.DEFAULT_RANDOM_STATE
-NORMALIZE_TARGET_SUM = _preprocessing_constants.NORMALIZE_TARGET_SUM
-DEFAULT_N_COMPONENTS_NMF = _preprocessing_constants.DEFAULT_N_COMPONENTS_NMF
-DEFAULT_N_HVG = _preprocessing_constants.DEFAULT_N_HVG
-DEFAULT_HVG_FLAVOR = _preprocessing_constants.DEFAULT_HVG_FLAVOR
-DEFAULT_MIN_GENES_PER_CELL = _preprocessing_constants.DEFAULT_MIN_GENES_PER_CELL
-DEFAULT_MIN_CELLS_PER_GENE = _preprocessing_constants.DEFAULT_MIN_CELLS_PER_GENE
-FILTER_METHODS = _preprocessing_constants.FILTER_METHODS
+# Gene blacklist filter lives in Selection-module/_filtering.py. It is imported
+# lazily inside _process_single_combination (not here) because _filtering re-pins
+# sys.modules["_constants"] to Selection-module's copy on import, which would
+# shadow this module's own _constants during startup.
+_SELECTION_DIR = _cpath(__file__).resolve().parent.parent / "Selection-module"
+
+
+try:
+    from ._constants import (
+        DEFAULT_HVG_FLAVOR,
+        DEFAULT_MIN_CELLS_PER_GENE,
+        DEFAULT_MIN_GENES_PER_CELL,
+        DEFAULT_N_COMPONENTS_NMF,
+        DEFAULT_N_COMPONENTS_PCA,
+        DEFAULT_N_HVG,
+        DEFAULT_RANDOM_STATE,
+        FILTER_METHODS,
+    )
+except ImportError:  # pragma: no cover - script / flat-import fallback
+    from _constants import (
+        DEFAULT_HVG_FLAVOR,
+        DEFAULT_MIN_CELLS_PER_GENE,
+        DEFAULT_MIN_GENES_PER_CELL,
+        DEFAULT_N_COMPONENTS_NMF,
+        DEFAULT_N_COMPONENTS_PCA,
+        DEFAULT_N_HVG,
+        DEFAULT_RANDOM_STATE,
+        FILTER_METHODS,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +72,47 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 __all__ = ['preprocess_for_selection', 'preprocess_for_analysis']
+
+
+def _is_integer_count_matrix(matrix) -> bool:
+    """Return True when ``matrix`` looks like raw integer counts.
+
+    Delegates to Utility-module's canonical ``is_anndata_raw`` (which only inspects
+    ``.X``) so every raw-count check in the cut shares one implementation.
+    """
+    return matrix is not None and is_anndata_raw(SimpleNamespace(X=matrix))
+
+
+def _copy_matrix(matrix):
+    """Copy sparse or dense matrices without changing their representation."""
+    return matrix.copy() if hasattr(matrix, "copy") else np.array(matrix, copy=True)
+
+
+def _resolve_raw_counts(adata: AnnData) -> Tuple[object, str]:
+    """Find raw integer counts aligned to the current AnnData variables."""
+    if "counts" in adata.layers and _is_integer_count_matrix(adata.layers["counts"]):
+        return _copy_matrix(adata.layers["counts"]), "layers['counts']"
+
+    if adata.raw is not None and _is_integer_count_matrix(adata.raw.X):
+        raw_var_names = adata.raw.var_names
+        positions = raw_var_names.get_indexer(adata.var_names)
+        missing = adata.var_names[positions < 0].tolist()
+        if missing:
+            preview = ", ".join(map(str, missing[:5]))
+            raise ValueError(
+                "Raw counts in adata.raw.X cannot be aligned to filtered genes; "
+                f"{len(missing)} genes are missing from adata.raw.var_names "
+                f"(examples: {preview})"
+            )
+        return _copy_matrix(adata.raw.X[:, positions]), "adata.raw.X"
+
+    if _is_integer_count_matrix(adata.X):
+        return _copy_matrix(adata.X), "adata.X"
+
+    raise ValueError(
+        "No valid raw integer counts found. Expected raw counts in "
+        "adata.layers['counts'], adata.raw.X, or adata.X before normalization."
+    )
 
 
 def preprocess_for_analysis(
@@ -114,7 +180,9 @@ def preprocess_for_selection(
     n_components_pca: int = DEFAULT_N_COMPONENTS_PCA,
     n_hvg: int = DEFAULT_N_HVG,
     hvg_flavor: str = DEFAULT_HVG_FLAVOR,
-    random_state: int = DEFAULT_RANDOM_STATE
+    random_state: int = DEFAULT_RANDOM_STATE,
+    blacklist_patterns: List[str] | None = None,
+    use_default_blacklist: bool = True,
 ) -> None:
     """
     Preprocess data for gene selection pipeline.
@@ -137,7 +205,12 @@ def preprocess_for_selection(
         n_hvg: Number of highly variable genes to select
         hvg_flavor: Scanpy HVG flavor ('seurat', 'seurat_v3', 'cell_ranger')
         random_state: Random state for reproducibility
-    
+        blacklist_patterns: Extra gene-name prefixes to remove before
+            normalization (case-insensitive), combined with the default set
+            unless ``use_default_blacklist`` is False.
+        use_default_blacklist: Remove the default families (mt-, hsp, rps, rpl)
+            before normalization. Default True.
+
     Examples:
         >>> preprocess_for_selection(
         ...     input_file='data/raw.h5ad',
@@ -204,7 +277,9 @@ def preprocess_for_selection(
                     n_components_pca=n_components_pca,
                     n_hvg=n_hvg,
                     hvg_flavor=hvg_flavor,
-                    random_state=random_state
+                    random_state=random_state,
+                    blacklist_patterns=blacklist_patterns,
+                    use_default_blacklist=use_default_blacklist,
                 )
             except Exception as e:
                 logger.error(f"Failed to process combination: {e}")
@@ -227,7 +302,9 @@ def _process_single_combination(
     n_components_pca: int,
     n_hvg: int,
     hvg_flavor: str,
-    random_state: int
+    random_state: int,
+    blacklist_patterns: List[str] | None = None,
+    use_default_blacklist: bool = True,
 ) -> None:
     """Process single filter/HVG combination."""
     
@@ -248,12 +325,39 @@ def _process_single_combination(
     adata = _apply_filtering(adata, filter_method)
     logger.info(f"After filtering: {adata.shape[0]} cells x {adata.shape[1]} genes")
 
+    # Step 1b: Gene blacklist filter — BEFORE normalization, so blacklisted
+    # families (mt-, hsp, rps, rpl by default) never contribute to
+    # normalize_total's per-cell size factors.
+    n_blacklist_removed = 0
+    if blacklist_patterns or use_default_blacklist:
+        logger.info("")
+        logger.info("Step 1b: Blacklist filtering (pre-normalization)")
+        if str(_SELECTION_DIR) not in sys.path:
+            sys.path.insert(0, str(_SELECTION_DIR))
+        from _filtering import apply_blacklist_filter  # noqa: E402  (lazy: see import note)
+        kept_genes, removed_genes, _ = apply_blacklist_filter(
+            gene_list=adata.var_names.tolist(),
+            blacklist_patterns=blacklist_patterns,
+            use_default_blacklist=use_default_blacklist,
+        )
+        n_blacklist_removed = len(removed_genes)
+        if n_blacklist_removed:
+            adata = adata[:, kept_genes].copy()
+        _combined = (['mt-', 'hsp', 'rps', 'rpl'] if use_default_blacklist else []) + (blacklist_patterns or [])
+        logger.info(
+            f"Blacklist patterns {_combined}: {adata.shape[1]} genes "
+            f"({n_blacklist_removed} removed)"
+        )
+
     # Step 2: Normalize and log-transform
     logger.info("")
     logger.info("Step 2: Normalization and log-transformation")
-    adata.layers["counts"] = adata.X.copy()  # Raw counts required by _dimred_selection
+    raw_counts, raw_source = _resolve_raw_counts(adata)
+    logger.info(f"Using {raw_source} as raw counts for layers['counts']")
+    adata.layers["counts"] = raw_counts
+    adata.X = _copy_matrix(raw_counts)
     adata.raw = adata.copy()
-    sc.pp.normalize_total(adata, target_sum=NORMALIZE_TARGET_SUM)
+    sc.pp.normalize_total(adata)  # scanpy default target_sum = per-cell median, matches Evaluation-module's convention
     sc.pp.log1p(adata)
 
     # Step 3: HVG selection
@@ -286,6 +390,10 @@ def _process_single_combination(
         'n_hvg': n_hvg,
         'hvg_flavor': hvg_flavor,
         'celltype_column': celltype_column,
+        'blacklist_pre_normalization': bool(blacklist_patterns or use_default_blacklist),
+        'blacklist_use_default': use_default_blacklist,
+        'blacklist_extra_patterns': blacklist_patterns or [],
+        'blacklist_genes_removed': n_blacklist_removed,
         'timestamp': datetime.now().isoformat()
     }
     metadata_output = os.path.join(comb_dir, 'metadata.json')
@@ -303,15 +411,6 @@ def _apply_filtering(adata: AnnData, filter_method: str) -> AnnData:
         logger.info(
             f"Applying Scanpy filter (min_genes={DEFAULT_MIN_GENES_PER_CELL}, "
             f"min_cells={DEFAULT_MIN_CELLS_PER_GENE})"
-        )
-
-        # Calculate QC metrics
-        adata.var["mt"] = adata.var_names.str.startswith("MT-")
-        adata.var["ribo"] = adata.var_names.str.startswith(("Rps", "Rpl"))
-        adata.var["hb"] = adata.var_names.str.contains("^Hb[^(P)]")
-
-        sc.pp.calculate_qc_metrics(
-            adata, qc_vars=["mt", "ribo", "hb"], inplace=True, log1p=True
         )
 
         # Filter cells and genes
@@ -366,7 +465,7 @@ def parse_arguments() -> argparse.Namespace:
             'HVG processing option: '
             '"all_genes" (no HVG subsetting), '
             '"hvg" (subset to highly variable genes only), '
-            '"both" (process both options - default for backward compatibility)'
+            '"both" (write both variants; default)'
         )
     )
     parser.add_argument(
@@ -385,6 +484,21 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--random_state', type=int, default=DEFAULT_RANDOM_STATE,
         help=f'Random state for reproducibility (default: {DEFAULT_RANDOM_STATE})'
+    )
+    parser.add_argument(
+        '--blacklist_patterns', type=str, nargs='*', default=None,
+        help=(
+            'Extra gene-name prefixes to remove BEFORE normalization '
+            '(case-insensitive). Combined with the default set unless '
+            '--disable_default_blacklist is given.'
+        )
+    )
+    parser.add_argument(
+        '--disable_default_blacklist', action='store_true',
+        help=(
+            'Do not remove the default blacklist families (mt-, hsp, rps, rpl) '
+            'before normalization. By default they ARE removed pre-normalization.'
+        )
     )
     parser.add_argument(
         '--log_level', type=str, default='INFO',
@@ -420,7 +534,9 @@ def main() -> int:
             n_components_pca=args.n_components_pca,
             n_hvg=args.n_hvg,
             hvg_flavor=args.hvg_flavor,
-            random_state=args.random_state
+            random_state=args.random_state,
+            blacklist_patterns=args.blacklist_patterns,
+            use_default_blacklist=not args.disable_default_blacklist,
         )
         return 0
     except Exception as e:

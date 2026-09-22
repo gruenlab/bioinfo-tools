@@ -1,20 +1,16 @@
 """
-Combination gene selection strategies (rf_nmf, rf_pca).
+Combination gene selection strategies (RecoVar, RecoVar_PCA).
 
 This module orchestrates combination strategies that merge genes from two sources:
 1. Random Forest on DEG-filtered genes (rf_deg)
 2. Dimensionality reduction (NMF or PCA) - global or per-celltype
 
-The workflow follows the pattern from _selection.py:
+The workflow:
 - Run both components WITH full filtering (Xenium)
 - Combine filtered results with ratio-based selection
 - Handle duplicates by assigning to RF pool and replacing from dimred pool
-- Support 3 gap-filling strategies to reach target size
+- Support 2 gap-filling strategies (celltype-specific dimred, DEG-based) to reach target size
 - Maintain factor/component and cell type awareness throughout
-
-Written by: Helene Hemmer
-Date: 2026-02-08
-Last modified: 2026-02-08
 """
 
 from __future__ import annotations
@@ -22,11 +18,11 @@ from __future__ import annotations
 import logging
 import os
 import json
+import re
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set
 
 import pandas as pd
-import scanpy as sc
 from anndata import AnnData
 
 # Support script execution by adding module directory to sys.path
@@ -39,45 +35,53 @@ if str(MODULE_DIR) not in sys.path:
 from run_single_selection import run_single_selection
 
 # Use absolute imports (for script execution)
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 from _constants import (
+    COL_CELLTYPE,
     DEFAULT_PROBESET_SIZE,
-    DEFAULT_REDUCTION_TYPES,
-    DEFAULT_ANALYSIS_TYPES,
-    DEFAULT_PER_FACTOR_SELECTION,
+    DEFAULT_REDUCTION_TYPE,
     DEFAULT_DIMRED_PERCENTAGE,
-    DEFAULT_BLACKLIST_PATTERNS,
     DEFAULT_RF_PERCENTAGE,
     DEFAULT_RUN_CELLTYPE_FILLING,
-    DEFAULT_RUN_GLOBAL_FILLING,
     DEFAULT_RUN_DEG_FILLING,
     COMBINATION_OVERSAMPLE_FACTOR,
     GAP_FILL_STRATEGY_CELLTYPE,
     GAP_FILL_STRATEGY_DEG,
-    GAP_FILL_STRATEGY_GLOBAL,
+    GAP_FILL_STRATEGY_DISPLAY_NAMES,
     GENE_SOURCE_DIMRED,
     GENE_SOURCE_FORCE_INCLUDE,
     GENE_SOURCE_GAP_FILL_CELLTYPE,
     GENE_SOURCE_GAP_FILL_DEG,
-    GENE_SOURCE_GAP_FILL_GLOBAL,
     GENE_SOURCE_OVERLAP_TO_RF,
     GENE_SOURCE_RF,
     DEFAULT_MIN_XENIUM_EXPRESSION,
     DEFAULT_MAX_XENIUM_EXPRESSION,
+    RF_CONTRIBUTING_CELLTYPE_MIN_SHARE,
 )
-from _gene_list_builder import GeneListBuilder
+from _gene_list_builder import GeneListBuilder, panel_information_filename
 
 
 def run_combination_selection(
     strategy: str,
     adata: AnnData,
     probeset_size: int = DEFAULT_PROBESET_SIZE,
-    reduction_type: str = DEFAULT_REDUCTION_TYPES,
-    analysis_type: str = DEFAULT_ANALYSIS_TYPES,
-    dimred_method: str = DEFAULT_PER_FACTOR_SELECTION,
+    reduction_type: str = DEFAULT_REDUCTION_TYPE,
     n_components: int = 50,
     pool_size_per_celltype: int = 200,  # Pool size per celltype for Phase 1
-    pool_size_per_factor: int = 200,      # Pool size per factor for Phase 1
+    dimred_n_jobs: int = 1,  # workers for the dimred component's per-celltype NMF/PCA fits
     rf_percentage: float = DEFAULT_RF_PERCENTAGE,
+    # dimred_percentage is DISPLAY-ONLY: the RF/dimred split is
+    # driven entirely by rf_percentage — n_dimred_target = adjusted_target_size - n_rf_target.
+    # This value is only checked for consistency (must sum to 1.0 ± 0.01 with rf_percentage)
+    # and echoed into metadata/logs; it never enters the split maths, so 0.30/0.70 and
+    # 0.30/0.6999 produce the identical panel. Kept for a readable, self-documenting CLI.
     dimred_percentage: float = DEFAULT_DIMRED_PERCENTAGE,
     force_include_genes: Optional[List[str]] = None,
     blacklist_patterns: Optional[List[str]] = None,
@@ -87,9 +91,8 @@ def run_combination_selection(
     xenium_min_expr: float = DEFAULT_MIN_XENIUM_EXPRESSION,
     xenium_max_expr: float = DEFAULT_MAX_XENIUM_EXPRESSION,
 
-    # Gap-filling control (three boolean flags)
+    # Gap-filling control (two boolean flags)
     run_celltype_filling: bool = DEFAULT_RUN_CELLTYPE_FILLING,
-    run_global_filling: bool = DEFAULT_RUN_GLOBAL_FILLING,
     run_deg_filling: bool = DEFAULT_RUN_DEG_FILLING,
     
     results_dir: Optional[str] = None,
@@ -99,10 +102,14 @@ def run_combination_selection(
     dimred_cache_dir: Optional[str] = None,
     nmf_model_cache_dir: Optional[str] = None,
     force_recompute: bool = False,
+    # Diagnostic plots -- both opt-in only: skipped entirely (never written into
+    # results_dir) when their directory isn't explicitly given.
+    dotplot_dir: Optional[str] = None,
+    expression_distribution_dir: Optional[str] = None,
     **kwargs
 ) -> GeneListBuilder:
     """
-    Run combination gene selection strategy (rf_nmf or rf_pca).
+    Run combination gene selection strategy (RecoVar or RecoVar_PCA).
     
     This function orchestrates a two-phase workflow:
     1. Run RF (rf_deg) and dimred (dimred_only) strategies independently with FULL filtering
@@ -115,7 +122,7 @@ def run_combination_selection(
       This may REDUCE the dimred count, creating a shortfall that must be filled from next-best
       dimred candidates.
     - **Gap-filling**: When the combined panel (force-include + RF + dimred) is SMALLER than target
-      size, add genes from additional sources (DEG-based, celltype-specific, or global dimred).
+      size, add genes from additional sources (celltype-specific dimred or DEG-based).
     
     These are separate operations: duplicate resolution maintains the RF/dimred ratio by replacing
     lost dimred genes, while gap-filling increases total panel size when needed.
@@ -129,37 +136,48 @@ def run_combination_selection(
     Parameters
     ----------
     strategy : str
-        Combination strategy name: 'rf_nmf' or 'rf_pca'
+        Combination strategy name: 'RecoVar' or 'RecoVar_PCA'
     adata : AnnData
         Annotated data matrix with expression data
     probeset_size : int
         Target total number of genes in final panel
     reduction_type : str
         Dimensionality reduction type: 'nmf' or 'pca'
-    analysis_type : str, default='per_celltype'
-        Dimred analysis level: 'per_celltype' or 'global'
-    dimred_method : str, default='method_a'
-        Dimred gene selection method: 'method_a' (top genes by absolute factor loading)
     n_components : int, default=5
         Number of components for dimensionality reduction
+    pool_size_per_celltype : int, default=200
+        Phase-1 dimred pool size per cell type. Forwarded to the dimred component.
+    dimred_n_jobs : int, default=1
+        Workers for the dimred component's per-celltype NMF/PCA fits (1 = sequential,
+        -1 = all cores). Forwarded to run_single_selection(strategy='dimred_only').
     rf_percentage : float, default=0.25
-        Target percentage of genes from RF (e.g., 0.25 = 25%)
+        Target fraction of genes from RF (e.g., 0.25 = 25%). This is the *only* knob that
+        moves the split: n_rf_target = int(adjusted_target_size * rf_percentage) and dimred
+        takes the remainder.
     dimred_percentage : float, default=0.75
-        Target percentage of genes from dimred (e.g., 0.75 = 75%)
+        Display-only. Must equal 1 - rf_percentage within 0.01 or
+        the run raises; it is echoed to metadata/logs but never enters the split maths, so it
+        cannot by itself change the panel. For a 100% RF or 100% dimred panel use the
+        `rf_simple` / `rf_deg` or `dimred_only` single strategies instead — this orchestrator
+        rejects `rf_percentage`/`dimred_percentage` of 0 or 1.
     force_include_genes : List[str], optional
         Genes to force-include (highest priority, added before ratio calculation)
     blacklist_patterns : List[str], optional
         Gene name prefixes to exclude (e.g., ['mt-', 'rps', 'rpl'])
+    use_default_blacklist : bool, default=True
+        Also apply the built-in default blacklist patterns alongside
+        ``blacklist_patterns``.
     apply_xenium_filter : bool, default=True
         Whether to apply Xenium expression filtering
+    xenium_celltype_aware : bool, default=True
+        Use per-cell-type mean expression for the Xenium filter; when False, use a
+        single pooled global mean.
     xenium_min_expr : float, default=0.1
         Minimum mean expression threshold for Xenium filter
     xenium_max_expr : float, default=100.0
         Maximum mean expression threshold for Xenium filter
     run_celltype_filling : bool, default=True
         Enable cell-type-specific dimred gap-filling (per-celltype analysis)
-    run_global_filling : bool, default=True
-        Enable global dimred gap-filling (global analysis)
     run_deg_filling : bool, default=True
         Enable DEG-based gap-filling (works for both analysis types)
     results_dir : str, optional
@@ -167,25 +185,30 @@ def run_combination_selection(
     experiment_name : str, default='combination_selection'
         Name for this experiment (used in result filenames)
     rf_deg_cache_dir : str, optional
-        Directory containing cached rf_deg results (selected_genes.csv).
+        Directory containing cached rf_deg results (ranked_gene_list.csv).
         If provided and exists, will load cached results instead of recomputing.
-        Expected structure: rf_deg_cache_dir/selected_genes.csv
+        Expected structure: rf_deg_cache_dir/ranked_gene_list.csv
     dimred_cache_dir : str, optional
-        Directory containing cached dimred_only results (selected_genes.csv).
+        Directory containing cached dimred_only results (ranked_gene_list.csv).
         If provided and exists, will load cached results instead of recomputing.
-        Expected structure: dimred_cache_dir/selected_genes.csv
+        Expected structure: dimred_cache_dir/ranked_gene_list.csv
+    nmf_model_cache_dir : str, optional
+        Shared directory for NMF/PCA model pkl files, forwarded to the dimred
+        component so one fit can be reused across probeset sizes / strategies.
     force_recompute : bool, default=False
         If True, ignore cached results and recompute both components.
         Use this to regenerate results even when cache exists.
     **kwargs
-        Additional parameters passed to component strategies
+        Additional parameters passed to component strategies (notably
+        ``dimred_counts_input`` — 'raw' or 'lognorm' — routed to the dimred
+        component's NMF/PCA input).
         
     Returns
     -------
     GeneListBuilder
         Final gene panel with complete metadata including:
-        - gene_source: Labels like 'rf_deg', 'dimred', 'overlap→rf_deg', 
-          'dimred_replacement', 'gap_fill_*', 'force_include'
+        - gene_source: Labels like 'rf_deg', 'dimred', 'overlap→rf_deg',
+          'gap_fill_celltype', 'gap_fill_deg', 'force_include'
         - component: Factor/component ID for dimred genes
         - celltype: Cell type for per-celltype genes
         - All scores and metadata from component strategies
@@ -204,8 +227,7 @@ def run_combination_selection(
     logging.info(f"COMBINATION STRATEGY: {strategy.upper()}")
     logging.info("=" * 80)
     logging.info(f"Target panel size: {probeset_size} genes")
-    logging.info(f"Reduction type: {reduction_type.upper()}")
-    logging.info(f"Analysis type: {analysis_type}")
+    logging.info(f"Reduction type: {reduction_type.upper()} (per cell type)")
     logging.info(f"Target composition: {rf_percentage:.0%} RF + {dimred_percentage:.0%} {reduction_type.upper()}")
     def _read_cache_filter_flags(cache_dir: str) -> tuple[Optional[bool], Optional[bool], Optional[list]]:
         """Read filter flags from filtering_summary.json if present.
@@ -231,11 +253,14 @@ def run_combination_selection(
             return None, None, None
     
     # Validate strategy
-    if strategy not in ['rf_nmf', 'rf_pca']:
-        raise ValueError(f"Invalid combination strategy: {strategy}. Must be 'rf_nmf' or 'rf_pca'")
+    if strategy not in ['RecoVar', 'RecoVar_PCA']:
+        raise ValueError(f"Invalid combination strategy: {strategy}. Must be 'RecoVar' or 'RecoVar_PCA'")
     
-    # Validate reduction type matches strategy
-    expected_reduction = 'nmf' if 'nmf' in strategy else 'pca'
+    # Validate reduction type matches strategy.
+    # 'RecoVar' is the NMF hybrid (renamed from 'rf_nmf'); 'RecoVar_PCA' the PCA one.
+    # (Substring checks like "'nmf' in strategy" broke with the rename -- 'nmf' is
+    # not a substring of 'RecoVar'.)
+    expected_reduction = 'pca' if strategy == 'RecoVar_PCA' else 'nmf'
     if reduction_type.lower() != expected_reduction:
         raise ValueError(
             f"Reduction type '{reduction_type}' doesn't match strategy '{strategy}'. "
@@ -289,8 +314,13 @@ def run_combination_selection(
     # STEP 2: Calculate target counts for RF and dimred (from adjusted target)
     # =========================================================================
     
+    # Split is a function of rf_percentage ONLY — dimred_percentage is display-only (#26).
+    # int() truncates toward zero, so a fractional RF share always rounds *down*
+    # (e.g. probeset_size=250, rf_percentage=0.25 -> n_rf_target=62, dimred gets 188).
+    # This is deliberate: dimred is the larger, primary component and absorbs the
+    # remainder so the two always sum to adjusted_target_size exactly.
     n_rf_target = int(adjusted_target_size * rf_percentage)
-    n_dimred_target = adjusted_target_size - n_rf_target  # Ensures exact sum
+    n_dimred_target = adjusted_target_size - n_rf_target  # exact sum by construction
     
     logging.info(f"Target gene counts:")
     logging.info(f"  RF genes: {n_rf_target}")
@@ -316,8 +346,13 @@ def run_combination_selection(
     rf_builder = None
 
     if rf_deg_cache_dir and not force_recompute:
-        # Look for ranked_gene_list.csv (new name) with fallback to the old name
-        rf_cache_file = os.path.join(rf_deg_cache_dir, 'ranked_gene_list.csv')
+        # Look for rf_deg_panel_information.csv (current name), falling back to the
+        # older ranked_gene_list.csv / ranked_gene_list_final.csv names for pre-rename
+        # cache directories (see docs/doc-pipeline/audit_3.md, "Selection-module CSV
+        # output reorganization").
+        rf_cache_file = os.path.join(rf_deg_cache_dir, panel_information_filename('rf_deg'))
+        if not os.path.exists(rf_cache_file):
+            rf_cache_file = os.path.join(rf_deg_cache_dir, 'ranked_gene_list.csv')
         if not os.path.exists(rf_cache_file):
             rf_cache_file = os.path.join(rf_deg_cache_dir, 'ranked_gene_list_final.csv')
 
@@ -369,7 +404,6 @@ def run_combination_selection(
                     raise ValueError("Cache format invalid")  # Caught by outer try/except
                 
                 # Create builder from cached data
-                from ._gene_list_builder import GeneListBuilder
                 rf_builder = GeneListBuilder(
                     strategy_name='rf_deg',
                     analysis_type='global',
@@ -391,7 +425,12 @@ def run_combination_selection(
                         selection_score=row.get('selection_score', None),
                         celltype=row.get('celltype', 'global'),
                         component=row.get('component', None),
-                        additional_metadata={}
+                        additional_metadata={
+                            # None-safe for pre-upgrade caches without these columns.
+                            'rf_celltype': row.get('rf_celltype', '') or '',
+                            'rf_contributing_celltypes': row.get('rf_contributing_celltypes', '') or '',
+                            'rf_celltype_scores': row.get('rf_celltype_scores', '{}') or '{}',
+                        },
                     )
                 
                 logging.info(f"✓ Loaded {len(rf_builder.get_all_genes())} RF genes from ranked list")
@@ -444,8 +483,14 @@ def run_combination_selection(
     dimred_builder = None
     
     if dimred_cache_dir and not force_recompute:
-        # Look for ranked_gene_list.csv (new name) with fallback to the old name
-        dimred_cache_file = os.path.join(dimred_cache_dir, 'ranked_gene_list.csv')
+        # Look for {nmf,pca}_panel_information.csv (current name), falling back to the
+        # older ranked_gene_list.csv / ranked_gene_list_final.csv names for pre-rename
+        # cache directories.
+        dimred_cache_file = os.path.join(
+            dimred_cache_dir, panel_information_filename('dimred_only', reduction_type)
+        )
+        if not os.path.exists(dimred_cache_file):
+            dimred_cache_file = os.path.join(dimred_cache_dir, 'ranked_gene_list.csv')
         if not os.path.exists(dimred_cache_file):
             dimred_cache_file = os.path.join(dimred_cache_dir, 'ranked_gene_list_final.csv')
 
@@ -497,10 +542,9 @@ def run_combination_selection(
                     raise ValueError("Cache format invalid")  # Caught by outer try/except
                 
                 # Create builder from cached data
-                from ._gene_list_builder import GeneListBuilder
                 dimred_builder = GeneListBuilder(
                     strategy_name='dimred_only',
-                    analysis_type=analysis_type,
+                    analysis_type='per_celltype',
                 )
                 
                 # Add genes from cache
@@ -512,7 +556,13 @@ def run_combination_selection(
                         selection_score=row.get('selection_score', None),
                         celltype=row.get('celltype', 'global'),
                         component=row.get('component', None),
-                        additional_metadata={'component_loading': row.get('component_loading', None)}
+                        additional_metadata={
+                            'component_loading': row.get('component_loading', None),
+                            # Restore per-cell-type attribution so cached dimred reuse
+                            # still feeds the coverage diagnostic and gap-fill lookups.
+                            'n_celltypes_selected': row.get('n_celltypes_selected', 1),
+                            'contributing_celltypes': row.get('contributing_celltypes', '') or '',
+                        },
                     )
                 
                 logging.info(f"✓ Loaded {len(dimred_builder.get_all_genes())} dimred genes from ranked list")
@@ -556,11 +606,9 @@ def run_combination_selection(
             adata=adata,
             probeset_size=n_dimred_oversample,
             reduction_type=reduction_type,
-            analysis_type=analysis_type,
-            dimred_method=dimred_method,
             n_components=n_components,
             pool_size_per_celltype=pool_size_per_celltype,
-            pool_size_per_factor=pool_size_per_factor,
+            dimred_n_jobs=dimred_n_jobs,
             force_include_genes=None,  # Don't double-count force-include in components
             blacklist_patterns=_sub_blacklist_patterns,
             use_default_blacklist=_sub_use_default_blacklist,
@@ -592,7 +640,6 @@ def run_combination_selection(
         n_dimred_target=n_dimred_target,
         force_include_set=force_include_set,
         reduction_type=reduction_type,
-        analysis_type=analysis_type,
         adata=adata,
         results_dir=results_dir
     )
@@ -624,17 +671,10 @@ def run_combination_selection(
             base_builder=combined_builder,
             rf_builder=rf_builder,
             dimred_builder=dimred_builder,
-            adata=adata,
             gap_needed=gap_needed,
             target_size=probeset_size,
             run_celltype_filling=run_celltype_filling,
-            run_global_filling=run_global_filling,
             run_deg_filling=run_deg_filling,
-            reduction_type=reduction_type,
-            analysis_type=analysis_type,
-            dimred_method=dimred_method,
-            n_components=n_components,
-            results_dir=results_dir
         )
         
         combined_builder = final_builder
@@ -658,6 +698,24 @@ def run_combination_selection(
             f"WARNING: Final size ({final_size}) does not match target ({probeset_size}). "
             "Check gap-filling strategies."
         )
+
+    # Combined-panel size status — parity with run_single_selection's filtering_summary.json.
+    # The per-component filtering_summary.json files carry panel_size_status for the RF and
+    # dimred halves; this records it for the combined panel.
+    if final_size >= probeset_size:
+        panel_size_status = 'complete'
+        short_panel_reason = None
+    else:
+        panel_size_status = 'short'
+        gap_remaining = combined_builder.metadata.get('gap_remaining')
+        short_panel_reason = (
+            'gap_fill_pool_exhausted' if gap_remaining
+            else 'insufficient_component_genes_after_filtering'
+        )
+    combined_builder.add_metadata('requested_panel_size', probeset_size)
+    combined_builder.add_metadata('final_panel_size', final_size)
+    combined_builder.add_metadata('panel_size_status', panel_size_status)
+    combined_builder.add_metadata('short_panel_reason', short_panel_reason)
     
     # Mark all genes as selected — every gene that made it into the combined
     # builder has passed Xenium filtering inside its component, so all are
@@ -670,8 +728,7 @@ def run_combination_selection(
     combined_builder.add_metadata('rf_percentage', rf_percentage)
     combined_builder.add_metadata('dimred_percentage', dimred_percentage)
     combined_builder.add_metadata('reduction_type', reduction_type)
-    combined_builder.add_metadata('analysis_type', analysis_type)
-    combined_builder.add_metadata('dimred_method', dimred_method)
+    combined_builder.add_metadata('analysis_type', 'per_celltype')
     combined_builder.add_metadata('n_components', n_components)
     combined_builder.add_metadata('target_size', probeset_size)
     combined_builder.add_metadata('final_size', final_size)
@@ -685,7 +742,34 @@ def run_combination_selection(
         strategy=strategy,
         reduction_type=reduction_type
     )
-    
+
+    _celltype_column = kwargs.get('celltype_column', COL_CELLTYPE)
+    if results_dir and dotplot_dir:
+        _generate_combination_dotplot(
+            adata=adata,
+            results_dir=results_dir,
+            celltype_column=_celltype_column,
+            output_dir=dotplot_dir,
+            reduction_type=reduction_type,
+        )
+    elif results_dir:
+        logging.info(
+            "Skipping final-gene dotplot: no dotplot_dir given (this plot is opt-in "
+            "only -- it is never written into results_dir)"
+        )
+
+    if results_dir and expression_distribution_dir:
+        _generate_expression_distribution_plot(
+            adata=adata,
+            results_dir=results_dir,
+            output_dir=expression_distribution_dir,
+        )
+    elif results_dir:
+        logging.info(
+            "Skipping panel expression-distribution plot: no expression_distribution_dir "
+            "given (this plot is opt-in only -- it is never written into results_dir)"
+        )
+
     logging.info(f"Results saved to: {results_dir}")
     logging.info("=" * 80)
     
@@ -752,7 +836,6 @@ def _combine_filtered_components(
     n_dimred_target: int,
     force_include_set: Set[str],
     reduction_type: str,
-    analysis_type: str,
     adata: AnnData,
     results_dir: str
 ) -> GeneListBuilder:
@@ -844,10 +927,12 @@ def _combine_filtered_components(
             f"Will be filled by gap-filling (Step 6)."
         )
     
-    # Build combined gene list with metadata
+    # Build combined gene list with metadata.
+    # 'nmf' -> 'RecoVar', 'pca' -> 'RecoVar_PCA' (matches the --strategy choices).
+    combined_strategy_name = 'RecoVar' if reduction_type.lower() == 'nmf' else f'RecoVar_{reduction_type.upper()}'
     combined_builder = GeneListBuilder(
-        strategy_name=f'rf_{reduction_type}',
-        analysis_type=analysis_type,
+        strategy_name=combined_strategy_name,
+        analysis_type='per_celltype',
     )
     
     # Add force-include genes (highest priority)
@@ -865,11 +950,12 @@ def _combine_filtered_components(
     # Add RF genes (including overlaps)
     for gene in rf_final:
         rf_metadata = rf_builder.get_gene_metadata(gene)
-        
+        rf_record = rf_builder.gene_records.get(gene, {})
+
         gene_source = GENE_SOURCE_RF
         if gene in overlapping_genes:
             gene_source = GENE_SOURCE_OVERLAP_TO_RF
-        
+
         combined_builder.add_gene(
             gene_name=gene,
             gene_source=gene_source,
@@ -880,7 +966,11 @@ def _combine_filtered_components(
             additional_metadata={
                 'from_rf': True,
                 'is_overlap': gene in overlapping_genes,
-                'original_rf_rank': rf_metadata.rank if rf_metadata else None
+                'original_rf_rank': rf_metadata.rank if rf_metadata else None,
+                # Per-class RF attribution ("from the random forest itself").
+                'rf_celltype': rf_record.get('rf_celltype', ''),
+                'rf_contributing_celltypes': rf_record.get('rf_contributing_celltypes', ''),
+                'rf_celltype_scores': rf_record.get('rf_celltype_scores', '{}'),
             }
         )
     
@@ -923,101 +1013,21 @@ def _combine_filtered_components(
     return combined_builder
 
 
-def _replace_dimred_genes(
-    n_needed: int,
-    candidates: List[str],
-    dimred_builder: GeneListBuilder,
-    current_rf_genes: Set[str],
-    current_dimred_genes: Set[str],
-    force_include_genes: Set[str],
-) -> Tuple[List[str], List[Dict]]:
-    """
-    Replace dimred genes lost to duplicates with next-best candidates.
-
-    Maintains factor/component and cell type awareness during replacement.
-
-    Parameters
-    ----------
-    n_needed : int
-        Number of replacement genes needed
-    candidates : List[str]
-        Ranked list of replacement candidates
-    dimred_builder : GeneListBuilder
-        Dimred component results (for metadata)
-    current_rf_genes : Set[str]
-        Current RF genes (to avoid duplicates)
-    current_dimred_genes : Set[str]
-        Current dimred genes (to avoid duplicates)
-    force_include_genes : Set[str]
-        Force-include genes (to avoid duplicates)
-
-    Returns
-    -------
-    Tuple[List[str], List[Dict]]
-        - List of accepted replacement genes
-        - List of replacement report dicts
-    """
-    replacements = []
-    replacement_report = []
-
-    all_excluded = current_rf_genes | current_dimred_genes | force_include_genes
-    n_skipped = 0
-
-    for candidate in candidates:
-        if len(replacements) >= n_needed:
-            break
-
-        if candidate in all_excluded or candidate in set(replacements):
-            n_skipped += 1
-            continue
-
-        candidate_metadata = dimred_builder.get_gene_metadata(candidate)
-        if candidate_metadata is None:
-            logging.warning(f"No metadata for candidate gene {candidate}, skipping")
-            continue
-
-        replacements.append(candidate)
-        replacement_report.append({
-            'replacement_gene': candidate,
-            'component': candidate_metadata.component,
-            'celltype': candidate_metadata.celltype,
-            'rank_in_candidates': candidates.index(candidate),
-        })
-        logging.info(
-            f"  ✓ Replacement {len(replacements)}/{n_needed}: {candidate} "
-            f"(component={candidate_metadata.component}, celltype={candidate_metadata.celltype})"
-        )
-
-    logging.info(f"")
-    logging.info(f"Replacement statistics:")
-    logging.info(f"  Accepted: {len(replacements)}")
-    logging.info(f"  Skipped (already in panel): {n_skipped}")
-
-    return replacements, replacement_report
-
-
 def _apply_gap_filling(
     base_builder: GeneListBuilder,
     rf_builder: GeneListBuilder,
     dimred_builder: GeneListBuilder,
-    adata: AnnData,
     gap_needed: int,
     target_size: int,
     run_celltype_filling: bool,
-    run_global_filling: bool,
     run_deg_filling: bool,
-    reduction_type: str,
-    analysis_type: str,
-    dimred_method: str,
-    n_components: int,
-    results_dir: str
 ) -> GeneListBuilder:
     """
     Apply gap-filling strategies to reach target panel size.
-    
-    Tries strategies in priority order until target size is reached.
-    Priority order is determined internally based on boolean flags and analysis_type.
-    
+
+    Tries strategies in priority order (celltype-specific, then DEG-based) until
+    the target size is reached.
+
     Parameters
     ----------
     base_builder : GeneListBuilder
@@ -1026,65 +1036,28 @@ def _apply_gap_filling(
         RF component results
     dimred_builder : GeneListBuilder
         Dimred component results
-    adata : AnnData
-        Annotated data matrix
     gap_needed : int
         Number of genes needed to reach target
     target_size : int
         Target panel size
     run_celltype_filling : bool
         Enable celltype-specific filling
-    run_global_filling : bool
-        Enable global gene filling
     run_deg_filling : bool
         Enable DEG-based filling
-    reduction_type : str
-        'nmf' or 'pca'
-    analysis_type : str
-        'per_celltype' or 'global'
-    dimred_method : str
-        'method_a' (top genes by absolute factor loading)
-    n_components : int
-        Number of components
-    results_dir : str
-        Results directory
-        
+
     Returns
     -------
     GeneListBuilder
         Final panel after gap filling
     """
-    
-    # Build gap-filling strategy priority order based on boolean flags and analysis_type
+
+    # Build gap-filling strategy priority order: celltype-specific, then DEG-based
     gap_fill_priority = []
-    
-    if analysis_type == 'per_celltype':
-        # Per-celltype analysis: prefer celltype-specific, then DEG-based
-        if run_celltype_filling:
-            gap_fill_priority.append(GAP_FILL_STRATEGY_CELLTYPE)
-        if run_deg_filling:
-            gap_fill_priority.append(GAP_FILL_STRATEGY_DEG)
-        # Ignore run_global_filling for per-celltype (incompatible)
-        if run_global_filling:
-            logging.warning(
-                f"Global gap-filling is incompatible with per-celltype analysis (analysis_type='{analysis_type}'). "
-                "Ignoring run_global_filling=True."
-            )
-    elif analysis_type == 'global':
-        # Global analysis: prefer global, then DEG-based
-        if run_global_filling:
-            gap_fill_priority.append(GAP_FILL_STRATEGY_GLOBAL)
-        if run_deg_filling:
-            gap_fill_priority.append(GAP_FILL_STRATEGY_DEG)
-        # Ignore run_celltype_filling for global (incompatible)
-        if run_celltype_filling:
-            logging.warning(
-                f"Celltype-specific gap-filling is incompatible with global analysis (analysis_type='{analysis_type}'). "
-                "Ignoring run_celltype_filling=True."
-            )
-    else:
-        raise ValueError(f"Unknown analysis_type: '{analysis_type}'. Expected 'per_celltype' or 'global'.")
-    
+    if run_celltype_filling:
+        gap_fill_priority.append(GAP_FILL_STRATEGY_CELLTYPE)
+    if run_deg_filling:
+        gap_fill_priority.append(GAP_FILL_STRATEGY_DEG)
+
     if not gap_fill_priority:
         logging.warning("All gap-filling strategies disabled. Panel may be smaller than target size if gaps exist.")
     
@@ -1094,7 +1067,8 @@ def _apply_gap_filling(
     current_builder = base_builder
     current_genes = set(current_builder.get_all_genes())
     genes_still_needed = gap_needed
-    
+    strategies_used: List[str] = []  # gap-fill strategies that actually contributed genes
+
     for strategy in gap_fill_priority:
         if genes_still_needed <= 0:
             break
@@ -1109,7 +1083,6 @@ def _apply_gap_filling(
                 current_genes=current_genes,
                 rf_builder=rf_builder,
                 n_needed=genes_still_needed,
-                results_dir=results_dir
             )
             gene_source_label = GENE_SOURCE_GAP_FILL_DEG
         
@@ -1119,23 +1092,9 @@ def _apply_gap_filling(
                 current_genes=current_genes,
                 dimred_builder=dimred_builder,
                 n_needed=genes_still_needed,
-                analysis_type=analysis_type,
             )
             gene_source_label = GENE_SOURCE_GAP_FILL_CELLTYPE
-        
-        elif strategy == GAP_FILL_STRATEGY_GLOBAL and run_global_filling:
-            # Global gene filling: Use global dimred genes
-            gap_genes = _fill_gap_with_global_dimred(
-                current_genes=current_genes,
-                adata=adata,
-                n_needed=genes_still_needed,
-                reduction_type=reduction_type,
-                dimred_method=dimred_method,
-                n_components=n_components,
-                results_dir=results_dir
-            )
-            gene_source_label = GENE_SOURCE_GAP_FILL_GLOBAL
-        
+
         else:
             logging.warning(f"Gap-filling strategy '{strategy}' not enabled or not recognized, skipping")
             continue
@@ -1143,29 +1102,51 @@ def _apply_gap_filling(
         # Add gap-fill genes to builder
         if gap_genes:
             logging.info(f"Gap-filling strategy '{strategy}' provided {len(gap_genes)} genes")
-            
+            n_before = genes_still_needed
+
             for gene in gap_genes:
                 if gene not in current_genes:
+                    # Carry the cell-type attribution the gene had in its source
+                    # component so downstream diagnostics can count gap-fill genes
+                    # per cell type (celltype-fill -> dimred pool, DEG-fill -> RF).
+                    gap_celltype = 'global'
+                    gap_meta = {
+                        'gap_filled': True,
+                        'gap_fill_strategy': GAP_FILL_STRATEGY_DISPLAY_NAMES.get(strategy, strategy),
+                    }
+                    if gene_source_label == GENE_SOURCE_GAP_FILL_CELLTYPE:
+                        rec = dimred_builder.gene_records.get(gene, {})
+                        gap_celltype = rec.get('celltype') or 'global'
+                        gap_meta['n_celltypes_selected'] = rec.get('n_celltypes_selected', 1)
+                        gap_meta['contributing_celltypes'] = rec.get('contributing_celltypes', '')
+                    elif gene_source_label == GENE_SOURCE_GAP_FILL_DEG:
+                        rec = rf_builder.gene_records.get(gene, {})
+                        gap_meta['rf_celltype'] = rec.get('rf_celltype', '')
+                        gap_meta['rf_contributing_celltypes'] = rec.get('rf_contributing_celltypes', '')
+                        gap_meta['rf_celltype_scores'] = rec.get('rf_celltype_scores', '{}')
+
                     current_builder.add_gene(
                         gene_name=gene,
                         gene_source=gene_source_label,
                         rank=None,
                         selection_score=None,
-                        celltype='global',  # Gap-fill genes treated as global
+                        celltype=gap_celltype,
                         component=None,
-                        additional_metadata={'gap_filled': True, 'gap_fill_strategy': strategy}
+                        additional_metadata=gap_meta,
                     )
                     current_genes.add(gene)
                     genes_still_needed -= 1
                     
                     if genes_still_needed <= 0:
                         break
-            
-            logging.info(f"Added {len(gap_genes)} gap-fill genes from '{strategy}'")
+
+            if n_before - genes_still_needed > 0:
+                strategies_used.append(GAP_FILL_STRATEGY_DISPLAY_NAMES.get(strategy, strategy))
+            logging.info(f"Added {n_before - genes_still_needed} gap-fill genes from '{strategy}'")
             logging.info(f"Genes still needed: {genes_still_needed}")
         else:
             logging.warning(f"Gap-filling strategy '{strategy}' found no suitable genes")
-    
+
     if genes_still_needed > 0:
         logging.warning(
             f"Could not fill entire gap: {genes_still_needed} genes still needed after all strategies. "
@@ -1173,9 +1154,12 @@ def _apply_gap_filling(
         )
     
     current_builder.add_metadata('gap_filling_applied', True)
+    current_builder.add_metadata(
+        'gap_filling_strategy', '+'.join(strategies_used) if strategies_used else 'none'
+    )
     current_builder.add_metadata('gap_filled_count', gap_needed - genes_still_needed)
     current_builder.add_metadata('gap_remaining', genes_still_needed)
-    
+
     return current_builder
 
 
@@ -1200,7 +1184,8 @@ def _fill_gap_with_deg(
     # Get all RF genes ranked
     all_rf_genes = rf_builder.get_all_genes()
     
-    # Find genes not in current panel
+    # Use only the precomputed RF-ranked list, and never re-add genes already
+    # present from RF, dimred, force-include, or earlier gap-fill strategies.
     candidates = [g for g in all_rf_genes if g not in current_genes]
     
     # Take top N candidates
@@ -1215,23 +1200,18 @@ def _fill_gap_with_celltype_dimred(
     current_genes: Set[str],
     dimred_builder: GeneListBuilder,
     n_needed: int,
-    analysis_type: str,
 ) -> List[str]:
     """
     Cell-type-specific gap filling: Use per-celltype dimred genes.
-    
+
     This reuses genes from dimred_builder (Phase 2 results) that weren't selected
     in the initial combination. No need to re-run dimred since we already have
     the full ranked list from per-celltype analysis.
     """
-    
+
     logging.info("Cell-type-specific gap filling: Using per-celltype dimred genes")
     logging.info("Reusing ranked genes from Phase 2 dimred_builder (no recomputation needed)")
-    
-    if analysis_type != 'per_celltype':
-        logging.warning("Cannot use celltype-specific filling with global analysis type")
-        return []
-    
+
     # Get all dimred genes ranked
     all_dimred_genes = dimred_builder.get_all_genes()
     
@@ -1246,58 +1226,33 @@ def _fill_gap_with_celltype_dimred(
     return gap_genes
 
 
-def _fill_gap_with_global_dimred(
-    current_genes: Set[str],
-    adata: AnnData,
-    n_needed: int,
-    reduction_type: str,
-    dimred_method: str,
-    n_components: int,
-    results_dir: str
-) -> List[str]:
-    """
-    Global gene gap filling: Run global dimred on-the-fly.
-    
-    NOTE: Unlike celltype-specific filling (which reuses the dimred_builder from
-    Phase 2), global filling MUST run a new dimred analysis because:
-    - If initial analysis was per-celltype, we don't have global dimred results
-    - If initial analysis was global, those genes are already in the panel
-    - Gap-filling needs NEW genes not yet selected
-    
-    Future optimization: Cache global dimred results across runs for reuse.
-    """
-    
-    logging.info("Global gene gap filling: Running global dimred analysis")
-    logging.info("NOTE: Re-running global dimred because initial analysis may have been per-celltype")
-    
-    # Import dimred selection
-    from ._dimred import run_dimred_and_select_genes
-    
-    # Run global dimred
-    global_results = run_dimred_and_select_genes(
-        adata=adata,
-        reduction_type=reduction_type,
-        analysis_type='global',
-        dimred_method=dimred_method,
-        n_components=n_components,
-        probeset_size=n_needed * 2,  # Oversample
-        results_dir=os.path.join(results_dir, 'global_dimred_gap_fill')
-    )
-    
-    # Get candidate genes
-    if isinstance(global_results, GeneListBuilder):
-        candidates = global_results.get_all_genes()
-    elif isinstance(global_results, dict):
-        candidates = global_results.get('selected_genes', [])
-    else:
-        candidates = []
-    
-    # Filter out genes already in panel
-    gap_genes = [g for g in candidates if g not in current_genes][:n_needed]
-    
-    logging.info(f"Found {len(gap_genes)} global dimred gap-fill genes")
-    
-    return gap_genes
+# Priority order for the panel-row (in_panel=True) section of RecoVar_panel_information.csv's
+# sort key: RF-derived sources first, then dimred, then force-include, then the two gap-fill
+# variants. Any gene_source not listed here (shouldn't happen) sorts last.
+_PANEL_GENE_SOURCE_PRIORITY = {
+    GENE_SOURCE_RF: 0,
+    GENE_SOURCE_OVERLAP_TO_RF: 0,
+    GENE_SOURCE_DIMRED: 1,
+    GENE_SOURCE_FORCE_INCLUDE: 2,
+    GENE_SOURCE_GAP_FILL_DEG: 3,
+    GENE_SOURCE_GAP_FILL_CELLTYPE: 3,
+}
+
+# Priority order for the non-panel-row (in_panel=False) section: random-forest-pool candidates
+# before NMF/PCA-pool candidates.
+_NON_PANEL_POOL_PRIORITY = {'random forest': 0, 'NMF': 1}
+
+# Display-only rename applied to RecoVar_panel_information.csv's gene_source column as
+# the very last step of _build_panel_information(), after sorting -- internal identifiers
+# (GENE_SOURCE_* constants, combined_builder.gene_records, gap-fill logic) are untouched;
+# only the written CSV's string values change. force_include is intentionally left as-is.
+_GENE_SOURCE_DISPLAY_RENAME = {
+    GENE_SOURCE_RF: 'random forest',
+    GENE_SOURCE_DIMRED: 'NMF',
+    GENE_SOURCE_OVERLAP_TO_RF: 'overlap',
+    GENE_SOURCE_GAP_FILL_CELLTYPE: 'gap-fill (NMF)',
+    GENE_SOURCE_GAP_FILL_DEG: 'gap-fill (random forest)',
+}
 
 
 def _save_combination_results(
@@ -1312,14 +1267,17 @@ def _save_combination_results(
     Save combination strategy results.
 
     Output files:
-    1. ranked_gene_list.csv   - All combined genes with full metadata;
-                                panel genes (in_panel=True) first, ranked by score.
-                                Component genes not selected into the panel follow below.
-                                Note: the per-component ranked lists (which include ALL
-                                Xenium-passing genes from each component) are already saved
-                                by run_single_selection inside rf_component/ and
-                                {reduction}_component/ subdirectories.
-    2. combination_summary.json - Summary statistics including duplicate-resolution counts.
+    1. RecoVar_panel_information.csv - Every gene considered during combination (union of the
+                                RF and dimred candidate pools plus the final panel), with
+                                panel membership (`in_panel`) and per-gene RF/NMF provenance.
+                                Panel genes are listed first. Note: the per-component ranked
+                                lists (which include ALL Xenium-passing candidates from each
+                                component) are already saved by run_single_selection inside
+                                rf_component/ and {reduction}_component/ subdirectories.
+    2. combination_summary.json - Summary statistics including duplicate-resolution counts
+                                and the combined-panel size status (`panel_size_status`
+                                `complete`/`short` + `short_panel_reason`), matching the
+                                per-component `filtering_summary.json` fields.
     """
 
     os.makedirs(results_dir, exist_ok=True)
@@ -1329,43 +1287,28 @@ def _save_combination_results(
     logging.info("SAVING COMBINATION RESULTS")
     logging.info("=" * 80)
 
-    # 1. Unified ranked gene list -------------------------------------------
-    #    All genes in the combined builder, panel genes first.
-    #    The combination builder contains genes from both components that survived
-    #    Xenium filtering in their respective single runs.
-    combined_df = combined_builder.to_dataframe()
-
-    # Add in_panel indicator as the second column
-    combined_df.insert(1, 'in_panel', combined_df['final_selection'].fillna(False))
-
-    # Panel genes first, then remaining; within each group sort by rank
-    combined_df = combined_df.sort_values(
-        ['in_panel', 'rank'],
-        ascending=[False, True],
-    ).reset_index(drop=True)
-
-    ranked_output = os.path.join(results_dir, 'ranked_gene_list.csv')
-    combined_df.to_csv(ranked_output, index=False)
-    n_panel  = int(combined_df['in_panel'].sum())
-    n_remain = len(combined_df) - n_panel
+    # 1. Panel information -----------------------------------------------------
+    panel_info_df = _build_panel_information(rf_builder, dimred_builder, combined_builder)
+    panel_info_output = os.path.join(results_dir, 'RecoVar_panel_information.csv')
+    panel_info_df.to_csv(panel_info_output, index=False)
+    n_panel = int(panel_info_df['in_panel'].sum())
     logging.info(
-        f"✓ Saved ranked_gene_list.csv: "
-        f"{n_panel} panel genes + {n_remain} remaining genes ({len(combined_df)} total)"
+        f"✓ Saved RecoVar_panel_information.csv: {n_panel} panel genes, "
+        f"{len(panel_info_df)} genes tracked total"
     )
 
     # 2. Combination summary JSON -------------------------------------------
-    # Count duplicate-resolution events from in-memory replacement report
-    # (stored in combined_builder metadata if available).
-    n_replacements = combined_builder.metadata.get('n_dimred_replacements', 0)
-
     summary = {
         'strategy': strategy,
         'reduction_type': reduction_type,
         'rf_component_genes': len(rf_builder.get_all_genes()),
         'dimred_component_genes': len(dimred_builder.get_all_genes()),
         'combined_panel_size': n_panel,
+        'requested_panel_size': combined_builder.metadata.get('requested_panel_size'),
+        'final_panel_size': combined_builder.metadata.get('final_panel_size', n_panel),
+        'panel_size_status': combined_builder.metadata.get('panel_size_status'),
+        'short_panel_reason': combined_builder.metadata.get('short_panel_reason'),
         'n_overlapping_genes': combined_builder.metadata.get('n_overlapping', 0),
-        'n_dimred_replacements': n_replacements,
         'gap_filling_applied': combined_builder.metadata.get('gap_filling_applied', False),
         'gap_filling_strategy': combined_builder.metadata.get('gap_filling_strategy', 'none'),
         'metadata': combined_builder.metadata,
@@ -1379,4 +1322,409 @@ def _save_combination_results(
 
     logging.info(f"✓ All combination results saved to: {results_dir}")
 
+
+def _build_panel_information(
+    rf_builder: GeneListBuilder,
+    dimred_builder: GeneListBuilder,
+    combined_builder: GeneListBuilder,
+) -> pd.DataFrame:
+    """
+    Build the RecoVar_panel_information.csv table: every gene considered during combination
+    (union of the RF candidate pool, the dimred candidate pool, and the final panel), with
+    panel membership and per-gene RF/NMF provenance. This is the sole combination-strategy
+    output — it replaces both the former panel-only `ranked_gene_list.csv` and the former
+    `gene_provenance.csv`.
+
+    Covers the union of the RF candidate pool, the dimred candidate pool, and the final panel
+    (the last is a superset guard for force-include / global-dimred-gap-fill genes that never
+    passed through the RF or dimred component builders).
+
+    `primary_celltype` uses a value-based fallback: a gene's real RF cell-type attribution
+    (`rf_celltype`) wins whenever present, falling back to NMF's `celltype` only when RF has
+    nothing usable for that gene — not merely when the gene isn't in the RF pool at all.
+    `secondary_celltypes_nmf` / `n_celltypes_nmf` / `mean_expression` all follow whichever
+    builder `primary_celltype` was actually resolved from.
+
+    Args:
+        rf_builder: RF component results (filtered).
+        dimred_builder: Dimred component results (filtered).
+        combined_builder: Final combined panel builder.
+
+    Returns:
+        DataFrame with columns: gene, in_panel, gene_source, informative_celltypes,
+        primary_celltype, secondary_celltypes_nmf, n_celltypes_nmf, gap_filled,
+        gap_fill_strategy, mean_expression. Panel genes (in_panel=True) sorted first by
+        gene_source priority then gap_filled; non-panel genes sorted by candidate-pool
+        priority then gene name.
+    """
+    rf_genes = set(rf_builder.get_all_genes())
+    dimred_genes = set(dimred_builder.get_all_genes())
+    panel_genes = set(combined_builder.get_all_genes())
+
+    all_genes = sorted(rf_genes | dimred_genes | panel_genes)
+
+    records = []
+    for gene in all_genes:
+        in_rf = gene in rf_genes
+        in_dimred = gene in dimred_genes
+        in_panel = gene in panel_genes
+
+        rf_rec = rf_builder.gene_records.get(gene, {})
+        dimred_rec = dimred_builder.gene_records.get(gene, {})
+        panel_rec = combined_builder.gene_records.get(gene, {})
+
+        if in_panel:
+            gene_source = panel_rec.get('gene_source')
+        elif in_rf or in_dimred:
+            gene_source = 'random forest' if in_rf else 'NMF'
+        else:
+            gene_source = ''  # panel_only candidates are always in_panel=True; unreachable
+
+        rf_celltype = rf_rec.get('rf_celltype') or None
+        if rf_celltype:
+            primary_celltype = rf_celltype
+            resolved_from = 'rf'
+        else:
+            primary_celltype = dimred_rec.get('celltype') or None
+            resolved_from = 'dimred' if primary_celltype else None
+
+        if resolved_from == 'dimred':
+            secondary_celltypes_nmf = dimred_rec.get('contributing_celltypes') or ''
+            n_celltypes_nmf = dimred_rec.get('n_celltypes_selected')
+            mean_expression = dimred_rec.get('mean_expression')
+        elif resolved_from == 'rf':
+            secondary_celltypes_nmf = ''
+            n_celltypes_nmf = None
+            mean_expression = rf_rec.get('mean_expression')
+        else:
+            secondary_celltypes_nmf = ''
+            n_celltypes_nmf = None
+            mean_expression = None
+
+        informative_parts = [primary_celltype] if primary_celltype else []
+        if secondary_celltypes_nmf:
+            informative_parts += [
+                ct for ct in secondary_celltypes_nmf.split(', ') if ct
+            ]
+        informative_celltypes = '|'.join(dict.fromkeys(informative_parts))
+
+        gap_filled = bool(panel_rec.get('gap_filled', False)) if in_panel else False
+        gap_fill_strategy = (panel_rec.get('gap_fill_strategy') or '') if in_panel else ''
+
+        records.append({
+            'gene': gene,
+            'in_panel': in_panel,
+            'gene_source': gene_source,
+            'informative_celltypes': informative_celltypes,
+            'primary_celltype': primary_celltype,
+            'secondary_celltypes_nmf': secondary_celltypes_nmf,
+            'n_celltypes_nmf': n_celltypes_nmf,
+            'gap_filled': gap_filled,
+            'gap_fill_strategy': gap_fill_strategy,
+            'mean_expression': mean_expression,
+        })
+
+    df = pd.DataFrame.from_records(records)
+
+    panel_mask = df['in_panel']
+    df_panel = df[panel_mask].copy()
+    df_other = df[~panel_mask].copy()
+
+    df_panel['_source_rank'] = df_panel['gene_source'].map(_PANEL_GENE_SOURCE_PRIORITY).fillna(99)
+    df_panel = df_panel.sort_values(
+        ['_source_rank', 'gap_filled'], ascending=[True, True]
+    ).drop(columns='_source_rank')
+
+    df_other['_pool_rank'] = df_other['gene_source'].map(_NON_PANEL_POOL_PRIORITY).fillna(99)
+    df_other = df_other.sort_values(
+        ['_pool_rank', 'gene'], ascending=[True, True]
+    ).drop(columns='_pool_rank')
+
+    result = pd.concat([df_panel, df_other], ignore_index=True)
+    # Display-only rename, applied last so it never affects the sort above (which keys
+    # off the real internal GENE_SOURCE_* identifiers). Non-panel rows' pool labels
+    # ("random forest" / "NMF") are already display strings and pass through unchanged.
+    result['gene_source'] = result['gene_source'].replace(_GENE_SOURCE_DISPLAY_RENAME)
+    return result
+
+
+# gene_source values (panel rows only) attributed to each side of the RF/dimred split,
+# for the dotplot's source-colored gene labels -- matches the DEG_SOURCES/NMF_SOURCES
+# categorization Analysis-scripts/pipeline/plot_recovar_selection.py used to apply
+# separately, after evaluation preprocessing. rf_simple is not included: combination
+# strategies always use rf_deg for their RF component, never rf_simple.
+# NOTE: these are the DISPLAY strings (post _GENE_SOURCE_DISPLAY_RENAME), since this
+# reads the just-written RecoVar_panel_information.csv back from disk, not the internal
+# GENE_SOURCE_* identifiers.
+_DOTPLOT_RF_SOURCES = {'random forest', 'overlap', 'gap-fill (random forest)'}
+_DOTPLOT_DIMRED_SOURCES = {'NMF', 'gap-fill (NMF)'}
+
+
+def _build_per_celltype_gene_lists(
+    panel_df: pd.DataFrame,
+    adata: AnnData,
+    celltype_column: str,
+    rf_component_df: Optional[pd.DataFrame],
+    dimred_component_df: Optional[pd.DataFrame],
+) -> tuple[dict[str, list[str]], list[str]]:
+    """For each cell type, list every panel gene whose own selection round -- random
+    forest's or NMF's, per the gene's ``gene_source`` -- implicated that cell type, as
+    a flat list (no primary/secondary tiering).
+
+    Cell-type membership is read from the RF/NMF component files (``rf_celltype`` /
+    ``rf_celltype_scores`` in ``rf_component_df``, ``celltype`` / ``informative_celltypes``
+    in ``dimred_component_df``) rather than the combined CSV's ``primary_celltype`` /
+    ``secondary_celltypes_nmf`` columns -- those apply a value-based fallback where RF's
+    attribution always overwrites NMF's for any gene that also happens to appear in RF's
+    full (oversampled) candidate pool, which silently discards NMF's often much richer,
+    genuinely-per-celltype-fit attribution. NMF is fit *independently per cell type*
+    (see ``Selection-module/CLAUDE.md``), so every cell type in a gene's
+    ``informative_celltypes`` is a cell type whose own fit selected that gene -- not a
+    lesser "secondary" relationship, just one that didn't happen to win the shared
+    factor slot during duplicate resolution.
+
+    Routing by ``gene_source``:
+    - ``'random forest'`` / ``'gap-fill (random forest)'``: RF's own membership set.
+    - ``'NMF'`` / ``'gap-fill (NMF)'``: NMF's own membership set.
+    - ``'overlap'``: the union of both -- selected independently by both methods, so
+      both methods' evidence counts. A gene can then legitimately land on more than
+      one cell type's plot for reasons neither method alone would explain.
+    - ``'force_include'``, or a gene missing from the relevant component file(s):
+      falls back to the combined CSV's own ``informative_celltypes`` (e.g. an
+      older-format results dir missing a component file); if that's also empty, the
+      gene is unattributed.
+
+    RF's membership set = ``{rf_celltype}`` (the Gini-importance argmax) plus every
+    other cell type in ``rf_celltype_scores`` (a JSON dict) with share >=
+    ``RF_CONTRIBUTING_CELLTYPE_MIN_SHARE`` -- usually empty in practice, since real
+    RF-selected genes' shares are typically sharply peaked on the argmax. NMF's
+    membership set = ``{celltype}`` union ``informative_celltypes.split('|')``.
+
+    Cell types are ordered by descending cell count (matching the convention used by
+    the cells-per-celltype bar chart); a cell-type name not in that vocabulary is
+    appended after. Gene order within each cell type's list follows ``panel_df``'s own
+    row order (already ``gene_source``-priority sorted).
+
+    Returns a ``(per_celltype, unattributed)`` pair: ``per_celltype`` maps each cell
+    type with >=1 gene to its flat gene list; ``unattributed`` is the list of panel
+    genes with no resolvable cell-type membership at all. Returns ``({}, [])`` if
+    ``panel_df`` doesn't have a ``gene_source`` column (e.g. an older-format CSV).
+    """
+    if 'gene_source' not in panel_df.columns:
+        return {}, []
+
+    celltype_order = adata.obs[celltype_column].value_counts().index.tolist()
+
+    rf_by_gene = rf_component_df.set_index('gene') if rf_component_df is not None else None
+    dimred_by_gene = dimred_component_df.set_index('gene') if dimred_component_df is not None else None
+
+    def _rf_membership(gene: str) -> set:
+        if rf_by_gene is None or gene not in rf_by_gene.index:
+            return set()
+        row = rf_by_gene.loc[gene]
+        rf_celltype = str(row.get('rf_celltype') or '').strip()
+        members = {rf_celltype} if rf_celltype else set()
+        scores_raw = row.get('rf_celltype_scores')
+        if isinstance(scores_raw, str) and scores_raw.strip():
+            try:
+                scores = json.loads(scores_raw)
+                members |= {
+                    ct for ct, share in scores.items()
+                    if share >= RF_CONTRIBUTING_CELLTYPE_MIN_SHARE
+                }
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+        return members
+
+    def _dimred_membership(gene: str) -> set:
+        if dimred_by_gene is None or gene not in dimred_by_gene.index:
+            return set()
+        row = dimred_by_gene.loc[gene]
+        celltype = str(row.get('celltype') or '').strip()
+        members = {celltype} if celltype else set()
+        informative_raw = str(row.get('informative_celltypes') or '').strip()
+        if informative_raw:
+            members |= {c.strip() for c in informative_raw.split('|') if c.strip()}
+        return members
+
+    membership: dict[str, list[str]] = {ct: [] for ct in celltype_order}
+    unattributed: list[str] = []
+
+    for _, row in panel_df.iterrows():
+        gene = row['gene']
+        gene_source = str(row.get('gene_source') or '')
+
+        if gene_source in ('random forest', 'gap-fill (random forest)'):
+            members = _rf_membership(gene)
+        elif gene_source in ('NMF', 'gap-fill (NMF)'):
+            members = _dimred_membership(gene)
+        elif gene_source == 'overlap':
+            members = _rf_membership(gene) | _dimred_membership(gene)
+        else:
+            members = set()
+
+        if not members:
+            # Graceful fallback to the combined CSV's own informative_celltypes
+            # (covers force_include, missing component files, older-format CSVs).
+            informative_raw = str(row.get('informative_celltypes') or '').strip()
+            if informative_raw:
+                members = {c.strip() for c in informative_raw.split('|') if c.strip()}
+
+        if not members:
+            unattributed.append(gene)
+            continue
+
+        for ct in members:
+            membership.setdefault(ct, []).append(gene)
+
+    result = {ct: genes for ct, genes in membership.items() if genes}
+    return result, unattributed
+
+
+def _generate_combination_dotplot(
+    adata: AnnData,
+    results_dir: str,
+    celltype_column: str,
+    output_dir: str,
+    reduction_type: str,
+) -> None:
+    """Generate one final-gene expression dotplot per cell type, right after panel
+    construction.
+
+    Reads back the just-written ``RecoVar_panel_information.csv`` from
+    ``results_dir``, plus the RF and dimred component files
+    (``rf_component/rf_deg_panel_information.csv``,
+    ``{reduction_type}_component/{reduction_type}_panel_information.csv``), and calls
+    ``Plotting-module``'s ``plot_final_gene_dotplot()`` once per cell type (via
+    ``_build_per_celltype_gene_lists``), directly from the selection pipeline, using
+    the same ``adata`` already in memory -- no dependency on Evaluation-module
+    preprocessing (which this used to wait on, via the standalone
+    ``Analysis-scripts/pipeline/plot_recovar_selection.py`` driver run after a full
+    evaluation cell completed). Each cell type's plot shows a flat list of every gene
+    whose own selection round (RF's or NMF's) implicated that cell type -- replacing
+    the old single whole-panel dotplot that mechanically chunked by gene count. Plots
+    are written to ``output_dir``, which may differ from ``results_dir`` (e.g. a
+    caller-managed ``plots/`` tree, kept separate from the gene-list CSVs). Non-fatal:
+    a plotting failure is logged and swallowed rather than failing the selection run;
+    a missing/unreadable component file degrades gracefully (see
+    ``_build_per_celltype_gene_lists``) rather than aborting the whole plot.
+    """
+    panel_info_path = os.path.join(results_dir, 'RecoVar_panel_information.csv')
+    if not os.path.exists(panel_info_path):
+        return
+    if celltype_column not in adata.obs.columns:
+        logging.warning(
+            f"Skipping final-gene dotplot: celltype column '{celltype_column}' "
+            f"not found in adata.obs"
+        )
+        return
+
+    try:
+        import sys as _sys2
+        _plotting_dir = str(Path(__file__).parent.parent / "Plotting-module")
+        if _plotting_dir not in _sys2.path:
+            _sys2.path.insert(0, _plotting_dir)
+        from _selection_plots import plot_final_gene_dotplot, _order_genes_by_celltype_contribution
+
+        panel_df = pd.read_csv(panel_info_path)
+        panel_df = panel_df[panel_df['in_panel'].fillna(False).astype(bool)]
+        src = panel_df['gene_source'].astype(str)
+        deg_gene_set = set(panel_df.loc[src.isin(_DOTPLOT_RF_SOURCES), 'gene'])
+        nmf_gene_set = set(panel_df.loc[src.isin(_DOTPLOT_DIMRED_SOURCES), 'gene'])
+
+        rf_component_df = None
+        rf_component_path = os.path.join(results_dir, 'rf_component', 'rf_deg_panel_information.csv')
+        try:
+            if os.path.exists(rf_component_path):
+                rf_component_df = pd.read_csv(rf_component_path)
+        except Exception as exc:
+            logging.warning(f"Could not read RF component file for dotplot attribution (non-fatal): {exc}")
+
+        dimred_component_df = None
+        try:
+            dimred_filename = panel_information_filename('dimred_only', reduction_type)
+            dimred_component_path = os.path.join(
+                results_dir, f'{reduction_type}_component', dimred_filename
+            )
+            if os.path.exists(dimred_component_path):
+                dimred_component_df = pd.read_csv(dimred_component_path)
+        except Exception as exc:
+            logging.warning(f"Could not read dimred component file for dotplot attribution (non-fatal): {exc}")
+
+        per_celltype, unattributed = _build_per_celltype_gene_lists(
+            panel_df, adata, celltype_column, rf_component_df, dimred_component_df
+        )
+
+        os.makedirs(output_dir, exist_ok=True)
+        n_plotted = 0
+        for ct, ct_genes in per_celltype.items():
+            ct_genes = _order_genes_by_celltype_contribution(adata, ct_genes, celltype_column, ct)
+            plot_final_gene_dotplot(
+                adata=adata,
+                probeset_genes=ct_genes,
+                deg_genes=[g for g in ct_genes if g in deg_gene_set],
+                nmf_genes=[g for g in ct_genes if g in nmf_gene_set],
+                groupby=celltype_column,
+                output_path=output_dir,
+                filename_prefix=re.sub(r'[^A-Za-z0-9]+', '_', ct).strip('_') or 'unknown',
+                title=f"Panel genes for {ct}",
+            )
+            n_plotted += 1
+
+        if unattributed:
+            plot_final_gene_dotplot(
+                adata=adata,
+                probeset_genes=unattributed,
+                deg_genes=[g for g in unattributed if g in deg_gene_set],
+                nmf_genes=[g for g in unattributed if g in nmf_gene_set],
+                groupby=celltype_column,
+                output_path=output_dir,
+                filename_prefix='unattributed',
+                title="Panel genes with no cell-type attribution",
+            )
+            n_plotted += 1
+
+        logging.info(f"✓ Saved {n_plotted} per-celltype final-gene dotplots to: {output_dir}")
+    except Exception as exc:  # never let a diagnostic plot fail the selection run
+        logging.warning(f"final-gene dotplot generation failed (non-fatal): {exc}")
+
+
+def _generate_expression_distribution_plot(
+    adata: AnnData,
+    results_dir: str,
+    output_dir: str,
+) -> None:
+    """Generate the panel-gene raw-vs-lognorm expression distribution histogram.
+
+    Reads back the just-written ``RecoVar_panel_information.csv`` from ``results_dir``
+    to get the panel gene list, and calls ``Plotting-module``'s
+    ``plot_panel_expression_distribution()`` directly from the selection pipeline,
+    using the same ``adata`` already in memory (both ``adata.layers['counts']`` and
+    ``adata.X`` are needed -- raw and log-normalized respectively). Non-fatal: a
+    plotting failure is logged and swallowed rather than failing the selection run.
+    """
+    panel_info_path = os.path.join(results_dir, 'RecoVar_panel_information.csv')
+    if not os.path.exists(panel_info_path):
+        return
+
+    try:
+        import sys as _sys3
+        _plotting_dir = str(Path(__file__).parent.parent / "Plotting-module")
+        if _plotting_dir not in _sys3.path:
+            _sys3.path.insert(0, _plotting_dir)
+        from _selection_plots import plot_panel_expression_distribution
+
+        panel_df = pd.read_csv(panel_info_path)
+        panel_genes = panel_df.loc[
+            panel_df['in_panel'].fillna(False).astype(bool), 'gene'
+        ].tolist()
+
+        os.makedirs(output_dir, exist_ok=True)
+        plot_panel_expression_distribution(
+            adata=adata,
+            panel_genes=panel_genes,
+            output_dir=output_dir,
+        )
+    except Exception as exc:  # never let a diagnostic plot fail the selection run
+        logging.warning(f"panel expression-distribution plot generation failed (non-fatal): {exc}")
 

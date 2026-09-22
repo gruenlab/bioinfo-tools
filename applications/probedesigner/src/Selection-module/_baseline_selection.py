@@ -2,9 +2,6 @@
 
 This module provides simple baseline selection strategies using highly variable genes
 or random selection. Uses GeneListBuilder for unified output format.
-
-Author: Refactored from _selection.py
-Date: 2026-02-08
 """
 
 from __future__ import annotations
@@ -14,13 +11,20 @@ import os
 from typing import Optional
 
 import numpy as np
-import pandas as pd
 import scanpy as sc
 from anndata import AnnData
 
 # Use absolute imports (for script execution)
-from _constants import COL_GENE, COL_RANK, COL_SELECTION_SCORE, DEFAULT_PROBESET_SIZE
-from _gene_list_builder import GeneListBuilder
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
+from _constants import DEFAULT_PROBESET_SIZE
+from _gene_list_builder import GeneListBuilder, panel_information_filename
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +81,7 @@ def select_highly_variable_genes(
         # Guard against infinity values that can arise from expm1 overflow on
         # very large log-normalised counts — replace with the finite max so
         # scanpy's binning step doesn't crash.
-        import scipy.sparse, numpy as np
+        import scipy.sparse
         if scipy.sparse.issparse(adata_hvg.X):
             adata_hvg.X = adata_hvg.X.toarray()
         inf_mask = ~np.isfinite(adata_hvg.X)
@@ -145,7 +149,7 @@ def select_highly_variable_genes(
         os.makedirs(results_dir, exist_ok=True)
 
         # Save selected genes
-        builder.to_csv(os.path.join(results_dir, "selected_genes.csv"))
+        builder.to_csv(os.path.join(results_dir, panel_information_filename("hvg")))
 
         # Save HVG statistics
         hvg_stats_file = os.path.join(results_dir, f"hvg_statistics_{probeset_size}genes.csv")
@@ -239,133 +243,7 @@ def select_random_genes(
     # Save results if directory provided
     if results_dir:
         os.makedirs(results_dir, exist_ok=True)
-        builder.to_csv(os.path.join(results_dir, "selected_genes.csv"))
+        builder.to_csv(os.path.join(results_dir, panel_information_filename("random")))
 
     logger.info(f"Random gene selection complete: {len(selected_genes)} genes")
-    return builder
-
-
-def select_random_genes_bootstrap(
-    adata: AnnData,
-    probeset_size: int = DEFAULT_PROBESET_SIZE,
-    n_bootstrap: int = 10,
-    random_state: int = 42,
-    results_dir: Optional[str] = None,
-) -> GeneListBuilder:
-    """Select random genes with bootstrap resampling for robustness analysis.
-
-    Generates multiple random gene sets to assess variability. Genes are ranked
-    by selection frequency across bootstrap iterations. This method is useful for
-    showing that random selection is unstable compared to informed methods.
-
-    Args:
-        adata: Annotated data matrix
-        probeset_size: Target number of genes per set
-        n_bootstrap: Number of random gene sets to generate
-        random_state: Base random seed (uses random_state + i for each bootstrap)
-        results_dir: Directory to save results (optional)
-
-    Returns:
-        GeneListBuilder with:
-            - selected_genes: Top N genes by bootstrap frequency
-            - selection_score: Bootstrap selection frequency (0.0-1.0)
-            - rank: Rank by frequency (ties broken randomly)
-            - metadata: {'selection_count': int, 'n_bootstrap': int}
-
-    Examples:
-        >>> builder = select_random_genes_bootstrap(adata, n_bootstrap=100)
-        >>> genes = builder.get_selected_genes()
-        >>> df = builder.to_dataframe()
-        >>> # Check bootstrap frequency
-        >>> print(df[df['selected']]['selection_score'].describe())
-    """
-    logger.info("=== Random Gene Selection with Bootstrap ===")
-    logger.info(f"Target probeset size: {probeset_size}")
-    logger.info(f"Bootstrap iterations: {n_bootstrap}")
-
-    # Initialize GeneListBuilder
-    builder = GeneListBuilder(
-        strategy_name="random_bootstrap",
-        analysis_type="global",
-    )
-
-    all_genes = adata.var_names.tolist()
-
-    if len(all_genes) < probeset_size:
-        raise ValueError(f"Not enough genes ({len(all_genes)}) for size {probeset_size}")
-
-    bootstrap_gene_sets = []
-
-    for bootstrap_idx in range(n_bootstrap):
-        seed = random_state + bootstrap_idx
-        np.random.seed(seed)
-
-        selected_genes = np.random.choice(
-            all_genes,
-            size=probeset_size,
-            replace=False,
-        ).tolist()
-
-        bootstrap_gene_sets.append(selected_genes)
-        logger.info(f"Bootstrap {bootstrap_idx + 1}/{n_bootstrap}: {len(selected_genes)} genes (seed={seed})")
-
-    # Calculate gene selection frequency
-    gene_counts = {}
-    for gene_set in bootstrap_gene_sets:
-        for gene in gene_set:
-            gene_counts[gene] = gene_counts.get(gene, 0) + 1
-
-    gene_freq_df = pd.DataFrame(
-        [
-            {
-                "gene": gene,
-                "selection_count": count,
-                "selection_frequency": count / n_bootstrap,
-            }
-            for gene, count in gene_counts.items()
-        ]
-    ).sort_values("selection_count", ascending=False)
-
-    # Log statistics
-    logger.info(f"Total unique genes across bootstraps: {len(gene_freq_df)}")
-    logger.info(f"Genes selected once: {len(gene_freq_df[gene_freq_df['selection_count'] == 1])}")
-    logger.info(f"Max selection count: {gene_freq_df['selection_count'].max()}")
-
-    # Add all genes to builder, ranked by frequency
-    for rank, (_, row) in enumerate(gene_freq_df.iterrows(), start=1):
-        gene = row["gene"]
-        selection_score = row["selection_frequency"]
-        selection_count = int(row["selection_count"])
-
-        builder.add_gene(
-            gene=gene,
-            selection_score=selection_score,
-            rank=rank,
-            metadata={
-                "selection_count": selection_count,
-                "n_bootstrap": n_bootstrap,
-                "random_state": random_state,
-            },
-        )
-
-        # Mark top N genes as selected
-        if rank <= probeset_size:
-            builder.mark_selected(gene)
-
-    # Save results if directory provided
-    if results_dir:
-        os.makedirs(results_dir, exist_ok=True)
-
-        # Save selected genes
-        builder.to_csv(os.path.join(results_dir, "selected_genes.csv"))
-
-        # Also save detailed frequency info
-        freq_file = os.path.join(
-            results_dir,
-            f"gene_selection_frequency_{probeset_size}genes_{n_bootstrap}bootstraps.csv",
-        )
-        gene_freq_df.to_csv(freq_file, index=False)
-        logger.info(f"Saved gene selection frequency to {freq_file}")
-
-    logger.info(f"Bootstrap selection complete: {len(builder.get_selected_genes())} genes")
     return builder

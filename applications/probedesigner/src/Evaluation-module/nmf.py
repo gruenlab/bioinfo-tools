@@ -14,12 +14,18 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 import scipy.sparse
-from sklearn.decomposition import non_negative_factorization  # still used by cNMF path
 from nico2_lib.predictors._nmf._nmf_pred import NmfPredictor
 from tqdm import tqdm
 
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+from _constants import NMF_PREDICTOR_FIXED_KWARGS
 from metrics import calculate_explained_variance, calculate_mse
 from metrics import (
     calculate_macro_explained_variance,
@@ -33,15 +39,9 @@ from metrics import (
 logger = logging.getLogger(__name__)
 
 _UTILITY_DIR = Path(__file__).parent.parent / "Utility-module"
-if _UTILITY_DIR.exists():
-    sys.path.insert(0, str(_UTILITY_DIR))
-try:
-    from _validation import is_anndata_raw_layer, is_anndata_raw  # type: ignore[import]
-except ImportError:
-    def is_anndata_raw_layer(adata, layer_name: str) -> bool:  # type: ignore[misc]
-        return True
-    def is_anndata_raw(adata) -> bool:  # type: ignore[misc]
-        return True
+sys.path.insert(0, str(_UTILITY_DIR))
+from _validation import is_anndata_raw_layer, is_anndata_raw  # type: ignore[import]
+from _nmf_objective import resolve_nmf_objective
 
 __all__ = [
     "nmf_reconstruction",
@@ -55,17 +55,13 @@ def nmf_reconstruction(
     A_train: np.ndarray,
     A_test: np.ndarray,
     n_components: int = 5,
-    max_iter: int = 1000,
     random_state: int = 42,
     cached_full_nmf: dict[str, Any] | None = None,
-    # cNMF options
-    use_consensus_nmf: bool = False,
-    cnmf_k_values: list[int] | None = None,
-    cnmf_n_iter: int = 100,
-    cnmf_max_iter: int = 1000,
-    cnmf_k_selection_method: str = "elbow",
-    cnmf_density_threshold: float = 0.5,
-    cnmf_local_neighborhood_size: float = 0.30,
+    expvar_mode: str = "global_mean",
+    expvar_modes: list[str] | None = None,
+    gene_subsets: list[str] | None = None,
+    nmf_counts_input: str = "raw",
+    nmf_objective: str = "auto",
 ) -> dict[str, Any]:
     """Evaluate how well a probe gene subset can represent the full transcriptome.
 
@@ -90,8 +86,8 @@ def nmf_reconstruction(
         )
         return w_query @ h_reference
 
-    H is **always fixed** to the probe-gene slice from the training fit. The solve is
-    constrained, not free — this is the key distinction from the pre-refactor bug.
+    H is **always fixed** to the probe-gene slice from the training fit: the solve is
+    constrained (only W is estimated), never a fresh unconstrained NMF on the probe subset.
 
     Following scikit-learn convention:
         - A (samples/cells × features/genes): Data matrix
@@ -103,20 +99,40 @@ def nmf_reconstruction(
         probeset_genes: List of genes in the probeset to evaluate.
         A_train: Pre-split training data (cells × genes).
         A_test: Pre-split testing data (cells × genes).
-        n_components: Number of NMF components to use (ignored if use_consensus_nmf=True).
-        max_iter: Maximum number of iterations for standard NMF optimization.
+        n_components: Number of NMF components to use.
         random_state: Random state for reproducibility.
         cached_full_nmf: Pre-computed full NMF results to avoid recomputation.
-        use_consensus_nmf: If True, use consensus NMF instead of standard NMF (more stable but slower).
-        cnmf_k_values: List of K values to test for cNMF. If None, uses range around n_components.
-        cnmf_n_iter: Number of independent NMF runs for consensus (default: 100).
-        cnmf_max_iter: Max optimization iterations per cNMF run (default: 1000, matches standard NMF).
-        cnmf_k_selection_method: Method for automatic K selection ("silhouette" or "elbow").
-        cnmf_density_threshold: Density threshold for filtering outlier spectra (default: 0.5).
-        cnmf_local_neighborhood_size: Local neighborhood size for density calculation (default: 0.30).
+        expvar_mode: Explained-variance aggregation mode passed to
+            ``metrics.calculate_explained_variance`` (see ``metrics.EXPVAR_MODES``).
+            Defaults to ``"global_mean"``.
+        expvar_modes: Optional list of explained-variance aggregation modes to
+            additionally report (e.g. ``["global_mean", "variance_weighted_sum",
+            "mean"]``). When given, adds ``expvar_test_probe_{subset}_{mode}``
+            (and the ``expvar_*_baseline_{mode}`` counterpart) to the result for
+            every ``(subset, mode)`` pair, on top of the unsuffixed keys (which are
+            always computed from ``expvar_mode`` alone, unchanged). Defaults to
+            ``None``, i.e. ``[expvar_mode]`` — no extra columns.
+        gene_subsets: Optional list of gene subsets to score the probe
+            reconstruction against: ``"all_genes"`` (default),
+            ``"panel_genes_only"``, ``"non_panel_genes_only"``. This does
+            **not** change what is reconstructed (always the full
+            transcriptome, exactly as before) — it is a scoring-time column
+            mask applied to the already-computed reconstruction, identical to
+            ``Analysis-scripts/pipeline/run_expvar_aggregation_test.py``'s
+            convention. Baseline metrics are only ever computed on the
+            all-genes scale (the baseline NMF fit doesn't depend on which
+            panel is being reconstructed). Defaults to ``None``, i.e.
+            ``["all_genes"]`` — matches today's implicit all-genes-only
+            scoring.
+        nmf_counts_input: Which count matrix ``A_train``/``A_test`` were derived from
+            (``"raw"`` or ``"lognorm"``) — used only to resolve ``nmf_objective``, not
+            to select the matrix (already fixed by the caller).
+        nmf_objective: NMF factorization objective — ``"auto"`` (default) derives the
+            solver/beta_loss from ``nmf_counts_input``; ``"frobenius"``/``"kl"`` force
+            that objective regardless of input. See ``_nmf_objective.py``.
 
     Returns:
-        Dictionary with MSE and explained variance metrics, plus cNMF stability metrics if enabled.
+        Dictionary with MSE and explained variance metrics.
     """
     logger.info(f"Evaluating NMF representation with {len(probeset_genes)} genes")
 
@@ -153,178 +169,6 @@ def nmf_reconstruction(
         )
 
     # ================================================================
-    # CONSENSUS NMF PATH (if requested)
-    # ================================================================
-    if use_consensus_nmf:
-        logger.info("=== Using Consensus NMF for evaluation ===")
-        try:
-            from pathlib import Path
-
-            utility_module_path = Path(__file__).parent.parent / 'Utility-module'
-
-            if str(utility_module_path) not in sys.path:
-                sys.path.insert(0, str(utility_module_path))
-
-            import _constants
-            import _consensus_nmf
-
-            run_consensus_nmf_global = _consensus_nmf.run_consensus_nmf_global
-            select_optimal_k = _consensus_nmf.select_optimal_k
-
-            import anndata as _ad
-
-            if cnmf_k_values is None:
-                k_min = max(2, n_components - 3)
-                k_max = n_components + 5
-                cnmf_k_values = list(range(k_min, k_max + 1, 2))
-            logger.info(f"Testing K values: {cnmf_k_values}")
-
-            train_adata = _ad.AnnData(X=A_train, var=pd.DataFrame(index=adata.var_names))
-            train_adata.layers['counts'] = A_train
-
-            logger.info(f"Running consensus NMF on training data ({cnmf_n_iter} iterations per K)")
-            cnmf_result = run_consensus_nmf_global(
-                train_adata,
-                k_values=cnmf_k_values,
-                n_iter=cnmf_n_iter,
-                random_state=random_state,
-                density_threshold=cnmf_density_threshold,
-                max_iter=cnmf_max_iter,
-            )
-
-            if not cnmf_result:
-                logger.error("Consensus NMF failed! Returning None.")
-                return None
-
-            cnmf_obj = cnmf_result["cnmf_object"]
-            consensus_by_k = cnmf_result["consensus_by_k"]
-
-            optimal_k = select_optimal_k(cnmf_obj, method=cnmf_k_selection_method)
-            logger.info(f"✓ cNMF selected optimal K={optimal_k} (method: {cnmf_k_selection_method})")
-
-            H_consensus = consensus_by_k[optimal_k]["consensus_H"]
-            W_consensus_train = consensus_by_k[optimal_k]["consensus_W"]
-
-            filtered_gene_names = consensus_by_k[optimal_k]["gene_names"]
-            n_genes_filtered = len(filtered_gene_names)
-            n_genes_original = adata.n_vars
-            n_genes_removed = n_genes_original - n_genes_filtered
-
-            logger.info(f"Gene filtering: {n_genes_original} original → {n_genes_filtered} filtered ({n_genes_removed} removed)")
-
-            filtered_gene_indices = np.array([
-                np.where(adata.var_names == gene)[0][0]
-                for gene in filtered_gene_names
-            ])
-
-            A_train_filtered = A_train[:, filtered_gene_indices]
-            A_test_filtered = A_test[:, filtered_gene_indices]
-
-            logger.info(f"A_train shape: {A_train.shape} → A_train_filtered: {A_train_filtered.shape}")
-            logger.info(f"A_test shape: {A_test.shape} → A_test_filtered: {A_test_filtered.shape}")
-
-            probe_gene_names = adata.var_names[probe_indices]
-            probe_indices_filtered = []
-            missing_probes = []
-
-            for probe_gene in probe_gene_names:
-                matches = np.where(filtered_gene_names == probe_gene)[0]
-                if len(matches) > 0:
-                    probe_indices_filtered.append(matches[0])
-                else:
-                    missing_probes.append(probe_gene)
-
-            probe_indices_filtered = np.array(probe_indices_filtered)
-
-            if missing_probes:
-                logger.warning(
-                    f"{len(missing_probes)} probe genes were filtered out (zero variance): "
-                    f"{missing_probes[:5]}{'...' if len(missing_probes) > 5 else ''}"
-                )
-
-            logger.info(
-                f"Probe indices: {len(probe_indices)} original → {len(probe_indices_filtered)} filtered "
-                f"({len(missing_probes)} missing)"
-            )
-
-            A_P_train_filtered = A_train_filtered[:, probe_indices_filtered]
-            A_P_test_filtered = A_test_filtered[:, probe_indices_filtered]
-
-            H_P_consensus = H_consensus[:, probe_indices_filtered]
-
-            logger.info(f"Consensus H shape: {H_consensus.shape} (components × genes_filtered)")
-            logger.info(f"Consensus H_P shape: {H_P_consensus.shape} (components × probe_genes_filtered)")
-
-            A_train_baseline = W_consensus_train @ H_consensus
-            mse_train_baseline = calculate_mse(A_train_filtered, A_train_baseline)
-            expvar_train_baseline = calculate_explained_variance(A_train_filtered, A_train_baseline)
-
-            W_train_probe, _, _ = non_negative_factorization(
-                A_P_train_filtered, H=H_P_consensus, n_components=optimal_k, init="custom",
-                update_H=False, max_iter=cnmf_max_iter, random_state=random_state,
-            )
-            A_train_probe_recon = W_train_probe @ H_consensus
-            mse_train_probe = calculate_mse(A_train_filtered, A_train_probe_recon)
-            expvar_train_probe = calculate_explained_variance(A_train_filtered, A_train_probe_recon)
-
-            logger.info(f"Training baseline: MSE={mse_train_baseline:.4f}, ExpVar={expvar_train_baseline:.4f}")
-            logger.info(f"Training probe: MSE={mse_train_probe:.4f}, ExpVar={expvar_train_probe:.4f}")
-
-            W_test_probe, _, _ = non_negative_factorization(
-                A_P_test_filtered, H=H_P_consensus, n_components=optimal_k, init="custom",
-                update_H=False, max_iter=cnmf_max_iter, random_state=random_state,
-            )
-
-            A_test_probe_recon = W_test_probe @ H_consensus
-            mse_test_probe = calculate_mse(A_test_filtered, A_test_probe_recon)
-            expvar_test_probe = calculate_explained_variance(A_test_filtered, A_test_probe_recon)
-
-            W_test_baseline, H_test_baseline, _ = non_negative_factorization(
-                A_test_filtered, n_components=optimal_k, max_iter=cnmf_max_iter, random_state=random_state
-            )
-            A_test_baseline = W_test_baseline @ H_test_baseline
-            mse_test_baseline = calculate_mse(A_test_filtered, A_test_baseline)
-            expvar_test_baseline = calculate_explained_variance(A_test_filtered, A_test_baseline)
-
-            logger.info(f"Testing baseline: MSE={mse_test_baseline:.4f}, ExpVar={expvar_test_baseline:.4f}")
-            logger.info(f"Testing probe: MSE={mse_test_probe:.4f}, ExpVar={expvar_test_probe:.4f}")
-
-            stability_metrics = {}
-            if hasattr(cnmf_obj, 'stability_metrics') and optimal_k in cnmf_obj.stability_metrics:
-                stability_metrics = cnmf_obj.stability_metrics[optimal_k]
-
-            return {
-                "mse_train_baseline": mse_train_baseline,
-                "expvar_train_baseline": expvar_train_baseline,
-                "mse_train_probe": mse_train_probe,
-                "expvar_train_probe": expvar_train_probe,
-                "mse_test_baseline": mse_test_baseline,
-                "expvar_test_baseline": expvar_test_baseline,
-                "mse_test_probe": mse_test_probe,
-                "expvar_test_probe": expvar_test_probe,
-                "probeset_size": len(probe_indices),
-                "n_components": optimal_k,
-                "n_components_requested": n_components,
-                "method": "consensus_nmf",
-                "cnmf_k_values_tested": cnmf_k_values,
-                "cnmf_optimal_k": optimal_k,
-                "cnmf_k_selection_method": cnmf_k_selection_method,
-                "cnmf_n_iter": cnmf_n_iter,
-                "cnmf_stability": stability_metrics,
-            }
-
-        except Exception as exc:
-            logger.error(f"Consensus NMF evaluation failed: {exc}", exc_info=True)
-            logger.warning("Falling back to standard NMF evaluation")
-            use_consensus_nmf = False
-
-    # ================================================================
-    # STANDARD NMF PATH
-    # ================================================================
-    if not use_consensus_nmf:
-        logger.info("=== Using Standard NMF for evaluation ===")
-
-    # ================================================================
     # TRAINING PHASE
     # ================================================================
     logger.info("--- Training Phase ---")
@@ -349,9 +193,16 @@ def nmf_reconstruction(
             logger.warning("Cached training data shape doesn't match, recomputing...")
             cached_full_nmf = None
 
+    # solver/beta_loss/init/max_iter derived from the count-input choice (raw -> mu/KL,
+    # lognorm -> cd/Frobenius) unless nmf_objective forces one; shared with Selection-module.
+    _obj_kwargs = resolve_nmf_objective(nmf_counts_input, nmf_objective)
+    logger.info(
+        f"Global NMF objective: nmf_objective={nmf_objective} "
+        f"(nmf_counts_input={nmf_counts_input}) -> {_obj_kwargs}"
+    )
     _nmf_kwargs = dict(
-        embedding_size=n_components, seed=random_state, max_iter=max_iter,
-        beta_loss="frobenius", init=None, alpha_W=0.0, alpha_H=0.0, l1_ratio=0.0,
+        n_components=n_components, embedding_size=n_components,
+        random_state=random_state, **_obj_kwargs,
     )
 
     if cached_full_nmf is None or "training" not in cached_full_nmf:
@@ -361,7 +212,7 @@ def nmf_reconstruction(
         H_full_train = train_predictor.h_reference
         A_train_baseline = W_full_train @ H_full_train
         mse_train_baseline = calculate_mse(A_train, A_train_baseline)
-        expvar_train_baseline = calculate_explained_variance(A_train, A_train_baseline)
+        expvar_train_baseline = calculate_explained_variance(A_train, A_train_baseline, mode=expvar_mode)
     else:
         # Reconstruct a pre-fitted predictor from cached H so predict() can be used
         train_predictor = NmfPredictor(**_nmf_kwargs, h_reference=H_full_train, ref_embedding=W_full_train)
@@ -419,7 +270,7 @@ def nmf_reconstruction(
         H_full_test = _test_pred.h_reference
         A_test_baseline = W_full_test @ H_full_test
         mse_test_baseline = calculate_mse(A_test, A_test_baseline)
-        expvar_test_baseline = calculate_explained_variance(A_test, A_test_baseline)
+        expvar_test_baseline = calculate_explained_variance(A_test, A_test_baseline, mode=expvar_mode)
 
     logger.info("Step 2: Iterative solve for test sample factors")
     W_test, A_test_recon = train_predictor.predict(A_P_test, indexer=probe_indices)
@@ -431,40 +282,66 @@ def nmf_reconstruction(
     logger.info("--- Reconstruction and Evaluation ---")
 
     mse_train_probe = calculate_mse(A_train, A_train_recon)
-    expvar_train_probe = calculate_explained_variance(A_train, A_train_recon)
-    mse_ratio_train = (
-        mse_train_probe / mse_train_baseline if mse_train_baseline > 0 else float("inf")
-    )
-    expvar_ratio_train = (
-        expvar_train_probe / expvar_train_baseline if expvar_train_baseline > 0 else 0
-    )
+    expvar_train_probe = calculate_explained_variance(A_train, A_train_recon, mode=expvar_mode)
 
     mse_test_probe = calculate_mse(A_test, A_test_recon)
-    expvar_test_probe = calculate_explained_variance(A_test, A_test_recon)
-    mse_ratio = mse_test_probe / mse_test_baseline if mse_test_baseline > 0 else float("inf")
-    expvar_ratio = expvar_test_probe / expvar_test_baseline if expvar_test_baseline > 0 else 0
+    expvar_test_probe = calculate_explained_variance(A_test, A_test_recon, mode=expvar_mode)
 
     logger.info(f"Training MSE (baseline): {mse_train_baseline:.6f}")
     logger.info(f"Training MSE (probe): {mse_train_probe:.6f}")
     logger.info(f"Test MSE (baseline): {mse_test_baseline:.6f}")
     logger.info(f"Test MSE (probe): {mse_test_probe:.6f}")
-    logger.info(f"MSE ratio train (probe/baseline): {mse_ratio_train:.3f}")
-    logger.info(f"MSE ratio test (probe/baseline): {mse_ratio:.3f}")
-    logger.info(f"ExpVar ratio train (probe/baseline): {expvar_ratio_train:.3f}")
-    logger.info(f"ExpVar ratio test (probe/baseline): {expvar_ratio:.3f}")
+    logger.info(f"Test ExpVar (baseline): {expvar_test_baseline:.4f}")
+    logger.info(f"Test ExpVar (probe): {expvar_test_probe:.4f}")
 
+    # Reported quantities are all absolute — the probe reconstruction and the
+    # full-gene "oracle" baseline are each scored directly (no probe/baseline ratios);
+    # the baseline numbers drive the reference lines in the plots.
     result = {
         "mse_train_baseline": mse_train_baseline,
         "mse_test_baseline": mse_test_baseline,
+        "mse_train_probe": mse_train_probe,
         "mse_test_probe": mse_test_probe,
         "expvar_train_baseline": expvar_train_baseline,
         "expvar_test_baseline": expvar_test_baseline,
+        "expvar_train_probe": expvar_train_probe,
         "expvar_test_probe": expvar_test_probe,
-        "mse_ratio": mse_ratio,
-        "expvar_ratio": expvar_ratio,
         "probeset_size": len(probeset_genes),
         "probeset_genes_found": len(probeset_genes_found),
     }
+
+    # ── Gene-subset x expvar-mode grid (additive on top of the keys above) ────
+    # Does not change what is reconstructed (A_test_recon is always the full
+    # transcriptome, unchanged) -- purely a scoring-time column mask, same
+    # convention as run_expvar_aggregation_test.py's gene-subset breakdown.
+    modes = list(expvar_modes) if expvar_modes else [expvar_mode]
+    subsets = list(gene_subsets) if gene_subsets else ["all_genes"]
+
+    panel_mask = np.zeros(A_test.shape[1], dtype=bool)
+    panel_mask[probe_indices] = True
+    _subset_masks: dict[str, np.ndarray | None] = {
+        "all_genes": None,
+        "panel_genes_only": panel_mask,
+        "non_panel_genes_only": ~panel_mask,
+    }
+
+    # Baseline is only ever computed on the all-genes scale (the baseline NMF fit
+    # doesn't depend on which panel is being reconstructed) -- one value per mode.
+    expvar_baseline_by_mode = {
+        m: calculate_explained_variance(A_test, A_test_baseline, mode=m) for m in modes
+    }
+    for m, v in expvar_baseline_by_mode.items():
+        result[f"expvar_test_baseline_{m}"] = v
+
+    for subset in subsets:
+        mask = _subset_masks[subset]
+        X_true = A_test if mask is None else A_test[:, mask]
+        X_recon = A_test_recon if mask is None else A_test_recon[:, mask]
+        result[f"mse_test_probe_{subset}"] = calculate_mse(X_true, X_recon)
+        for m in modes:
+            result[f"expvar_test_probe_{subset}_{m}"] = calculate_explained_variance(
+                X_true, X_recon, mode=m
+            )
 
     if cached_full_nmf is None:
         result["computed_full_nmf"] = {
@@ -494,21 +371,16 @@ def nmf_reconstruction(
 def nmf_reconstruction_by_celltype(
     adata,
     probeset_genes: list[str],
-    celltype_column: str = "celltypes_v2",
+    celltype_column: str = "cluster",  # = _constants.DEFAULT_CELLTYPE_COLUMN
     n_components: int = 5,
-    max_iter: int = 1000,
     random_state: int = 42,
     cached_full_nmf_by_celltype: dict[str, Any] | None = None,
-    # cNMF options
-    use_consensus_nmf: bool = False,
-    cnmf_k_values: list[int] | None = None,
-    cnmf_n_iter: int = 100,
-    cnmf_max_iter: int = 1000,
-    cnmf_k_selection_method: str = "elbow",
-    cnmf_density_threshold: float = 0.5,
-    cnmf_local_neighborhood_size: float = 0.30,
     per_celltype_splits: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
     nmf_counts_input: str = "raw",
+    expvar_mode: str = "global_mean",
+    expvar_modes: list[str] | None = None,
+    gene_subsets: list[str] | None = None,
+    nmf_objective: str = "auto",
 ) -> dict[str, Any]:
     """Evaluate NMF representation for each celltype separately.
 
@@ -521,7 +393,6 @@ def nmf_reconstruction_by_celltype(
         probeset_genes: List of genes in the probeset to evaluate.
         celltype_column: Column name in adata.obs containing celltype information.
         n_components: Number of NMF components to use.
-        max_iter: Maximum number of iterations for NMF.
         random_state: Random state for reproducibility.
         cached_full_nmf_by_celltype: Pre-computed full NMF results by celltype (W/H matrices only).
         per_celltype_splits: Required. Per-celltype train/test index splits as returned by
@@ -530,6 +401,24 @@ def nmf_reconstruction_by_celltype(
         nmf_counts_input: Count matrix to use as NMF input. ``"raw"`` (default): raw integer
             counts from ``adata.layers['counts']``. ``"lognorm"``: log-normalised counts from
             ``adata.X``.
+        expvar_mode: Explained-variance aggregation mode passed to
+            ``metrics.calculate_explained_variance`` (see ``metrics.EXPVAR_MODES``).
+            Defaults to ``"global_mean"``.
+        expvar_modes: Optional list of explained-variance aggregation modes to
+            additionally report per celltype (e.g. ``["global_mean",
+            "variance_weighted_sum", "mean"]``), on top of the unsuffixed keys
+            (unchanged, still computed from ``expvar_mode`` alone). Defaults to
+            ``None``, i.e. ``[expvar_mode]``. See :func:`nmf_reconstruction`
+            for the full explanation.
+        gene_subsets: Optional list of gene subsets to score against:
+            ``"all_genes"`` (default), ``"panel_genes_only"``,
+            ``"non_panel_genes_only"``. Scoring-time column mask only, does
+            not change what is reconstructed. Defaults to ``None``, i.e.
+            ``["all_genes"]``. See :func:`nmf_reconstruction` for the full
+            explanation.
+        nmf_objective: NMF factorization objective — ``"auto"`` (default) derives the
+            solver/beta_loss from ``nmf_counts_input``; ``"frobenius"``/``"kl"`` force
+            that objective regardless of input. See ``_nmf_objective.py``.
 
     Returns:
         Dictionary with MSE and explained variance metrics by celltype.
@@ -561,6 +450,39 @@ def nmf_reconstruction_by_celltype(
     logger.info(
         f"Found {len(probeset_genes_found)} out of {len(probeset_genes)} probeset genes in the dataset"
     )
+
+    # ── Gene-subset x expvar-mode grid setup (see nmf_reconstruction for the
+    # full explanation) — additive on top of the unsuffixed per-celltype keys. ──
+    _modes = list(expvar_modes) if expvar_modes else [expvar_mode]
+    _subsets = list(gene_subsets) if gene_subsets else ["all_genes"]
+
+    # solver/beta_loss/init/max_iter derived from the count-input choice (raw -> mu/KL,
+    # lognorm -> cd/Frobenius) unless nmf_objective forces one; shared with Selection-module.
+    _obj_kwargs_ct = resolve_nmf_objective(nmf_counts_input, nmf_objective)
+    logger.info(
+        f"Per-celltype NMF objective: nmf_objective={nmf_objective} "
+        f"(nmf_counts_input={nmf_counts_input}) -> {_obj_kwargs_ct}"
+    )
+    _panel_mask = np.zeros(len(adata.var_names), dtype=bool)
+    _panel_mask[probe_indices] = True
+    _subset_masks: dict[str, np.ndarray | None] = {
+        "all_genes": None,
+        "panel_genes_only": _panel_mask,
+        "non_panel_genes_only": ~_panel_mask,
+    }
+    # Full set of extra (subset, mode) keys -- used both when computing a
+    # celltype's real results and when filling in NaN for skipped/failed ones,
+    # so every celltype row has the same DataFrame columns.
+    _extra_nan_keys: dict[str, float] = {}
+    for _subset in _subsets:
+        _extra_nan_keys[f"mse_train_probe_{_subset}"] = np.nan
+        _extra_nan_keys[f"mse_test_probe_{_subset}"] = np.nan
+        for _m in _modes:
+            _extra_nan_keys[f"expvar_train_probe_{_subset}_{_m}"] = np.nan
+            _extra_nan_keys[f"expvar_test_probe_{_subset}_{_m}"] = np.nan
+    for _m in _modes:
+        _extra_nan_keys[f"expvar_train_baseline_{_m}"] = np.nan
+        _extra_nan_keys[f"expvar_test_baseline_{_m}"] = np.nan
 
     celltype_results = {}
 
@@ -622,16 +544,12 @@ def nmf_reconstruction_by_celltype(
                 "expvar_test_baseline": np.nan,
                 "expvar_train_probe": np.nan,
                 "expvar_test_probe": np.nan,
-                "mse_ratio_train": np.nan,
-                "mse_ratio_test": np.nan,
-                "expvar_ratio_train": np.nan,
-                "expvar_ratio_test": np.nan,
-                "generalization_gap": np.nan,
                 "probeset_size": len(probeset_genes),
                 "probeset_genes_found": len(probeset_genes_found),
                 "n_cells": adata_celltype.shape[0],
                 "skipped": True,
                 "skip_reason": "insufficient_cells",
+                **_extra_nan_keys,
             }
             continue
 
@@ -671,9 +589,11 @@ def nmf_reconstruction_by_celltype(
             else:
                 logger.info(f"Computing NMF for celltype {celltype}")
 
+                # Objective kwargs resolved above (data-space-driven, see _nmf_objective.py).
                 _nmf_kwargs_ct = dict(
-                    embedding_size=n_components, seed=random_state, max_iter=max_iter,
-                    beta_loss="frobenius", init=None, alpha_W=0.0, alpha_H=0.0, l1_ratio=0.0,
+                    n_components=n_components, embedding_size=n_components,
+                    random_state=random_state,
+                    **_obj_kwargs_ct,
                 )
 
                 logger.info("Computing Full NMF on training data")
@@ -682,7 +602,7 @@ def nmf_reconstruction_by_celltype(
                 H_full_train = _train_pred_ct.h_reference
                 A_train_baseline = W_full_train @ H_full_train
                 mse_train_baseline = calculate_mse(A_train_ct, A_train_baseline)
-                expvar_train_baseline = calculate_explained_variance(A_train_ct, A_train_baseline)
+                expvar_train_baseline = calculate_explained_variance(A_train_ct, A_train_baseline, mode=expvar_mode)
 
                 logger.info("Computing Full NMF on testing data")
                 _test_pred_ct = NmfPredictor(**_nmf_kwargs_ct).fit(A_test_ct)
@@ -690,7 +610,7 @@ def nmf_reconstruction_by_celltype(
                 H_full_test = _test_pred_ct.h_reference
                 A_test_baseline = W_full_test @ H_full_test
                 mse_test_baseline = calculate_mse(A_test_ct, A_test_baseline)
-                expvar_test_baseline = calculate_explained_variance(A_test_ct, A_test_baseline)
+                expvar_test_baseline = calculate_explained_variance(A_test_ct, A_test_baseline, mode=expvar_mode)
 
                 # Cache W/H matrices only (no raw data arrays)
                 cached_full_nmf_by_celltype[celltype] = {
@@ -708,45 +628,65 @@ def nmf_reconstruction_by_celltype(
                     },
                 }
 
+            # Reconstructed baseline matrices, needed below for the extra expvar-mode
+            # grid -- cheap (W @ H matmul reusing already-fit W/H), recomputed
+            # unconditionally so this also works on the cache-hit branch above (which
+            # only caches W/H, not the reconstructed matrix).
+            A_train_baseline = W_full_train @ H_full_train
+            A_test_baseline = W_full_test @ H_full_test
+
             # Apply NMF representation approach
             logger.info(f"Running NMF representation for celltype {celltype}")
 
             # H_full_train is set above (either from cache or fresh fit)
             _train_pred_ct = NmfPredictor(
-                embedding_size=n_components, seed=random_state, max_iter=max_iter,
-                beta_loss="frobenius", init=None, alpha_W=0.0, alpha_H=0.0, l1_ratio=0.0,
+                n_components=n_components, embedding_size=n_components,
+                random_state=random_state,
+                **_obj_kwargs_ct,
                 h_reference=H_full_train, ref_embedding=W_full_train,
             )
 
             W_train, A_train_recon = _train_pred_ct.predict(A_P_train_ct, indexer=probe_indices)
             W_test, A_test_recon = _train_pred_ct.predict(A_P_test_ct, indexer=probe_indices)
 
+            # ── Gene-subset x expvar-mode grid (additive; see nmf_reconstruction) ──
+            _extra_metrics: dict[str, float] = {}
+            _baseline_train_by_mode = {
+                m: calculate_explained_variance(A_train_ct, A_train_baseline, mode=m) for m in _modes
+            }
+            _baseline_test_by_mode = {
+                m: calculate_explained_variance(A_test_ct, A_test_baseline, mode=m) for m in _modes
+            }
+            for _m, _v in _baseline_train_by_mode.items():
+                _extra_metrics[f"expvar_train_baseline_{_m}"] = _v
+            for _m, _v in _baseline_test_by_mode.items():
+                _extra_metrics[f"expvar_test_baseline_{_m}"] = _v
+            for _subset in _subsets:
+                _mask = _subset_masks[_subset]
+                _Xtr_true = A_train_ct if _mask is None else A_train_ct[:, _mask]
+                _Xtr_recon = A_train_recon if _mask is None else A_train_recon[:, _mask]
+                _Xte_true = A_test_ct if _mask is None else A_test_ct[:, _mask]
+                _Xte_recon = A_test_recon if _mask is None else A_test_recon[:, _mask]
+
+                _extra_metrics[f"mse_train_probe_{_subset}"] = calculate_mse(_Xtr_true, _Xtr_recon)
+                _extra_metrics[f"mse_test_probe_{_subset}"] = calculate_mse(_Xte_true, _Xte_recon)
+                for _m in _modes:
+                    _extra_metrics[f"expvar_train_probe_{_subset}_{_m}"] = calculate_explained_variance(
+                        _Xtr_true, _Xtr_recon, mode=_m
+                    )
+                    _extra_metrics[f"expvar_test_probe_{_subset}_{_m}"] = calculate_explained_variance(
+                        _Xte_true, _Xte_recon, mode=_m
+                    )
+
             mse_train_probe = calculate_mse(A_train_ct, A_train_recon)
-            expvar_train_probe = calculate_explained_variance(A_train_ct, A_train_recon)
+            expvar_train_probe = calculate_explained_variance(A_train_ct, A_train_recon, mode=expvar_mode)
 
             mse_test_probe = calculate_mse(A_test_ct, A_test_recon)
-            expvar_test_probe = calculate_explained_variance(A_test_ct, A_test_recon)
-
-            mse_ratio = (
-                mse_test_probe / mse_test_baseline if mse_test_baseline > 0 else float("inf")
-            )
-            expvar_ratio = (
-                expvar_test_probe / expvar_test_baseline if expvar_test_baseline > 0 else 0
-            )
+            expvar_test_probe = calculate_explained_variance(A_test_ct, A_test_recon, mode=expvar_mode)
 
             logger.info(
-                f"Celltype {celltype} - Test MSE (baseline): {mse_test_baseline:.6f}, (probe): {mse_test_probe:.6f}, ratio: {mse_ratio:.3f}"
+                f"Celltype {celltype} - Test MSE (baseline): {mse_test_baseline:.6f}, (probe): {mse_test_probe:.6f}"
             )
-
-            mse_ratio_train = (
-                mse_train_probe / mse_train_baseline if mse_train_baseline > 0 else float("inf")
-            )
-            mse_ratio_test = mse_ratio
-            expvar_ratio_train = (
-                expvar_train_probe / expvar_train_baseline if expvar_train_baseline > 0 else 0
-            )
-            expvar_ratio_test = expvar_ratio
-            generalization_gap = mse_ratio_test - mse_ratio_train
 
             celltype_results[celltype] = {
                 "mse_train_baseline": mse_train_baseline,
@@ -757,15 +697,11 @@ def nmf_reconstruction_by_celltype(
                 "expvar_test_baseline": expvar_test_baseline,
                 "expvar_train_probe": expvar_train_probe,
                 "expvar_test_probe": expvar_test_probe,
-                "mse_ratio_train": mse_ratio_train,
-                "mse_ratio_test": mse_ratio_test,
-                "expvar_ratio_train": expvar_ratio_train,
-                "expvar_ratio_test": expvar_ratio_test,
-                "generalization_gap": generalization_gap,
                 "probeset_size": len(probeset_genes),
                 "probeset_genes_found": len(probeset_genes_found),
                 "n_cells": adata_celltype.shape[0],
                 "skipped": False,
+                **_extra_metrics,
             }
 
         except Exception as e:
@@ -779,16 +715,12 @@ def nmf_reconstruction_by_celltype(
                 "expvar_test_baseline": np.nan,
                 "expvar_train_probe": np.nan,
                 "expvar_test_probe": np.nan,
-                "mse_ratio_train": np.nan,
-                "mse_ratio_test": np.nan,
-                "expvar_ratio_train": np.nan,
-                "expvar_ratio_test": np.nan,
-                "generalization_gap": np.nan,
                 "probeset_size": len(probeset_genes),
                 "probeset_genes_found": len(probeset_genes_found),
                 "n_cells": adata_celltype.shape[0],
                 "skipped": True,
                 "skip_reason": "evaluation_failed",
+                **_extra_nan_keys,
             }
 
     # Calculate summary statistics across celltypes
@@ -813,6 +745,33 @@ def nmf_reconstruction_by_celltype(
             [res["expvar_test_baseline"] for res in valid_results.values()]
         )
 
+        # ── Gene-subset x expvar-mode grid summary (additive) ──────────────
+        _extra_summary: dict[str, float] = {}
+        for _m in _modes:
+            _bkey = f"expvar_test_baseline_{_m}"
+            _extra_summary[f"weighted_expvar_test_baseline_{_m}"] = (
+                calculate_weighted_explained_variance_baseline(valid_results, metric_key=_bkey)
+            )
+            _extra_summary[f"macro_expvar_test_baseline_{_m}"] = np.mean(
+                [res[_bkey] for res in valid_results.values()]
+            )
+        for _subset in _subsets:
+            _mse_key = f"mse_test_probe_{_subset}"
+            _extra_summary[f"weighted_mse_test_probe_{_subset}"] = calculate_weighted_mse(
+                valid_results, metric_key=_mse_key
+            )
+            _extra_summary[f"macro_mse_test_probe_{_subset}"] = calculate_macro_mse(
+                valid_results, metric_key=_mse_key
+            )
+            for _m in _modes:
+                _ekey = f"expvar_test_probe_{_subset}_{_m}"
+                _extra_summary[f"weighted_expvar_test_probe_{_subset}_{_m}"] = (
+                    calculate_weighted_explained_variance(valid_results, metric_key=_ekey)
+                )
+                _extra_summary[f"macro_expvar_test_probe_{_subset}_{_m}"] = (
+                    calculate_macro_explained_variance(valid_results, metric_key=_ekey)
+                )
+
         summary_results = {
             "celltype_results": celltype_results,
             "summary": {
@@ -827,9 +786,21 @@ def nmf_reconstruction_by_celltype(
                 "total_cells": total_cells,
                 "n_celltypes_processed": len(valid_results),
                 "n_celltypes_skipped": len(celltype_results) - len(valid_results),
+                **_extra_summary,
             },
         }
     else:
+        _extra_summary_nan: dict[str, float] = {}
+        for _m in _modes:
+            _extra_summary_nan[f"weighted_expvar_test_baseline_{_m}"] = np.nan
+            _extra_summary_nan[f"macro_expvar_test_baseline_{_m}"] = np.nan
+        for _subset in _subsets:
+            _extra_summary_nan[f"weighted_mse_test_probe_{_subset}"] = np.nan
+            _extra_summary_nan[f"macro_mse_test_probe_{_subset}"] = np.nan
+            for _m in _modes:
+                _extra_summary_nan[f"weighted_expvar_test_probe_{_subset}_{_m}"] = np.nan
+                _extra_summary_nan[f"macro_expvar_test_probe_{_subset}_{_m}"] = np.nan
+
         summary_results = {
             "celltype_results": celltype_results,
             "summary": {
@@ -844,6 +815,7 @@ def nmf_reconstruction_by_celltype(
                 "total_cells": 0,
                 "n_celltypes_processed": 0,
                 "n_celltypes_skipped": len(celltype_results),
+                **_extra_summary_nan,
             },
         }
 

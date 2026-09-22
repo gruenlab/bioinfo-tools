@@ -24,6 +24,14 @@ _MODULE_DIR = Path(__file__).parent.absolute()
 sys.path.insert(0, str(_MODULE_DIR))
 
 from _comparison_umaps import plot_celltype_umap, plot_raw_vs_log_factor_umap_grid
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 from _constants import ANALYSIS_PNG_DPI
 
 logger = logging.getLogger(__name__)

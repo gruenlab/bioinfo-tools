@@ -1,34 +1,33 @@
 """
-Factor-aware duplicate resolution and gap filling for dimensionality reduction.
+Factor-aware duplicate resolution for dimensionality reduction.
 
-This module implements factor-aware strategies for maintaining balanced
-representation across components (factors) in NMF/PCA-based gene selection.
-Key features:
-- Resolve duplicates by keeping genes in highest-weight factor
-- Fill gaps while maintaining factor balance
-- Support both global and per-celltype analysis
+This module implements factor-aware duplicate resolution for maintaining balanced
+representation across components (factors) in NMF/PCA-based gene selection:
+resolve duplicates by keeping each gene in its highest-weight factor, backfilling
+the vacated slot with the next-best candidate. Supports both global and
+per-celltype analysis (`resolve_duplicates_factor_aware_global` /
+`resolve_duplicates_factor_aware_per_celltype`).
 """
 
 from __future__ import annotations
 
 import logging
-import math
-from collections import defaultdict
-from pathlib import Path
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Set
 
-import numpy as np
 import pandas as pd
-from numpy.typing import NDArray
 
 # Use absolute imports (for script execution)
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 from _constants import (
-    DEFAULT_DIMRED_GENES_PER_COMPONENT,
     MIN_FACTOR_CONTRIBUTION,
     FACTOR_BALANCE_TOLERANCE,
-    COL_COMPONENT,
-    COL_RANK,
-    COL_GENE,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,7 +39,7 @@ def resolve_duplicates_factor_aware_global(
     loadings_df: pd.DataFrame,
     component_cols: List[str],
     context: str = 'final'
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """
     Resolve duplicate genes by keeping them in factor with highest weight.
     
@@ -55,7 +54,10 @@ def resolve_duplicates_factor_aware_global(
         loadings_df: Full loadings dataframe (genes × components).
             Must have columns for each component in component_cols.
         component_cols: List of component column names (e.g., ['NMF1', 'NMF2']).
-        
+        context: Balance-check mode passed to ``_validate_factor_balance`` —
+            ``'final'`` warns on any imbalance, ``'pool'`` suppresses
+            over-representation warnings.
+
     Returns:
         Dictionary containing:
             - 'selected_genes': List of final selected gene names
@@ -243,7 +245,6 @@ def resolve_duplicates_factor_aware_per_celltype(
     
     celltype_factor_to_genes = {}
     within_ct_duplicates = 0
-    cross_ct_duplicates = 0
     total_replacements = 0
     
     # Step 1: Resolve within-celltype duplicates for each celltype
@@ -341,221 +342,6 @@ def resolve_duplicates_factor_aware_per_celltype(
     )
 
     return result
-
-
-def fill_gap_factor_aware_global(
-    existing_genes: Set[str],
-    gap_needed: int,
-    dimred_df: pd.DataFrame,
-    n_components: int
-) -> List[str]:
-    """
-    Perform factor-aware gap filling for global selection.
-    
-    Distributes gap equally across factors and selects next-best candidates
-    from each factor to maintain balanced factor representation.
-    
-    Args:
-        existing_genes: Set of already selected genes.
-        gap_needed: Number of genes needed to fill gap.
-        dimred_df: Loadings dataframe (genes × components).
-        n_components: Number of components in dimensionality reduction.
-        
-    Returns:
-        List of candidate genes ranked by factor, ready for filtering.
-        
-    Raises:
-        ValueError: If gap_needed is negative.
-        KeyError: If factor_to_genes is missing expected components.
-        
-    Examples:
-        >>> existing = {'Gene1', 'Gene2', 'Gene3'}
-        >>> candidates = fill_gap_factor_aware_global(
-        ...     existing, 10, loadings_df, factor_map, 5
-        ... )
-        >>> len(candidates)
-        10
-        >>> all(g not in existing for g in candidates)
-        True
-    """
-    if gap_needed < 0:
-        raise ValueError(f"gap_needed must be non-negative, got {gap_needed}")
-    
-    if gap_needed == 0:
-        return []
-    
-    logger.info(f"Filling gap of {gap_needed} genes (factor-aware)")
-    
-    # Calculate genes per factor for gap
-    genes_per_factor = gap_needed // n_components
-    remainder = gap_needed % n_components
-    
-    logger.debug(
-        f"Distributing gap: {genes_per_factor} per factor, "
-        f"{remainder} remainder"
-    )
-    
-    # Get component columns from dimred_df
-    # Use first n_components columns (already filtered by caller)
-    component_cols = dimred_df.columns[:n_components].tolist()
-    
-    gap_fill_genes = []
-    
-    for idx, component in enumerate(component_cols[:n_components]):
-        # Calculate how many genes needed from this component
-        n_needed = genes_per_factor
-        if idx < remainder:
-            n_needed += 1  # Distribute remainder to first factors
-        
-        if n_needed == 0:
-            continue
-        
-        # Get next-best genes from this component
-        component_genes = _get_next_best_genes_for_component(
-            component=component,
-            n_genes=n_needed,
-            loadings_df=dimred_df,
-            exclude_genes=existing_genes.union(set(gap_fill_genes))
-        )
-        
-        gap_fill_genes.extend(component_genes)
-        
-        logger.debug(
-            f"Factor {component}: added {len(component_genes)}/{n_needed} genes"
-        )
-    
-    logger.info(f"✓ Gap filled: {len(gap_fill_genes)} genes selected")
-    
-    return gap_fill_genes
-
-
-def fill_gap_factor_aware_per_celltype(
-    existing_genes_per_ct: Dict[str, Set[str]],
-    gap_needed_per_ct: Dict[str, int],
-    loadings_per_celltype: Dict[str, pd.DataFrame],
-    factor_to_genes_per_ct: Dict[str, Dict[str, List[str]]],
-    n_components: int
-) -> Dict[str, List[str]]:
-    """
-    Perform factor-aware gap filling for per-celltype selection.
-    
-    Extends gap filling to per-celltype analysis, maintaining factor balance
-    within each celltype independently.
-    
-    Args:
-        existing_genes_per_ct: Already selected genes per celltype.
-        gap_needed_per_ct: Gap size for each celltype.
-        loadings_per_celltype: Loadings dataframe for each celltype.
-        factor_to_genes_per_ct: Factor assignments per celltype.
-        n_components: Number of components in dimensionality reduction.
-        
-    Returns:
-        Dict mapping celltype to list of gap-fill genes.
-        
-    Raises:
-        ValueError: If any gap_needed value is negative.
-        
-    Examples:
-        >>> existing = {'T_cells': {'Gene1', 'Gene2'}, 'B_cells': {'Gene3'}}
-        >>> gaps = {'T_cells': 5, 'B_cells': 8}
-        >>> result = fill_gap_factor_aware_per_celltype(
-        ...     existing, gaps, loadings, factors, 5
-        ... )
-        >>> len(result['T_cells'])
-        5
-    """
-    if any(gap < 0 for gap in gap_needed_per_ct.values()):
-        raise ValueError("gap_needed values must be non-negative")
-    
-    logger.info("Filling gaps (per-celltype, factor-aware)")
-    
-    gap_fill_genes_per_ct = {}
-    
-    for celltype, gap in gap_needed_per_ct.items():
-        if gap == 0:
-            gap_fill_genes_per_ct[celltype] = []
-            continue
-        
-        logger.debug(f"Filling {gap} genes for celltype: {celltype}")
-        
-        # Use global gap filling logic for this celltype
-        gap_genes = fill_gap_factor_aware_global(
-            existing_genes=existing_genes_per_ct.get(celltype, set()),
-            gap_needed=gap,
-            dimred_df=loadings_per_celltype[celltype],
-            n_components=n_components
-        )
-        
-        gap_fill_genes_per_ct[celltype] = gap_genes
-    
-    total_filled = sum(len(genes) for genes in gap_fill_genes_per_ct.values())
-    logger.info(f"✓ Per-celltype gap filling complete: {total_filled} genes total")
-    
-    return gap_fill_genes_per_ct
-
-
-def build_factor_replacement_pools(
-    gene_list_df: pd.DataFrame,
-    group_by: str = COL_COMPONENT
-) -> Dict[any, List[str]]:
-    """
-    Build replacement pools organized by factor/component.
-    
-    Creates pools of candidate genes for each factor, sorted by rank,
-    for use in factor-aware replacement during filtering.
-    
-    Args:
-        gene_list_df: Gene list with component assignments.
-            Must have 'component' and 'rank' columns.
-        group_by: Column to group by ('component' or ('celltype', 'component')).
-        
-    Returns:
-        Dict mapping component (or tuple) to list of genes sorted by rank.
-        For component-only: {component: [genes]}
-        For celltype-component: {(celltype, component): [genes]}
-        
-    Raises:
-        KeyError: If required columns missing from gene_list_df.
-        
-    Examples:
-        >>> df = pd.DataFrame({
-        ...     'gene': ['A', 'B', 'C'],
-        ...     'component': ['NMF1', 'NMF1', 'NMF2'],
-        ...     'rank': [1, 2, 1]
-        ... })
-        >>> pools = build_factor_replacement_pools(df)
-        >>> pools['NMF1']
-        ['A', 'B']
-    """
-    required_cols = [COL_GENE, COL_RANK, group_by]
-    if isinstance(group_by, tuple):
-        required_cols = [COL_GENE, COL_RANK] + list(group_by)
-    
-    missing = set(required_cols) - set(gene_list_df.columns)
-    if missing:
-        raise KeyError(
-            f"Missing required columns: {missing}. "
-            f"Available: {list(gene_list_df.columns)}"
-        )
-    
-    logger.debug(f"Building replacement pools grouped by: {group_by}")
-    
-    pools = {}
-    
-    if isinstance(group_by, tuple):
-        # Per-celltype-component pools
-        for group_vals, group_df in gene_list_df.groupby(list(group_by)):
-            sorted_genes = group_df.sort_values(COL_RANK)[COL_GENE].tolist()
-            pools[group_vals] = sorted_genes
-    else:
-        # Per-component pools
-        for component, group_df in gene_list_df.groupby(group_by):
-            sorted_genes = group_df.sort_values(COL_RANK)[COL_GENE].tolist()
-            pools[component] = sorted_genes
-    
-    logger.debug(f"Created {len(pools)} replacement pools")
-    
-    return pools
 
 
 # =============================================================================
@@ -705,26 +491,3 @@ def _validate_factor_balance(
                 )
 
 
-def _get_next_best_genes_for_component(
-    component: str,
-    n_genes: int,
-    loadings_df: pd.DataFrame,
-    exclude_genes: Set[str]
-) -> List[str]:
-    """Get next-best genes from a component, excluding already selected."""
-    component_loadings = loadings_df[component]
-    component_loadings = component_loadings.sort_values(ascending=False)
-    
-    available = [
-        gene for gene in component_loadings.index
-        if gene not in exclude_genes
-    ]
-    
-    selected = available[:n_genes]
-    
-    if len(selected) < n_genes:
-        logger.warning(
-            f"Component {component}: only found {len(selected)}/{n_genes} genes"
-        )
-    
-    return selected

@@ -8,24 +8,28 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
-from typing import Any, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 from _constants import (
     COL_EXPVAR_TEST_PROBE,
-    COL_MACRO_EXPVAR,
-    COL_MACRO_MSE,
     COL_MSE_TEST_PROBE,
     COL_N_CELLS,
     COL_RMSE_TEST_PROBE,
     COL_SKIPPED,
-    COL_WEIGHTED_EXPVAR,
-    COL_WEIGHTED_MSE,
     DEFAULT_PNG_DPI,
 )
 
@@ -36,16 +40,6 @@ __all__ = [
     "calculate_weighted_metrics",
     "main",
 ]
-
-import os
-import sys
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
-import argparse
-import logging
 
 # Setup logging
 logging.basicConfig(
@@ -158,7 +152,7 @@ def simplify_dataset_label(dataset_name):
     Returns:
     --------
     simplified_name : str
-        Simplified name (e.g., 'hvg_100' or 'nmf_global_method_b_200')
+        Simplified name (e.g., 'hvg_100' or 'nmf_global_200')
     """
     # Remove common prefix 'Xenium-Filter_All-Genes_'
     if 'Xenium-Filter_All-Genes_' in dataset_name:
@@ -261,7 +255,7 @@ def collect_method_results(base_dir, method_name):
 # PLOTTING FUNCTIONS
 ##############################################################################
 
-def plot_method_mse_comparison(results_df, method_name, gene_count, output_dir, dpi=300):
+def plot_method_mse_comparison(results_df, method_name, gene_count, output_dir, dpi=DEFAULT_PNG_DPI):
     """
     Create MSE comparison plot (macro + weighted) for a specific method and gene count.
     Uses horizontal bar plot style matching the evaluation module.
@@ -369,7 +363,7 @@ def plot_method_mse_comparison(results_df, method_name, gene_count, output_dir, 
     logging.info(f"Saved: {output_file}")
 
 
-def plot_method_expvar_comparison(results_df, method_name, gene_count, output_dir, dpi=300):
+def plot_method_expvar_comparison(results_df, method_name, gene_count, output_dir, dpi=DEFAULT_PNG_DPI):
     """
     Create Explained Variance comparison plot (macro + weighted) for a specific method and gene count.
     Uses horizontal bar plot style matching the evaluation module.
@@ -524,8 +518,8 @@ def main():
     parser.add_argument(
         '--dpi',
         type=int,
-        default=300,
-        help='Plot resolution (default: 300)'
+        default=DEFAULT_PNG_DPI,
+        help=f'Plot resolution (default: {DEFAULT_PNG_DPI})'
     )
     
     args = parser.parse_args()

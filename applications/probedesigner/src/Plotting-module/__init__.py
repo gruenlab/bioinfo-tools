@@ -12,36 +12,31 @@ CLI entry points:
     plot_raw_vs_log_factor_umaps.py — Raw-vs-log NMF factor UMAP grids
 
 Internal modules:
-    _clustering_plots   — Clustering, kNN, cell-type classification plots
-    _variability_plots  — NMF variability metric plots
-    _selection_plots    — Gene selection result plots
-    _stability_plots    — Stability analysis plots (gene frequency, overlap, metrics)
-    _k_varying_plots    — K-varying analysis plots (reconstruction quality, gene stability)
-    _comparison_umaps   — Raw-vs-log factor UMAP comparison plots
-    _constants          — Shared column names and plot settings
+    _clustering_plots     — Clustering, kNN, cell-type classification plots
+    _variability_plots    — NMF variability metric plots
+    _selection_plots      — Gene selection result plots
+    _reconstruction_plots — Tangram-vs-NMF reconstruction plots
+    _stability_plots      — Stability analysis plots (gene frequency, overlap, metrics)
+    _k_varying_plots      — K-varying analysis plots (reconstruction quality, gene stability)
+    _comparison_umaps     — Raw-vs-log factor UMAP comparison plots
+    _constants            — Shared column names and plot settings
 """
 
 from __future__ import annotations
 
 from ._clustering_plots import (
     extract_display_name_from_dataset,
-    extract_detailed_display_name_for_heatmap,
     extract_factor_number_from_dataset_name,
     extract_strategy_from_dataset_name,
-    generate_category_9_label,
-    generate_method_specific_colors,
     generate_method_specific_colors_and_markers,
     generate_panel_size_colors_and_strategy_markers,
-    plot_celltype_accuracy_barchart,
+    plot_celltype_classification_diagnostics_global,
     plot_celltype_f1_heatmap,
     plot_clustering_quality_ari,
     plot_clustering_quality_nmi,
     plot_confusion_matrix,
-    plot_decision_tree_visualization,
-    plot_feature_importance_heatmap,
     plot_neighborhood_preservation_by_k,
-    plot_neighborhood_preservation_heatmap,
-    plot_optimal_neighborhood_preservation,
+    plot_neighborhood_preservation_celltype_heatmap,
     plot_umap_for_representation,
     resolve_marker_strategy,
     create_feature_plots,
@@ -61,8 +56,8 @@ from ._selection_plots import (
     plot_f1_distribution,
     plot_feature_importances,
     plot_final_gene_dotplot,
-    plot_gene_count_comparison,
     plot_gene_source_distribution,
+    plot_genes_per_celltype,
 )
 from ._stability_plots import (
     plot_aggregate_metrics_summary,
@@ -89,23 +84,17 @@ from ._comparison_umaps import (
 __all__ = [
     # Clustering / kNN / cell-type plots
     "extract_display_name_from_dataset",
-    "extract_detailed_display_name_for_heatmap",
     "extract_factor_number_from_dataset_name",
     "extract_strategy_from_dataset_name",
-    "generate_category_9_label",
-    "generate_method_specific_colors",
     "generate_method_specific_colors_and_markers",
     "generate_panel_size_colors_and_strategy_markers",
-    "plot_celltype_accuracy_barchart",
+    "plot_celltype_classification_diagnostics_global",
     "plot_celltype_f1_heatmap",
     "plot_clustering_quality_ari",
     "plot_clustering_quality_nmi",
     "plot_confusion_matrix",
-    "plot_decision_tree_visualization",
-    "plot_feature_importance_heatmap",
     "plot_neighborhood_preservation_by_k",
-    "plot_neighborhood_preservation_heatmap",
-    "plot_optimal_neighborhood_preservation",
+    "plot_neighborhood_preservation_celltype_heatmap",
     "plot_umap_for_representation",
     "resolve_marker_strategy",
     "create_feature_plots",
@@ -119,11 +108,12 @@ __all__ = [
     "plot_aggregated_celltype_metrics",
     "plot_celltype_evaluation_results",
     # Selection plots
+    "plot_confusion_matrix_selection",
     "plot_f1_distribution",
     "plot_feature_importances",
     "plot_final_gene_dotplot",
-    "plot_gene_count_comparison",
     "plot_gene_source_distribution",
+    "plot_genes_per_celltype",
     # Stability analysis plots
     "plot_aggregate_metrics_summary",
     "plot_feature_umaps",

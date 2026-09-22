@@ -3,7 +3,6 @@ Separated filtering functions for gene selection pipeline.
 
 This module provides modular, composable filtering functions:
 - Xenium expression filter (celltype-aware or global)
-- Top-N selection from filtered lists
 - Blacklist filter for unwanted gene patterns
 
 Each function operates independently and can be applied in sequence
@@ -14,20 +13,22 @@ from __future__ import annotations
 
 import logging
 import scipy.sparse
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 
 # Use absolute imports (for script execution)
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 from _constants import (
     COL_GENE,
-    COL_RANK,
     COL_CELLTYPE,
-    COL_COMPONENT,
-    COL_GENE_SOURCE,
-    COL_PASSED_XENIUM,
     DEFAULT_MIN_XENIUM_EXPRESSION,
     DEFAULT_MAX_XENIUM_EXPRESSION,
     DEFAULT_BLACKLIST_PATTERNS
@@ -122,94 +123,6 @@ def apply_xenium_filter_to_genelist(
     return gene_list_builder
 
 
-def select_top_n_from_filtered_list(
-    gene_list_builder: GeneListBuilder,
-    n_top_genes: int,
-    filter_criteria: Optional[List[str]] = None,
-    respect_celltype_balance: bool = False
-) -> List[str]:
-    """
-    Select top N genes from ranked list that passed specified filters.
-    
-    Args:
-        gene_list_builder: Gene list with filter results.
-        n_top_genes: Number of genes to select.
-        filter_criteria: Which filters must pass.
-            If None, defaults to ['passed_xenium'].
-            Options: 'passed_xenium'.
-        respect_celltype_balance: If True, select proportionally per celltype.
-        
-    Returns:
-        List of selected gene names.
-        
-    Raises:
-        ValueError: If n_top_genes <= 0.
-        ValueError: If filter_criteria contains invalid filter names.
-        
-    Examples:
-        >>> selected = select_top_n_from_filtered_list(
-        ...     builder, 100, ['passed_xenium']
-        ... )
-        >>> len(selected)
-        100
-    """
-    if n_top_genes <= 0:
-        raise ValueError(f"n_top_genes must be positive, got {n_top_genes}")
-    
-    if filter_criteria is None:
-        filter_criteria = [COL_PASSED_XENIUM]
-
-    # Validate filter criteria
-    valid_filters = [COL_PASSED_XENIUM]
-    invalid = set(filter_criteria) - set(valid_filters)
-    if invalid:
-        raise ValueError(
-            f"Invalid filter criteria: {invalid}. "
-            f"Valid options: {valid_filters}"
-        )
-    
-    logger.info(
-        f"Selecting top {n_top_genes} genes "
-        f"(filters: {filter_criteria}, celltype_balance: {respect_celltype_balance})"
-    )
-    
-    df = gene_list_builder.to_dataframe()
-    
-    # Apply filter criteria
-    mask = pd.Series([True] * len(df), index=df.index)
-    for criterion in filter_criteria:
-        if criterion in df.columns:
-            mask = mask & (df[criterion] == True)
-    
-    passing_df = df[mask].sort_values(COL_RANK)
-    
-    logger.debug(
-        f"After filtering: {len(passing_df)} genes available "
-        f"(requested: {n_top_genes})"
-    )
-    
-    if respect_celltype_balance and COL_CELLTYPE in passing_df.columns:
-        # Select proportionally per celltype
-        selected = _select_proportionally_per_celltype(
-            passing_df, n_top_genes
-        )
-    else:
-        # Simple top N
-        selected = passing_df.head(n_top_genes)[COL_GENE].tolist()
-    
-    if len(selected) < n_top_genes:
-        logger.warning(
-            f"Only found {len(selected)}/{n_top_genes} genes passing filters"
-        )
-    
-    # Mark as selected (post-filter selection)
-    gene_list_builder.mark_selected(selected, selection_type='initial')
-    
-    logger.info(f"✓ Selected {len(selected)} genes")
-    
-    return selected
-
-
 def apply_blacklist_filter(
     gene_list: List[str],
     blacklist_patterns: Optional[List[str]] = None,
@@ -220,7 +133,7 @@ def apply_blacklist_filter(
     Filter genes based on blacklist patterns (case-insensitive prefix matching).
     
     This filter removes genes that match blacklist patterns (e.g., mitochondrial
-    genes starting with 'mt-', heat shock proteins starting with 'hsp'). 
+    genes starting with 'mt-', heat shock proteins starting with 'hsp').
     Force-included genes override the blacklist.
     
     Args:
@@ -467,45 +380,3 @@ def _check_expression_all_celltypes(
         return True, None
     else:
         return False, "failed_all_celltypes"
-
-
-def _select_proportionally_per_celltype(
-    passing_df: pd.DataFrame,
-    n_top_genes: int
-) -> List[str]:
-    """
-    Select genes proportionally per celltype.
-    
-    Maintains celltype representation in proportion to number of available
-    genes per celltype.
-    """
-    celltype_counts = passing_df[COL_CELLTYPE].value_counts()
-    total_available = len(passing_df)
-    
-    selected_genes = []
-    
-    for celltype in celltype_counts.index:
-        # Calculate proportion
-        proportion = celltype_counts[celltype] / total_available
-        n_from_ct = int(n_top_genes * proportion)
-        
-        # Select top N from this celltype
-        ct_genes = passing_df[
-            passing_df[COL_CELLTYPE] == celltype
-        ].head(n_from_ct)[COL_GENE].tolist()
-        
-        selected_genes.extend(ct_genes)
-        
-        logger.debug(
-            f"Celltype {celltype}: selected {len(ct_genes)}/{n_from_ct} genes"
-        )
-    
-    # If we haven't reached n_top_genes, add more from top ranks
-    if len(selected_genes) < n_top_genes:
-        remaining = n_top_genes - len(selected_genes)
-        additional = passing_df[
-            ~passing_df[COL_GENE].isin(selected_genes)
-        ].head(remaining)[COL_GENE].tolist()
-        selected_genes.extend(additional)
-    
-    return selected_genes[:n_top_genes]

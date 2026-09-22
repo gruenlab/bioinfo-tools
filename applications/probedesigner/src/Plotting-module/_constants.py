@@ -43,6 +43,45 @@ COL_MACRO_EXPVAR: str = "macro_expvar_test_probe"
 COL_N_CELLS: str = "n_cells"
 COL_SKIPPED: str = "skipped"
 
+# --- Reconstruction-method display names ---
+# Used to title/label plots for whichever variability method produced a given results
+# CSV (nmf/pca/ica/ridge/mapping). Not the same axis as a panel's own selection-strategy
+# colors below (those color which *strategy chose the panel*, not which method *scored*
+# it) -- see get_category_colors() in _variability_plots.py.
+METHOD_DISPLAY_NAMES: dict[str, str] = {
+    "nmf": "NMF",
+    "pca": "PCA",
+    "ica": "ICA",
+    "ridge": "Ridge",
+    "ridge-regression": "Ridge",
+    "mapping": "Mapping",
+    "tangram": "Tangram",
+}
+
+# --- Ridge variability (dual raw/lognorm space; see Evaluation-module/ridge.py) ---
+# Ridge has no train-side baseline (its baseline is a per-gene training-mean constant
+# predictor scored only against the test split), hence "mean_baseline" not "test_baseline".
+COL_MSE_TEST_PROBE_RAW: str = "mse_test_probe_raw"
+COL_MSE_TEST_PROBE_LOGNORM: str = "mse_test_probe_lognorm"
+COL_EXPVAR_TEST_PROBE_RAW: str = "expvar_test_probe_raw"
+COL_EXPVAR_TEST_PROBE_LOGNORM: str = "expvar_test_probe_lognorm"
+COL_WEIGHTED_MSE_RAW: str = "weighted_mse_test_probe_raw"
+COL_WEIGHTED_MSE_LOGNORM: str = "weighted_mse_test_probe_lognorm"
+COL_WEIGHTED_EXPVAR_RAW: str = "weighted_expvar_test_probe_raw"
+COL_WEIGHTED_EXPVAR_LOGNORM: str = "weighted_expvar_test_probe_lognorm"
+COL_MACRO_MSE_RAW: str = "macro_mse_test_probe_raw"
+COL_MACRO_MSE_LOGNORM: str = "macro_mse_test_probe_lognorm"
+COL_MACRO_EXPVAR_RAW: str = "macro_expvar_test_probe_raw"
+COL_MACRO_EXPVAR_LOGNORM: str = "macro_expvar_test_probe_lognorm"
+COL_WEIGHTED_MSE_BASELINE_RAW: str = "weighted_mse_mean_baseline_raw"
+COL_WEIGHTED_MSE_BASELINE_LOGNORM: str = "weighted_mse_mean_baseline_lognorm"
+COL_MACRO_MSE_BASELINE_RAW: str = "macro_mse_mean_baseline_raw"
+COL_MACRO_MSE_BASELINE_LOGNORM: str = "macro_mse_mean_baseline_lognorm"
+COL_WEIGHTED_EXPVAR_BASELINE_RAW: str = "weighted_expvar_mean_baseline_raw"
+COL_WEIGHTED_EXPVAR_BASELINE_LOGNORM: str = "weighted_expvar_mean_baseline_lognorm"
+COL_MACRO_EXPVAR_BASELINE_RAW: str = "macro_expvar_mean_baseline_raw"
+COL_MACRO_EXPVAR_BASELINE_LOGNORM: str = "macro_expvar_mean_baseline_lognorm"
+
 # =============================================================================
 # SELECTION RESULT CSV COLUMN NAMES
 # =============================================================================
@@ -67,9 +106,13 @@ COL_DISPLAY_NAME: str = "display_name"
 # PLOT SETTINGS
 # =============================================================================
 
-# DPI Settings (Publication Quality)
-DEFAULT_PNG_DPI: int = 600  # Increased from 300 for publication quality
-ANALYSIS_PNG_DPI: int = 600  # For analysis plots (previously 200 in various scripts)
+# DPI Settings
+# Default output resolution for saved PNGs. 300 dpi is a sensible default for
+# on-screen review and drafts; override per run with the --png_dpi / --dpi CLI
+# flag (or the png_dpi= keyword on the plotting functions) when a higher
+# publication resolution is needed.
+DEFAULT_PNG_DPI: int = 300
+ANALYSIS_PNG_DPI: int = 300  # For analysis plots
 
 DEFAULT_FIGURE_FORMAT: str = "png"
 DEFAULT_COLORMAP: str = "viridis"
@@ -92,9 +135,9 @@ PUB_COLORBAR_SIZE: int = 16     # Colorbar labels
 # PUBLICATION-QUALITY LINE/MARKER SIZES
 # =============================================================================
 
-PUB_LINE_WIDTH: int = 3         # Plot line width (increased from 2)
-PUB_MARKER_SIZE: int = 8        # Marker size (increased from 6)
-PUB_BAR_EDGE_WIDTH: float = 2.5 # Bar edge width (increased from 2)
+PUB_LINE_WIDTH: int = 3         # Plot line width
+PUB_MARKER_SIZE: int = 8        # Marker size
+PUB_BAR_EDGE_WIDTH: float = 2.5 # Bar edge width
 
 # =============================================================================
 # ANALYSIS-SPECIFIC COLORS
@@ -107,7 +150,6 @@ STABILITY_METRIC_COLOR: str = "#2196F3" # Blue (for metric bars)
 
 # K-varying analysis colors
 K_VARYING_NMF_COLOR: str = "#1f77b4"   # Blue (NMF method)
-K_VARYING_CNMF_COLOR: str = "#ff7f0e"  # Orange (cNMF method)
 
 # General analysis colors
 ANALYSIS_NMF_COLOR: str = "#2196F3"     # Blue (NMF reconstruction)

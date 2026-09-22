@@ -5,10 +5,15 @@ This script provides a single CLI to run any combination of:
 
 - **preprocess**: Subset panels to selected genes and compute PCA/NMF,
   clustering, and KNN graphs.
-- **evaluate**: Compute baseline (clustering/KNN/celltype) and/or
-  variability (NMF) metrics on preprocessed panels.
-- **both**: Run preprocessing immediately followed by evaluation in one
-  command (equivalent to running the two modes sequentially).
+- **evaluate**: Compute baseline (clustering/KNN/celltype), variability
+  (NMF), and/or biology (pathway enrichment) metrics on preprocessed panels.
+- **both** (pipeline mode): Run preprocessing immediately followed by
+  evaluation in one command (equivalent to running the two modes
+  sequentially). Not to be confused with ``--evaluation_type``, below.
+
+``--evaluation_type`` selects which metric(s) to compute: ``baseline``,
+``variability``, ``biology``, ``all`` (baseline + variability + biology), or
+``tangram_only``.
 
 Usage::
 
@@ -24,7 +29,7 @@ Usage::
         --input_file preprocessed/full_transcriptome.h5ad \\
         --preprocessed_dir preprocessed/ \\
         --output_dir Evaluation-Results/ \\
-        --evaluation_type both
+        --evaluation_type all
 
     # Everything in one go
     python run_evaluation.py --mode both \\
@@ -32,7 +37,7 @@ Usage::
         --gene_lists_dir Selected-panels/ \\
         --preprocessed_dir preprocessed/ \\
         --output_dir Evaluation-Results/ \\
-        --evaluation_type both \\
+        --evaluation_type all \\
         --include_tangram
 
     # Dry-run: print resolved config without executing
@@ -49,7 +54,7 @@ import json
 import logging
 import os
 import sys
-import traceback
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -70,9 +75,6 @@ from tqdm import tqdm
 # This ensures compatibility with anndata's HDF5 writer (pandas 2.x+ uses PyArrow strings by default)
 pd.options.mode.string_storage = "python"
 
-# Presentation-friendly defaults for Scanpy-generated figures
-sc.set_figure_params(fontsize=16)
-
 # ---------------------------------------------------------------------------
 # Internal module imports
 # ---------------------------------------------------------------------------
@@ -84,19 +86,15 @@ from _clustering import (
     evaluate_celltype_identification,
     evaluate_clustering_quality,
     evaluate_neighborhood_preservation,
-    compute_rare_celltype_marker_coverage,
 )
-from _filters import (
-    filter_datasets_by_args,
-    filter_datasets_by_keywords,
-    group_datasets_by_attributes,
-    parse_dataset_attributes,
-)
+from _filters import filter_datasets_by_args
 from _preprocessing import (
     load_all_gene_lists,
     load_gene_list_from_csv,
+    extract_genelist_name_from_path,
     preprocess_reference_dataset,
     process_data_for_panel_evaluation,
+    filter_reference_blacklist,
     _convert_arrow_strings_to_object,
 )
 from metrics import (
@@ -108,10 +106,35 @@ from _splits import generate_evaluation_splits
 
 # Optional Tangram reconstruction check
 try:
-    from _tangram import run_tangram_reconstruction_check
+    from _tangram import (
+        run_tangram_reconstruction_check,
+        _save_tangram_results,
+        _aggregate_per_celltype_metrics,
+    )
     _RECONSTRUCTION_AVAILABLE = True
 except ImportError:
     _RECONSTRUCTION_AVAILABLE = False
+
+# Optional pathway enrichment (biology evaluation)
+try:
+    from _pathway import (
+        run_pathway_enrichment_for_panel,
+        run_pathway_enrichment_by_celltype,
+        load_panel_informative_map,
+        resolve_pathway_libraries,
+    )
+    _PATHWAY_AVAILABLE = True
+except ImportError:
+    _PATHWAY_AVAILABLE = False
+
+    def resolve_pathway_libraries(organism, override=None):  # noqa: D401 - fallback stub
+        if override:
+            return list(override)
+        return (
+            ["GO_Biological_Process_2023", "KEGG_2019_Mouse", "Reactome_2022"]
+            if organism == "mouse"
+            else ["GO_Biological_Process_2023", "KEGG_2021_Human", "Reactome_2022"]
+        )
 
 # Constants
 # Load local _constants.py by exact path to avoid collisions with sibling
@@ -126,29 +149,23 @@ _eval_constants = importlib.util.module_from_spec(_eval_constants_spec)
 _eval_constants_spec.loader.exec_module(_eval_constants)
 
 DEFAULT_CELLTYPE_COLUMN = _eval_constants.DEFAULT_CELLTYPE_COLUMN
-DEFAULT_DIMENSIONALITY_REDUCTION = _eval_constants.DEFAULT_DIMENSIONALITY_REDUCTION
+DEFAULT_CELLTYPE_CLF_MAX_DEPTH = _eval_constants.DEFAULT_CELLTYPE_CLF_MAX_DEPTH
 DEFAULT_DIM_REDUCTION_PREPROCESS = _eval_constants.DEFAULT_DIM_REDUCTION_PREPROCESS
 DEFAULT_EVALUATION_TYPE = _eval_constants.DEFAULT_EVALUATION_TYPE
 DEFAULT_N_COMPONENTS = _eval_constants.DEFAULT_N_COMPONENTS
 DEFAULT_N_NEIGHBORS = _eval_constants.DEFAULT_N_NEIGHBORS
 DEFAULT_RANDOM_STATE = _eval_constants.DEFAULT_RANDOM_STATE
 DEFAULT_TANGRAM_N_EPOCHS = _eval_constants.DEFAULT_TANGRAM_N_EPOCHS
-DEFAULT_TEST_SIZE = _eval_constants.DEFAULT_TEST_SIZE
+NMF_PREDICTOR_FIXED_KWARGS = _eval_constants.NMF_PREDICTOR_FIXED_KWARGS
 
 # ---------------------------------------------------------------------------
 # Utility module (external dependency)
 # ---------------------------------------------------------------------------
 
 _UTILITY_DIR = _MODULE_DIR.parent / "Utility-module"
-if _UTILITY_DIR.exists():
-    sys.path.insert(0, str(_UTILITY_DIR))
-try:
-    from _validation import is_anndata_raw, is_anndata_raw_layer  # type: ignore[import]
-except ImportError:
-    def is_anndata_raw(adata) -> bool:  # type: ignore[misc]
-        return True
-    def is_anndata_raw_layer(adata, layer_name: str) -> bool:  # type: ignore[misc]
-        return True
+sys.path.insert(0, str(_UTILITY_DIR))
+from _validation import is_anndata_raw, is_anndata_raw_layer  # type: ignore[import]
+from _nmf_objective import resolve_nmf_objective
 try:
     from _utils import convert_ensembl_to_gene_symbols  # type: ignore[import]
 except ImportError:
@@ -213,28 +230,39 @@ class EvaluationConfig:
             (required for ``preprocess`` / ``both`` modes).
         gene_list_files_txt: Path to a newline-separated text file of gene
             list CSV paths (alternative to *gene_lists_dir*).
+        reference_blacklist_patterns: Extra gene-name prefix patterns to strip
+            from the reference dataset before preprocessing (e.g. ``["rps", "rpl"]``).
+        reference_use_default_blacklist: Also strip genes matching
+            Selection-module's default blacklist (``mt-``, ``hsp``, ``rps``, ``rpl``)
+            from the reference. Defaults to ``True``; set
+            ``--reference_disable_default_blacklist`` on the CLI to turn it off.
         evaluation_type: Evaluation types to run:
-            ``"baseline"``, ``"variability"``, or ``"both"``.
+            ``"baseline"``, ``"variability"``, ``"biology"`` (Enrichr pathway
+            enrichment), ``"all"`` (baseline + variability + biology), or
+            ``"tangram_only"`` (skip NMF and baseline; run only the Tangram
+            reconstruction stage).
         celltype_col: obs column holding cell-type labels.
-        dimensionality_reduction: Embedding for baseline evaluation:
-            ``"pca"``, ``"nmf"``, or ``"both"``.
+        celltype_clf_max_depth: Fixed ``max_depth`` for the cell-type-classification
+            decision tree (baseline evaluation), applied identically to every panel.
+            Defaults to ``DEFAULT_CELLTYPE_CLF_MAX_DEPTH``; changing it changes the
+            measuring instrument, so hold it constant across any panels being compared.
         n_components: Number of NMF components (variability evaluation).
-        test_size: Fraction of cells held out for testing.
         random_state: Global random seed.
-        n_splits: Number of folds for stratified k-fold cross-validation.
-        split_mode: ``"kfold"`` (default, stratified k-fold) or ``"simple"``
-            (single 80/20 random split). Both NMF and Tangram use the identical
-            splits generated by this setting.
+        n_splits: Number of folds for the stratified k-fold cross-validation used
+            by both NMF and Tangram (they share the identical splits).
         n_neighbors: Nearest neighbours for KNN graph construction.
         dim_reduction_preprocess: Dimensionality reduction to compute during
             preprocessing (``"pca"``, ``"nmf"``, or ``"both"``).
         include_tangram: Run the optional Tangram reconstruction check.
         tangram_n_epochs: Number of Tangram mapping epochs.
+        pathway_libraries: Enrichr gene-set libraries to query for the
+            ``"biology"``/``"all"`` evaluation types.
+        pathway_organism: Enrichr organism (``"human"`` or ``"mouse"``).
+        pathway_sleep: Seconds to sleep between per-panel Enrichr API calls.
+        pathway_top_n: Number of top pathways to plot per library.
         external_panels: Paths to external gene-panel CSV files.
         external_names: Display names for the external panels.
         external_probeset_sizes: Per-panel gene count limits (0 = keep all).
-        add_10x_panels: 10x panel integration mode for preprocessing.
-        data_dir: Base directory for 10x panel files.
         dry_run: Print resolved config and exit without executing.
         strategies: Strategy filter for evaluation dataset selection.
         probeset_sizes: Panel-size filter.
@@ -242,13 +270,15 @@ class EvaluationConfig:
         hvg_subset_options: HVG option filter.
         reduction_types: Reduction type filter.
         analysis_types: Analysis type filter.
-        dimred_methods: Dimred method filter.
         dt_percentages: DT percentage filter.
         dimred_percentages: Dimred percentage filter.
         run_celltype_specific_filling: Gap-filling filter.
         run_global_gene_filling: Gap-filling filter.
         run_deg_based_filling: Gap-filling filter.
         preferred_strategy: Preferred strategy filter.
+        expvar_mode: Explained-variance gene-aggregation mode passed to
+            ``metrics.calculate_explained_variance`` (see ``metrics.EXPVAR_MODES``
+            for the 5 available modes). Defaults to ``"global_mean"``.
     """
 
     # Required
@@ -261,15 +291,17 @@ class EvaluationConfig:
     gene_lists_dir: Path | None = None
     gene_list_files_txt: Path | None = None
 
+    # Reference blacklist filtering (mirrors Selection-module's blacklist filter)
+    reference_blacklist_patterns: list[str] = field(default_factory=list)
+    reference_use_default_blacklist: bool = True
+
     # Evaluation settings
     evaluation_type: str = DEFAULT_EVALUATION_TYPE
     celltype_col: str = DEFAULT_CELLTYPE_COLUMN
-    dimensionality_reduction: str = DEFAULT_DIMENSIONALITY_REDUCTION
+    celltype_clf_max_depth: int = DEFAULT_CELLTYPE_CLF_MAX_DEPTH
     n_components: int = DEFAULT_N_COMPONENTS
-    test_size: float = DEFAULT_TEST_SIZE
     random_state: int = DEFAULT_RANDOM_STATE
     n_splits: int = 5
-    split_mode: str = "kfold"
 
     # Preprocessing settings
     n_neighbors: int = DEFAULT_N_NEIGHBORS
@@ -279,14 +311,22 @@ class EvaluationConfig:
     include_tangram: bool = False
     tangram_n_epochs: int = DEFAULT_TANGRAM_N_EPOCHS
 
+    # Pathway enrichment (biology evaluation).
+    # None => resolve the library set from `pathway_organism` (see _pathway.resolve_pathway_libraries).
+    pathway_libraries: list[str] | None = None
+    pathway_organism: str = "human"
+    pathway_sleep: float = 1.0
+    pathway_top_n: int = 12
+    # Per-cell-type pathway enrichment (in addition to the whole-panel run). On by
+    # default; disable with --no-pathway_per_celltype.
+    pathway_per_celltype: bool = True
+    pathway_celltype_gene_source: str = "informative"  # "informative" | "all_panel"
+    pathway_celltype_min_genes: int = 5
+
     # External panels
     external_panels: list[str] = field(default_factory=list)
     external_names: list[str] = field(default_factory=list)
     external_probeset_sizes: list[int] = field(default_factory=list)
-
-    # 10x integration
-    add_10x_panels: str = "no-10x-panel"
-    data_dir: str = ""
 
     # Dry-run
     dry_run: bool = False
@@ -298,7 +338,6 @@ class EvaluationConfig:
     hvg_subset_options: list[str] = field(default_factory=list)
     reduction_types: list[str] = field(default_factory=list)
     analysis_types: list[str] = field(default_factory=list)
-    dimred_methods: list[str] = field(default_factory=list)
     dt_percentages: list[float] = field(default_factory=list)
     dimred_percentages: list[float] = field(default_factory=list)
     run_celltype_specific_filling: str = ""
@@ -309,12 +348,33 @@ class EvaluationConfig:
     # NMF / Tangram count input
     nmf_counts_input: str = "raw"
 
+    # NMF factorization objective: "auto" derives from nmf_counts_input (raw -> mu/KL,
+    # lognorm -> cd/Frobenius); "frobenius"/"kl" force one regardless of input.
+    nmf_objective: str = "auto"
+
+    # Explained-variance aggregation mode
+    expvar_mode: str = "global_mean"
+    # Optional multi-mode / multi-gene-subset explained-variance breakdown (additive on
+    # top of expvar_mode above -- see nmf.py::nmf_reconstruction for the full explanation).
+    expvar_modes: list[str] = field(default_factory=list)
+    gene_subsets: list[str] = field(
+        default_factory=lambda: ["all_genes", "panel_genes_only", "non_panel_genes_only"]
+    )
+
 
 def _save_evaluation_parameters(config: EvaluationConfig) -> None:
     """Save all evaluation parameter settings to a JSON file in the output directory."""
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     params = asdict(config)
+
+    # Record the NMF solver/beta_loss actually resolved from
+    # nmf_counts_input + nmf_objective (e.g. 'auto' alone doesn't say whether this run
+    # factorized with Frobenius or Kullback-Leibler).
+    _nmf_kwargs = resolve_nmf_objective(config.nmf_counts_input, config.nmf_objective)
+    params["nmf_solver"] = _nmf_kwargs["solver"]
+    params["nmf_beta_loss"] = _nmf_kwargs["beta_loss"]
+
     params["timestamp"] = datetime.now().isoformat()
     params["script"] = "run_evaluation.py"
 
@@ -356,23 +416,58 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gene_lists_dir", default=None, help="Selection pipeline gene lists directory.")
     p.add_argument("--gene_list_files_txt", default=None, help="Text file with gene-list CSV paths (one per line).")
 
-    # Evaluation
-    p.add_argument("--evaluation_type", choices=["baseline", "variability", "both"], default="both")
-    p.add_argument("--celltype_col", default="cluster")
-    p.add_argument("--dimensionality_reduction", choices=["pca", "nmf", "both"], default="pca")
-    p.add_argument("--n_components", type=int, default=5)
-    p.add_argument("--test_size", type=float, default=0.3)
-    p.add_argument("--random_state", type=int, default=42)
-    p.add_argument("--n_splits", type=int, default=5, help="Number of folds for stratified k-fold cross-validation")
+    # Reference blacklist filtering (mirrors Selection-module's --blacklist_patterns)
     p.add_argument(
-        "--split_mode",
-        choices=["simple", "kfold"],
-        default="kfold",
+        "--reference_blacklist_patterns",
+        nargs="+",
+        default=[],
         help=(
-            "kfold (default): stratified k-fold using --n_splits folds (default 5). "
-            "simple: one 80/20 random split. "
-            "Both NMF and Tangram use the identical splits."
+            "Extra gene-name prefix patterns to remove from the reference dataset before "
+            "preprocessing (case-insensitive, e.g. 'rps' 'rpl'). Use to match genes that "
+            "were blacklisted out of the panel during selection, so the reference doesn't "
+            "unfairly penalize the panel for genes it was barred from selecting. "
+            "Default: no extra patterns (off)."
         ),
+    )
+    p.add_argument(
+        "--reference_disable_default_blacklist",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable removal of genes matching Selection-module's DEFAULT_BLACKLIST_PATTERNS "
+            "('mt-', 'hsp', 'rps', 'rpl') from the reference dataset. Default: enabled, "
+            "so the reference isn't unfairly penalized for genes barred from selection."
+        ),
+    )
+
+    # Evaluation
+    p.add_argument(
+        "--evaluation_type",
+        choices=["baseline", "variability", "biology", "all", "tangram_only"],
+        default="all",
+        help=(
+            "baseline: clustering/kNN/celltype metrics. variability: NMF representation "
+            "metrics. biology: Enrichr pathway enrichment per panel. all: baseline + "
+            "variability + biology. tangram_only: skip NMF/baseline/biology, run only the "
+            "Tangram reconstruction stage (requires --include_tangram)."
+        ),
+    )
+    p.add_argument("--celltype_col", default=DEFAULT_CELLTYPE_COLUMN)
+    p.add_argument(
+        "--celltype_clf_max_depth", type=int, default=DEFAULT_CELLTYPE_CLF_MAX_DEPTH,
+        help=(
+            "max_depth of the cell-type-classification DecisionTreeClassifier (baseline "
+            "evaluation), fixed identically for every panel in the run. This is a "
+            "measuring instrument, not a panel property -- only override it deliberately, "
+            "and hold it constant across any set of panels/benchmarks being compared "
+            f"(default: {DEFAULT_CELLTYPE_CLF_MAX_DEPTH})."
+        ),
+    )
+    p.add_argument("--n_components", type=int, default=5)
+    p.add_argument("--random_state", type=int, default=42)
+    p.add_argument(
+        "--n_splits", type=int, default=5,
+        help="Number of folds for the stratified k-fold cross-validation (NMF + Tangram share the splits)",
     )
 
     # Preprocessing
@@ -382,7 +477,35 @@ def _build_parser() -> argparse.ArgumentParser:
     # Tangram
     p.add_argument("--include_tangram", action="store_true", default=False,
                    help="Run optional Tangram reconstruction check.")
-    p.add_argument("--tangram_n_epochs", type=int, default=1000)
+    p.add_argument("--tangram_n_epochs", type=int, default=DEFAULT_TANGRAM_N_EPOCHS)
+
+    # Pathway enrichment (biology evaluation)
+    p.add_argument("--pathway_libraries", nargs="*", default=None,
+                   help="Enrichr gene-set libraries to query for the 'biology'/'all' evaluation types. "
+                        "Default: resolved from --pathway_organism (human: GO BP 2023 / KEGG 2021 Human / "
+                        "Reactome 2022; mouse: same but KEGG 2019 Mouse).")
+    p.add_argument("--pathway_organism", choices=["human", "mouse"], default="human",
+                   help="Enrichr organism. Selects the default library set unless --pathway_libraries "
+                        "is given.")
+    p.add_argument("--pathway_sleep", type=float, default=1.0,
+                   help="Seconds to sleep between per-panel Enrichr API calls (politeness/rate-limit).")
+    p.add_argument("--pathway_top_n", type=int, default=12,
+                   help="Number of top (lowest adjusted p-value) pathways to plot per library.")
+    p.add_argument("--pathway_per_celltype", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Also run Enrichr per cell type (in addition to the whole-panel run) "
+                        "for the 'biology'/'all' evaluation types. On by default; pass "
+                        "--no-pathway_per_celltype to disable.")
+    p.add_argument("--pathway_celltype_gene_source", choices=["informative", "all_panel"],
+                   default="informative",
+                   help="Per-cell-type gene set. 'informative': panel genes whose "
+                        "ranked_gene_list.csv 'informative_celltypes' column lists that cell "
+                        "type (requires --gene_lists_dir or --gene_list_files_txt). "
+                        "'all_panel': the full panel gene list for every cell type in "
+                        "adata.obs[--celltype_col].")
+    p.add_argument("--pathway_celltype_min_genes", type=int, default=5,
+                   help="Skip per-cell-type enrichment for cell types with fewer than this "
+                        "many genes.")
 
     # NMF / Tangram count input
     p.add_argument(
@@ -396,15 +519,68 @@ def _build_parser() -> argparse.ArgumentParser:
             "'lognorm': log-normalised counts from adata.X."
         ),
     )
+    p.add_argument(
+        "--nmf_objective",
+        type=str,
+        default="auto",
+        choices=["auto", "frobenius", "kl"],
+        help=(
+            "NMF factorization objective. "
+            "'auto' (default): derive from --nmf_counts_input — raw -> mu solver + "
+            "Kullback-Leibler beta_loss + nndsvda init + max_iter 2000; lognorm -> cd + "
+            "Frobenius + nndsvd + 1000 (identical to the historical pinned config). "
+            "'frobenius' / 'kl': force that objective regardless of input."
+        ),
+    )
+    p.add_argument(
+        "--expvar_mode",
+        type=str,
+        default="global_mean",
+        choices=["global_mean", "variance_weighted_sum", "mean", "median", "expression_weighted_sum"],
+        help=(
+            "Gene-aggregation mode for explained variance (see metrics.EXPVAR_MODES). "
+            "'global_mean' (default): pools all cell x gene entries, R2 around one global "
+            "scalar mean. 'variance_weighted_sum': per-gene R2 weighted by per-gene variance. "
+            "'mean'/'median': unweighted average/median of per-gene R2. "
+            "'expression_weighted_sum': per-gene R2 weighted by per-gene mean expression."
+        ),
+    )
+    p.add_argument(
+        "--expvar_modes",
+        type=str,
+        nargs="+",
+        default=None,
+        choices=["global_mean", "variance_weighted_sum", "mean", "median", "expression_weighted_sum"],
+        help=(
+            "Optional list of explained-variance aggregation modes to additionally report in "
+            "the variability stage, on top of --expvar_mode (unaffected). E.g. "
+            "'--expvar_modes global_mean variance_weighted_sum mean' adds "
+            "expvar_test_probe_{gene_subset}_{mode} columns for every mode listed. "
+            "Defaults to None, i.e. just [--expvar_mode] (today's single-mode behavior)."
+        ),
+    )
+    p.add_argument(
+        "--gene_subsets",
+        type=str,
+        nargs="+",
+        default=["all_genes", "panel_genes_only", "non_panel_genes_only"],
+        choices=["all_genes", "panel_genes_only", "non_panel_genes_only"],
+        help=(
+            "Which gene subset(s) to score the variability stage's probe reconstruction "
+            "against. This does NOT change what is reconstructed (always the full "
+            "transcriptome) -- it is a scoring-time column mask on the already-computed "
+            "reconstruction, matching run_expvar_aggregation_test.py's convention. "
+            "Defaults to all three subsets (all_genes, panel_genes_only, "
+            "non_panel_genes_only) so the gene-subset explained-variance breakdown plot "
+            "is always populated; the extra cost is 2 masked expvar calls per fold "
+            "(no NMF refit)."
+        ),
+    )
 
     # External panels
     p.add_argument("--external_panels", nargs="*", default=[])
     p.add_argument("--external_names", nargs="*", default=[])
     p.add_argument("--external_probeset_sizes", nargs="*", type=int, default=[])
-
-    # 10x integration
-    p.add_argument("--add_10x_panels", default="no-10x-panel")
-    p.add_argument("--data_dir", default="")
 
     # Dry-run
     p.add_argument("--dry_run", action="store_true", default=False,
@@ -417,15 +593,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hvg_subset_options", nargs="*", default=[])
     p.add_argument("--reduction_types", nargs="*", default=[])
     p.add_argument("--analysis_types", nargs="*", default=[])
-    p.add_argument("--dimred_methods", nargs="*", default=[])
     p.add_argument("--dt_percentages", nargs="*", type=float, default=[])
     p.add_argument("--dimred_percentages", nargs="*", type=float, default=[])
     p.add_argument("--run_celltype_specific_filling", default="")
     p.add_argument("--run_global_gene_filling", default="")
     p.add_argument("--run_deg_based_filling", default="")
     p.add_argument("--preferred_strategy", default="")
-    p.add_argument("--external_names_filter", nargs="*", dest="external_names_filter", default=[],
-                   help="External panel names to include in evaluation (display-name filter).")
 
     return p
 
@@ -446,23 +619,28 @@ def _args_to_config(args: argparse.Namespace) -> EvaluationConfig:
         output_dir=Path(args.output_dir),
         gene_lists_dir=Path(args.gene_lists_dir) if args.gene_lists_dir else None,
         gene_list_files_txt=Path(args.gene_list_files_txt) if args.gene_list_files_txt else None,
+        reference_blacklist_patterns=args.reference_blacklist_patterns or [],
+        reference_use_default_blacklist=not args.reference_disable_default_blacklist,
         evaluation_type=args.evaluation_type,
         celltype_col=args.celltype_col,
-        dimensionality_reduction=args.dimensionality_reduction,
+        celltype_clf_max_depth=args.celltype_clf_max_depth,
         n_components=args.n_components,
-        test_size=args.test_size,
         random_state=args.random_state,
         n_splits=args.n_splits,
-        split_mode=args.split_mode,
         n_neighbors=args.n_neighbors,
         dim_reduction_preprocess=args.dim_reduction_preprocess,
         include_tangram=args.include_tangram,
         tangram_n_epochs=args.tangram_n_epochs,
+        pathway_libraries=args.pathway_libraries,
+        pathway_organism=args.pathway_organism,
+        pathway_sleep=args.pathway_sleep,
+        pathway_top_n=args.pathway_top_n,
+        pathway_per_celltype=args.pathway_per_celltype,
+        pathway_celltype_gene_source=args.pathway_celltype_gene_source,
+        pathway_celltype_min_genes=args.pathway_celltype_min_genes,
         external_panels=args.external_panels or [],
         external_names=args.external_names or [],
         external_probeset_sizes=args.external_probeset_sizes or [],
-        add_10x_panels=args.add_10x_panels,
-        data_dir=args.data_dir,
         dry_run=args.dry_run,
         strategies=args.strategies or [],
         probeset_sizes=args.probeset_sizes or [],
@@ -470,7 +648,6 @@ def _args_to_config(args: argparse.Namespace) -> EvaluationConfig:
         hvg_subset_options=args.hvg_subset_options or [],
         reduction_types=args.reduction_types or [],
         analysis_types=args.analysis_types or [],
-        dimred_methods=args.dimred_methods or [],
         dt_percentages=args.dt_percentages or [],
         dimred_percentages=args.dimred_percentages or [],
         run_celltype_specific_filling=args.run_celltype_specific_filling or "",
@@ -478,6 +655,10 @@ def _args_to_config(args: argparse.Namespace) -> EvaluationConfig:
         run_deg_based_filling=args.run_deg_based_filling or "",
         preferred_strategy=args.preferred_strategy or "",
         nmf_counts_input=args.nmf_counts_input,
+        nmf_objective=args.nmf_objective,
+        expvar_mode=args.expvar_mode,
+        expvar_modes=args.expvar_modes or [],
+        gene_subsets=args.gene_subsets or ["all_genes"],
     )
 
 
@@ -509,17 +690,13 @@ def _save_results_per_dataset(
     is_celltype = "celltype" in results_df.columns
 
     if is_celltype:
+        # Cell-type results carry both a dataset-level row (celltype NaN) and per-cell-type
+        # rows under the same "dataset" value; write them together, one CSV per dataset.
         base_datasets = results_df[results_df["celltype"].isna()]["dataset"].unique()
         logger.info("Saving %s results for %d datasets to: %s", metric_name, len(base_datasets), output_subdir)
 
         for base_name in base_datasets:
-            dataset_level = results_df[results_df["dataset"] == base_name].copy()
-            per_ct_rows = [
-                row for _, row in results_df[results_df["celltype"].notna()].iterrows()
-                if row["dataset"] == f"{base_name}_{row['celltype']}"
-            ]
-            per_celltype = pd.DataFrame(per_ct_rows) if per_ct_rows else pd.DataFrame()
-            combined = pd.concat([dataset_level, per_celltype], ignore_index=True)
+            combined = results_df[results_df["dataset"] == base_name].copy()
             safe_name = base_name.replace("/", "_").replace(" ", "_")
             combined.to_csv(Path(output_subdir) / f"{safe_name}.csv", index=False)
             logger.info("  Saved %s: %d rows", base_name, len(combined))
@@ -564,8 +741,6 @@ def _build_filter_args(config: EvaluationConfig) -> dict[str, Any] | None:
         fa["reduction_types"] = config.reduction_types
     if config.analysis_types:
         fa["analysis_types"] = config.analysis_types
-    if config.dimred_methods:
-        fa["dimred_methods"] = config.dimred_methods
     if config.dt_percentages:
         fa["dt_percentages"] = config.dt_percentages
     if config.dimred_percentages:
@@ -661,6 +836,9 @@ def _compute_full_nmf_baseline(
     A_test: np.ndarray,
     n_components: int = 5,
     random_state: int = 42,
+    expvar_mode: str = "global_mean",
+    nmf_counts_input: str = "raw",
+    nmf_objective: str = "auto",
 ) -> dict[str, Any]:
     """Compute the full-transcriptome NMF baseline.
 
@@ -671,66 +849,36 @@ def _compute_full_nmf_baseline(
         A_test: Testing data (cells × genes).
         n_components: Number of NMF components.
         random_state: Random seed.
+        expvar_mode: Explained-variance aggregation mode (see ``metrics.EXPVAR_MODES``).
+        nmf_counts_input: Which count matrix ``A_train``/``A_test`` were derived from
+            (``"raw"`` or ``"lognorm"``) — used only to resolve ``nmf_objective``.
+        nmf_objective: NMF factorization objective — ``"auto"`` (default) derives the
+            solver/beta_loss from ``nmf_counts_input``; ``"frobenius"``/``"kl"`` force
+            that objective regardless of input. See ``_nmf_objective.py``.
 
     Returns:
         Dictionary with ``"training"`` and ``"testing"`` sub-dicts each
         containing ``W``, ``H``, reconstructed matrix, MSE, and explained
         variance.
     """
+    # solver/beta_loss/init/max_iter derived from the count-input choice (raw -> mu/KL,
+    # lognorm -> cd/Frobenius) unless nmf_objective forces one; shared with Selection-module.
+    _obj_kwargs = resolve_nmf_objective(nmf_counts_input, nmf_objective)
+
     def _fit(X: np.ndarray) -> dict[str, Any]:
         pred = NmfPredictor(
-            embedding_size=n_components, seed=random_state, max_iter=1000,
-            beta_loss="frobenius", init=None, alpha_W=0.0, alpha_H=0.0, l1_ratio=0.0,
+            embedding_size=n_components, random_state=random_state,
+            **_obj_kwargs,
         ).fit(X)
         W, H = pred.ref_embedding, pred.h_reference
         X_recon = W @ H
         return {
             "W": W, "H": H, "X_recon": X_recon,
             "mse": calculate_mse(X, X_recon),
-            "expvar": calculate_explained_variance(X, X_recon),
+            "expvar": calculate_explained_variance(X, X_recon, mode=expvar_mode),
         }
 
     return {"training": _fit(A_train), "testing": _fit(A_test)}
-
-
-def _compute_full_nmf_baseline_swapped(
-    A_train: np.ndarray,
-    A_test: np.ndarray,
-    n_components: int = 5,
-    random_state: int = 42,
-) -> dict[str, Any]:
-    """Compute the full-transcriptome NMF baseline (mapping convention).
-
-    Uses the transposed convention: ``A.T ≈ H.T @ W.T`` so that H spans
-    the gene dimension.
-
-    Args:
-        A_train: Training data (cells × genes).
-        A_test: Testing data (cells × genes).
-        n_components: Number of NMF components.
-        random_state: Random seed.
-
-    Returns:
-        Dictionary with ``"training"`` and ``"testing"`` sub-dicts.
-    """
-    def _fit_swapped(X: np.ndarray) -> dict[str, Any]:
-        # Fit on transposed matrix so ref_embedding spans gene space.
-        # pred.ref_embedding  ≡ model.fit_transform(X.T)  — shape (n_genes × n_components)
-        # pred.h_reference    ≡ model.components_          — shape (n_components × n_cells)
-        pred = NmfPredictor(
-            embedding_size=n_components, seed=random_state, max_iter=1000,
-            beta_loss="frobenius", init=None, alpha_W=0.0, alpha_H=0.0, l1_ratio=0.0,
-        ).fit(X.T)
-        H = pred.ref_embedding.T    # model.fit_transform(X.T).T  → (n_components × n_genes)
-        W = pred.h_reference.T      # model.components_.T          → (n_cells × n_components)
-        X_recon = W @ H
-        return {
-            "W": W, "H": H, "X_recon": X_recon,
-            "mse": calculate_mse(X, X_recon),
-            "expvar": calculate_explained_variance(X, X_recon),
-        }
-
-    return {"training": _fit_swapped(A_train), "testing": _fit_swapped(A_test)}
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +921,16 @@ def run_preprocessing_stage(config: EvaluationConfig) -> None:
 
     adata.obs_names_make_unique()
 
+    # ── Reference blacklist filtering ────────────────────────────────
+    # Applied before the reference cache check so both the cached
+    # full_transcriptome.h5ad and the per-panel subsetting loop below see
+    # the same filtered gene universe.
+    adata = filter_reference_blacklist(
+        adata,
+        blacklist_patterns=config.reference_blacklist_patterns or None,
+        use_default_blacklist=config.reference_use_default_blacklist,
+    )
+
     # ── Reference preprocessing ──────────────────────────────────────
     ref_out = config.preprocessed_dir / "full_transcriptome.h5ad"
     if not ref_out.exists():
@@ -798,7 +956,6 @@ def run_preprocessing_stage(config: EvaluationConfig) -> None:
                 continue
             genes = load_gene_list_from_csv(path)
             if genes:
-                from _preprocessing import extract_genelist_name_from_path
                 name = extract_genelist_name_from_path(path)
                 gene_lists[name] = genes
     elif config.gene_lists_dir is not None and config.gene_lists_dir.exists():
@@ -874,8 +1031,8 @@ def run_baseline_evaluation(
     preprocessed_datasets: dict[str, sc.AnnData],
     output_dir: str | Path,
     celltype_col: str = "cluster",
-    dimensionality_reduction: str = "pca",
     external_names: list[str] | None = None,
+    celltype_clf_max_depth: int = DEFAULT_CELLTYPE_CLF_MAX_DEPTH,
 ) -> dict[str, Any]:
     """Run baseline evaluation on preprocessed datasets.
 
@@ -888,9 +1045,10 @@ def run_baseline_evaluation(
         output_dir: Root output directory. Results go into
             ``Baseline-Evaluation/results/`` and ``Baseline-Evaluation/plots/``.
         celltype_col: obs column holding cell-type labels.
-        dimensionality_reduction: Embedding to use (``"pca"``, ``"nmf"``,
-            or ``"both"``).
         external_names: Optional list of external panel names for plot colouring.
+        celltype_clf_max_depth: Fixed ``max_depth`` for the cell-type-classification
+            decision tree, applied identically to every panel here. See
+            ``evaluate_celltype_identification`` / ``EvaluationConfig.celltype_clf_max_depth``.
 
     Returns:
         Dictionary with keys ``"neighborhood"``, ``"clustering"``,
@@ -914,7 +1072,6 @@ def run_baseline_evaluation(
         nb_results = evaluate_neighborhood_preservation(
             preprocessed_datasets,
             reference_key="full_transcriptome",
-            dimensionality_reduction=dimensionality_reduction,
             celltype_col=celltype_col,
         )
         results["neighborhood"] = nb_results
@@ -932,7 +1089,6 @@ def run_baseline_evaluation(
         cl_results = evaluate_clustering_quality(
             preprocessed_datasets,
             reference_key="full_transcriptome",
-            dimensionality_reduction=dimensionality_reduction,
             celltype_col=celltype_col,
         )
         results["clustering"] = cl_results
@@ -951,6 +1107,7 @@ def run_baseline_evaluation(
             preprocessed_datasets,
             reference_key="full_transcriptome",
             celltype_col=celltype_col,
+            celltype_clf_max_depth=celltype_clf_max_depth,
         )
         results["celltype"] = ct_results
         _save_results_per_dataset(ct_results, results_dir / "celltype", "Cell-type")
@@ -959,53 +1116,187 @@ def run_baseline_evaluation(
     gc.collect()
     _log_memory("after cell-type evaluation")
 
-    # ── 4. Rare cell type marker coverage ────────────────────────────
-    logger.info("-" * 60)
-    logger.info("4. RARE CELL TYPE MARKER COVERAGE")
-    logger.info("-" * 60)
-    try:
-        adata_full = preprocessed_datasets["full_transcriptome"]
-        rare_rows = []
-        for dataset_name, dataset in preprocessed_datasets.items():
-            if dataset_name == "full_transcriptome":
-                continue
-            panel_genes = list(dataset.var_names)
-            coverage = compute_rare_celltype_marker_coverage(
-                adata_full,
-                panel_genes=panel_genes,
-                celltype_col=celltype_col,
-            )
-            # Summary row
-            rare_rows.append(
-                {
-                    "dataset": dataset_name,
-                    "celltype": None,
-                    "n_rare_celltypes": coverage["n_rare_celltypes"],
-                    "panel_n_rare_ct_covered": coverage["panel_n_rare_ct_covered"],
-                    "panel_fraction_rare_ct_covered": coverage["panel_fraction_rare_ct_covered"],
-                }
-            )
-            # Per-CT rows
-            for ct, ct_info in coverage["per_rare_ct"].items():
-                rare_rows.append(
-                    {
-                        "dataset": dataset_name,
-                        "celltype": ct,
-                        "n_cells": ct_info["n_cells"],
-                        "fraction_cells": ct_info["fraction_cells"],
-                        "n_exclusive_markers_total": ct_info["n_exclusive_markers_total"],
-                        "n_exclusive_markers_in_panel": ct_info["n_exclusive_markers_in_panel"],
-                    }
-                )
-        rare_df = pd.DataFrame(rare_rows)
-        results["rare_coverage"] = rare_df
-        _save_results_per_dataset(rare_df, results_dir / "rare_coverage", "Rare CT Coverage")
-    except Exception as exc:
-        logger.warning("Rare cell type coverage evaluation failed: %s", exc, exc_info=True)
-    gc.collect()
-    _log_memory("after rare coverage evaluation")
-
     logger.info("Baseline evaluation complete.")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Biology evaluation stage (pathway enrichment)
+# ---------------------------------------------------------------------------
+
+
+def run_biology_evaluation(
+    preprocessed_datasets: dict[str, sc.AnnData],
+    output_dir: str | Path,
+    libraries: list[str] | None = None,
+    organism: str = "human",
+    sleep: float = 1.0,
+    top_n: int = 12,
+    per_celltype: bool = False,
+    per_celltype_gene_source: str = "informative",
+    per_celltype_min_genes: int = 5,
+    gene_list_paths: dict[str, str] | None = None,
+    celltype_col: str = "cluster",
+    reference_celltypes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Run Enrichr pathway enrichment on each preprocessed panel.
+
+    For every panel (excluding ``"full_transcriptome"``), runs Enrichr over
+    the panel's genes and saves significant pathways + top-hit bar charts.
+    Requires ``gseapy``; if unavailable, logs a warning and returns ``{}``.
+
+    When *per_celltype* is set, additionally runs Enrichr once per cell type
+    (results under ``<panel>/per_celltype/<safe celltype>/``):
+
+    - ``per_celltype_gene_source="informative"``: for each cell type, the panel
+      genes whose ``ranked_gene_list.csv`` ``informative_celltypes`` column lists
+      it. Needs *gene_list_paths* (``{panel_name: ranked_gene_list.csv path}``);
+      panels with no entry are logged and skipped for the per-cell-type pass.
+    - ``per_celltype_gene_source="all_panel"``: the full panel gene list for each
+      cell type in *reference_celltypes*.
+
+    Args:
+        preprocessed_datasets: ``{dataset_name: AnnData}`` dict. Must include
+            a ``"full_transcriptome"`` key (skipped, not itself enriched).
+        output_dir: Root output directory. Results go into
+            ``Biology-Evaluation/results/``.
+        libraries: Enrichr gene-set libraries to query.
+        organism: Enrichr organism (``"human"`` or ``"mouse"``).
+        sleep: Seconds to sleep between per-panel Enrichr API calls.
+        top_n: Number of top pathways to plot per library.
+        per_celltype: Also run the per-cell-type enrichment pass.
+        per_celltype_gene_source: ``"informative"`` or ``"all_panel"`` (see above).
+        per_celltype_min_genes: Skip cell types with fewer than this many genes.
+        gene_list_paths: ``{panel_name: ranked_gene_list.csv path}`` for the
+            ``"informative"`` source.
+        celltype_col: Reference cell-type column name (recorded in the summary).
+        reference_celltypes: Cell-type labels for the ``"all_panel"`` source.
+
+    Returns:
+        Dictionary with ``"pathway_summary"`` (DataFrame),
+        ``"significant_pathways"`` (``{panel_name: DataFrame}``) and, when
+        *per_celltype* is set, ``"pathway_per_celltype_summary"`` (DataFrame).
+    """
+    logger.info("=" * 80)
+    logger.info("BIOLOGY EVALUATION: Pathway Enrichment (Enrichr)")
+    logger.info("=" * 80)
+
+    if not _PATHWAY_AVAILABLE:
+        logger.warning("gseapy not installed – skipping biology evaluation.")
+        return {}
+
+    libraries = resolve_pathway_libraries(organism, libraries)
+    logger.info("Enrichr organism=%s, libraries=%s", organism, libraries)
+    output_dir = Path(output_dir)
+    results_dir = output_dir / "Biology-Evaluation" / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    panel_names = [n for n in preprocessed_datasets if n != "full_transcriptome"]
+    logger.info("Evaluating pathway enrichment for %d panels...", len(panel_names))
+
+    if per_celltype:
+        logger.info(
+            "Per-cell-type pathway enrichment enabled (gene_source=%s, min_genes=%d)",
+            per_celltype_gene_source, per_celltype_min_genes,
+        )
+        gene_list_paths = gene_list_paths or {}
+
+    summary_rows: list[dict[str, Any]] = []
+    significant_pathways: dict[str, pd.DataFrame] = {}
+    per_celltype_rows: list[dict[str, Any]] = []
+
+    for panel_name in tqdm(panel_names, desc="Biology evaluation"):
+        adata_panel = preprocessed_datasets[panel_name]
+        genes = adata_panel.var_names.tolist()
+        sig = run_pathway_enrichment_for_panel(
+            label=panel_name,
+            genes=genes,
+            out_dir=results_dir / panel_name,
+            libraries=libraries,
+            organism=organism,
+            top_n=top_n,
+        )
+        n_significant = 0 if sig is None else len(sig)
+        summary_rows.append({
+            "dataset": panel_name,
+            "n_genes": len(genes),
+            "n_significant": n_significant,
+        })
+        if sig is not None:
+            significant_pathways[panel_name] = sig
+        time.sleep(sleep)
+
+        if not per_celltype:
+            continue
+
+        if per_celltype_gene_source == "all_panel":
+            if not reference_celltypes:
+                logger.warning(
+                    "per_celltype_gene_source='all_panel' but no reference cell types "
+                    "provided – skipping per-cell-type pass for '%s'", panel_name,
+                )
+                continue
+            genes_by_celltype = {ct: list(genes) for ct in reference_celltypes}
+        else:  # "informative"
+            csv_path = gene_list_paths.get(panel_name)
+            if not csv_path:
+                # An empty map means no --gene_lists_dir/--gene_list_files_txt was given
+                # (already warned once upfront); a populated map missing just this panel
+                # is unexpected and worth a warning.
+                log_fn = logger.warning if gene_list_paths else logger.info
+                log_fn(
+                    "No ranked_gene_list.csv mapped for panel '%s' – skipping its "
+                    "per-cell-type pass (pass --gene_lists_dir / --gene_list_files_txt "
+                    "or --pathway_celltype_gene_source all_panel)",
+                    panel_name,
+                )
+                continue
+            genes_by_celltype = load_panel_informative_map(csv_path, genes)
+            if not genes_by_celltype:
+                logger.warning(
+                    "No per-cell-type gene attribution found for panel '%s'", panel_name,
+                )
+                continue
+
+        ct_summary = run_pathway_enrichment_by_celltype(
+            label=panel_name,
+            genes_by_celltype=genes_by_celltype,
+            out_dir=results_dir / panel_name / "per_celltype",
+            libraries=libraries,
+            organism=organism,
+            top_n=top_n,
+            min_genes=per_celltype_min_genes,
+            sleep=sleep,
+        )
+        for row in ct_summary.to_dict("records"):
+            per_celltype_rows.append({
+                "dataset": panel_name,
+                "celltype_col": celltype_col,
+                "gene_source": per_celltype_gene_source,
+                **row,
+            })
+
+    results: dict[str, Any] = {}
+    if summary_rows:
+        df_summary = pd.DataFrame(summary_rows)
+        df_summary.to_csv(results_dir / "pathway_summary.csv", index=False)
+        results["pathway_summary"] = df_summary
+        results["significant_pathways"] = significant_pathways
+
+    if per_celltype:
+        df_ct_summary = pd.DataFrame(
+            per_celltype_rows,
+            columns=["dataset", "celltype_col", "gene_source", "celltype",
+                     "n_genes", "n_significant", "skipped_reason"],
+        )
+        df_ct_summary.to_csv(
+            results_dir / "pathway_per_celltype_summary.csv", index=False
+        )
+        results["pathway_per_celltype_summary"] = df_ct_summary
+
+    gc.collect()
+    _log_memory("after biology evaluation")
+    logger.info("Biology evaluation complete.")
     return results
 
 
@@ -1027,23 +1318,20 @@ def _aggregate_fold_results(df_per_fold: pd.DataFrame) -> pd.DataFrame:
         logger.warning("No 'fold' column found in results. Returning original DataFrame.")
         return df_per_fold
 
-    # Identify grouping columns (non-metric columns)
-    metric_cols = ["mse_train_baseline", "mse_test_baseline", "mse_test_probe",
-                   "expvar_train_baseline", "expvar_test_baseline", "expvar_test_probe",
-                   "mse_ratio", "expvar_ratio", "probeset_size", "probeset_genes_found",
-                   "weighted_mse_test_probe", "weighted_mse_test_baseline",
-                   "weighted_expvar_test_probe", "weighted_expvar_test_baseline",
-                   "macro_mse_test_probe", "macro_mse_test_baseline",
-                   "macro_expvar_test_probe", "macro_expvar_test_baseline",
-                   "total_cells", "n_celltypes_processed", "n_celltypes_skipped",
-                   "mse_train_probe", "expvar_train_probe"]
-
     group_cols = ["dataset", "gene_list", "analysis_type"]
     if "celltype" in df_per_fold.columns:
         group_cols.append("celltype")
 
-    # Filter to only existing metric columns
-    available_metrics = [col for col in metric_cols if col in df_per_fold.columns]
+    # Metric columns = every numeric column except the grouping columns and "fold"
+    # itself. Generalized from a hardcoded name list to dynamic numeric-dtype
+    # detection so the gene-subset x expvar-mode columns (e.g.
+    # expvar_test_probe_panel_genes_only_variance_weighted_sum) get fold-aggregated
+    # automatically without enumerating every (subset, mode) combination by hand.
+    exclude_cols = set(group_cols) | {"fold"}
+    available_metrics = [
+        c for c in df_per_fold.select_dtypes(include=[np.number]).columns
+        if c not in exclude_cols
+    ]
 
     if not available_metrics:
         logger.warning("No metric columns found for aggregation.")
@@ -1075,6 +1363,10 @@ def run_variability_evaluation(
     random_state: int = 42,
     external_names: list[str] | None = None,
     nmf_counts_input: str = "raw",
+    nmf_objective: str = "auto",
+    expvar_mode: str = "global_mean",
+    expvar_modes: list[str] | None = None,
+    gene_subsets: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run NMF-based variability evaluation using pre-generated train/test splits.
 
@@ -1096,6 +1388,16 @@ def run_variability_evaluation(
         celltype_col: obs column for cell-type labels.
         random_state: Random seed.
         external_names: External panel names for plot colouring.
+        nmf_counts_input: Which count matrix to use (``"raw"`` or ``"lognorm"``).
+        nmf_objective: NMF factorization objective — ``"auto"`` (default) derives the
+            solver/beta_loss from ``nmf_counts_input``; ``"frobenius"``/``"kl"`` force
+            that objective regardless of input. See ``_nmf_objective.py``.
+        expvar_mode: Explained-variance aggregation mode (see ``metrics.EXPVAR_MODES``).
+        expvar_modes: Optional list of explained-variance modes to additionally report
+            (see ``nmf.py::nmf_reconstruction``). Defaults to ``None``, i.e. ``[expvar_mode]``.
+        gene_subsets: Optional list of gene subsets to score against (``"all_genes"``,
+            ``"panel_genes_only"``, ``"non_panel_genes_only"``). Defaults to ``None``,
+            i.e. ``["all_genes"]``.
 
     Returns:
         Dictionary with ``"nmf"`` and ``"nmf_per_fold"`` DataFrames.
@@ -1141,9 +1443,10 @@ def run_variability_evaluation(
         raise ValueError(
             f"Unknown nmf_counts_input='{nmf_counts_input}'. Choose 'raw' or 'lognorm'."
         )
-    if scipy.sparse.issparse(X_full):
-        X_full = X_full.toarray()
-    X_full = np.asarray(X_full, dtype=np.float32)
+    # Do NOT densify X_full upfront.  For the full-transcriptome reference
+    # (167K × 28K genes) this alone costs ~18 GB.  Instead we materialise only
+    # the per-fold train/test slices inside the loop below, so at most one
+    # fold's worth of dense data coexists with the sparse source matrix.
 
     if celltype_col not in adata_full.obs.columns:
         logger.error("Cell-type column '%s' not found.", celltype_col)
@@ -1161,20 +1464,26 @@ def run_variability_evaluation(
         logger.info("FOLD %d/%d: %d training cells, %d test cells", fold + 1, len(splits), len(train_idx), len(test_idx))
         logger.info("-" * 60)
 
-        A_train = X_full[train_idx]
-        A_test = X_full[test_idx]
+        # Materialise only the current fold's slices as dense float32.
+        # Keeps peak usage to ~one fold's worth of data instead of the full matrix.
+        def _to_dense_f32(X: np.ndarray | scipy.sparse.spmatrix, idx: np.ndarray) -> np.ndarray:
+            s = X[idx]
+            if scipy.sparse.issparse(s):
+                s = s.toarray()
+            return np.asarray(s, dtype=np.float32)
+
+        A_train = _to_dense_f32(X_full, train_idx)
+        A_test = _to_dense_f32(X_full, test_idx)
 
         # Convert index-based per-celltype splits to array-based splits
         ct_splits: dict[str, tuple[np.ndarray, np.ndarray]] = {
-            ct: (X_full[tr], X_full[te])
+            ct: (_to_dense_f32(X_full, tr), _to_dense_f32(X_full, te))
             for ct, (tr, te) in ct_splits_idx.items()
         }
 
         # Initialize NMF caches per fold
         cached_full_nmf: dict[int, Any] = {}
-        cached_full_nmf_swapped: dict[int, Any] = {}
         cached_ct_nmf: dict[str, dict] = {}
-        cached_ct_nmf_swapped: dict[str, dict] = {}
 
         for panel_name in tqdm(panel_names, desc=f"Fold {fold + 1} evaluation", leave=False):
             adata_panel = preprocessed_datasets[panel_name]
@@ -1190,9 +1499,7 @@ def run_variability_evaluation(
                     A_test=A_test,
                     ct_splits=ct_splits,
                     cached_full_nmf=cached_full_nmf,
-                    cached_full_nmf_swapped=cached_full_nmf_swapped,
                     cached_ct_nmf=cached_ct_nmf,
-                    cached_ct_nmf_swapped=cached_ct_nmf_swapped,
                     n_components=panel_n,
                     celltype_col=celltype_col,
                     random_state=random_state,
@@ -1200,6 +1507,10 @@ def run_variability_evaluation(
                     per_celltype_splits=ct_splits_idx,
                     fold=fold,
                     nmf_counts_input=nmf_counts_input,
+                    nmf_objective=nmf_objective,
+                    expvar_mode=expvar_mode,
+                    expvar_modes=expvar_modes,
+                    gene_subsets=gene_subsets,
                 )
             except Exception as exc:
                 logger.warning("Fold %d: Evaluation failed for '%s': %s. Skipping.", fold, panel_name, exc, exc_info=True)
@@ -1238,9 +1549,7 @@ def _evaluate_single_panel_variability(
     A_test: np.ndarray,
     ct_splits: dict[str, tuple[np.ndarray, np.ndarray]],
     cached_full_nmf: dict[int, Any],
-    cached_full_nmf_swapped: dict[int, Any],
     cached_ct_nmf: dict[str, dict],
-    cached_ct_nmf_swapped: dict[str, dict],
     n_components: int,
     celltype_col: str,
     random_state: int,
@@ -1248,6 +1557,10 @@ def _evaluate_single_panel_variability(
     per_celltype_splits: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
     fold: int | None = None,
     nmf_counts_input: str = "raw",
+    nmf_objective: str = "auto",
+    expvar_mode: str = "global_mean",
+    expvar_modes: list[str] | None = None,
+    gene_subsets: list[str] | None = None,
 ) -> None:
     """Run NMF evaluation for one panel.
 
@@ -1261,9 +1574,7 @@ def _evaluate_single_panel_variability(
         A_test: Global test data (cells × full genes).
         ct_splits: Per-cell-type ``{celltype: (A_train, A_test)}``.
         cached_full_nmf: Cache for global NMF baselines (mutated in place).
-        cached_full_nmf_swapped: Cache for swapped global NMF baselines.
         cached_ct_nmf: Cache for per-cell-type NMF baselines.
-        cached_ct_nmf_swapped: Cache for per-cell-type swapped NMF baselines.
         n_components: NMF components for this panel.
         celltype_col: obs column for cell-type labels.
         random_state: Random seed.
@@ -1271,19 +1582,24 @@ def _evaluate_single_panel_variability(
         per_celltype_splits: Per-cell-type index splits.
         fold: Fold number (optional, for k-fold evaluation).
         nmf_counts_input: Which count matrix to use (``"raw"`` or ``"lognorm"``).
+        nmf_objective: NMF factorization objective — ``"auto"`` (default) derives the
+            solver/beta_loss from ``nmf_counts_input``; ``"frobenius"``/``"kl"`` force
+            that objective regardless of input. See ``_nmf_objective.py``.
+        expvar_mode: Explained-variance aggregation mode (see ``metrics.EXPVAR_MODES``).
+        expvar_modes: Optional list of explained-variance modes to additionally report
+            (see ``nmf.py::nmf_reconstruction``). Defaults to ``None``, i.e. ``[expvar_mode]``.
+        gene_subsets: Optional list of gene subsets to score against. Defaults to
+            ``None``, i.e. ``["all_genes"]``.
     """
     # Lazily compute global NMF baseline
     if n_components not in cached_full_nmf:
         logger.info("Computing global NMF baseline (n_components=%d)...", n_components)
         cached_full_nmf[n_components] = _compute_full_nmf_baseline(
-            A_train, A_test, n_components, random_state
-        )
-        cached_full_nmf_swapped[n_components] = _compute_full_nmf_baseline_swapped(
-            A_train, A_test, n_components, random_state
+            A_train, A_test, n_components, random_state, expvar_mode=expvar_mode,
+            nmf_counts_input=nmf_counts_input, nmf_objective=nmf_objective,
         )
 
     baseline = cached_full_nmf[n_components]
-    baseline_sw = cached_full_nmf_swapped[n_components]
 
     # ── Translate evaluation-baseline format → variability-cache format ───────
     # _compute_full_nmf_baseline stores keys ("W", "H", "X_recon", "mse", "expvar")
@@ -1319,7 +1635,13 @@ def _evaluate_single_panel_variability(
         A_train=A_train,
         A_test=A_test,
         n_components=n_components,
+        random_state=random_state,
         cached_full_nmf=variability_cache,
+        nmf_counts_input=nmf_counts_input,
+        nmf_objective=nmf_objective,
+        expvar_mode=expvar_mode,
+        expvar_modes=expvar_modes,
+        gene_subsets=gene_subsets,
     )
     if nmf_global:
         nmf_global["dataset"] = panel_name
@@ -1337,799 +1659,29 @@ def _evaluate_single_panel_variability(
             probeset_genes=probeset_genes,
             celltype_column=celltype_col,
             n_components=n_components,
+            random_state=random_state,
             cached_full_nmf_by_celltype=cached_ct_nmf,
             per_celltype_splits=per_celltype_splits,
             nmf_counts_input=nmf_counts_input,
+            nmf_objective=nmf_objective,
+            expvar_mode=expvar_mode,
+            expvar_modes=expvar_modes,
+            gene_subsets=gene_subsets,
         )
-        for ct, res in (mech_ct or {}).items():
-            row = {**res, "dataset": panel_name, "gene_list": panel_name, "celltype": ct, "analysis_type": "per_celltype"}
-            if fold is not None:
-                row["fold"] = fold
-            nmf_rows.append(row)
-
-# ---------------------------------------------------------------------------
-# Feature plots & dot plot generation
-# ---------------------------------------------------------------------------
-
-
-def generate_panel_plots(
-    adata_full: sc.AnnData,
-    preprocessed_datasets: dict[str, sc.AnnData],
-    celltype_col: str,
-    output_dir: Path,
-) -> None:
-    """Generate and save UMAP featureplots and a dot plot for each panel.
-
-    Plots are saved under *output_dir* / "Feature-Plots" / *panel_name* /.
-
-    Args:
-        adata_full: Full-transcriptome AnnData (used for UMAP embedding).
-        preprocessed_datasets: Dict of panel name → panel AnnData.
-        celltype_col: obs column for cell-type labels.
-        output_dir: Root evaluation output directory.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    logger.info("=" * 80)
-    logger.info("GENERATING FEATURE PLOTS AND DOT PLOTS")
-    logger.info("=" * 80)
-
-    # --- Compute UMAP on the full transcriptome once ---
-    adata = adata_full.copy()
-    try:
-        if "X_pca" not in adata.obsm:
-            sc.pp.normalize_total(adata, target_sum=1e4)
-            sc.pp.log1p(adata)
-            sc.pp.highly_variable_genes(adata, n_top_genes=2000, flavor="seurat")
-            sc.pp.pca(adata, n_comps=30)
-            sc.pp.neighbors(adata)
-        if "X_umap" not in adata.obsm:
-            sc.tl.umap(adata)
-    except Exception as exc:
-        logger.warning("Could not compute UMAP embedding: %s", exc, exc_info=True)
-        return
-
-    panel_names = [n for n in preprocessed_datasets if n != "full_transcriptome"]
-
-    for panel_name in panel_names:
-        panel_adata = preprocessed_datasets[panel_name]
-        panel_genes = panel_adata.var_names.tolist()
-        panel_in_adata = [g for g in panel_genes if g in adata.var_names]
-
-        plots_dir = output_dir / "Feature-Plots" / panel_name
-        plots_dir.mkdir(parents=True, exist_ok=True)
-
-        logger.info("Saving feature plots for panel '%s' (%d genes)...", panel_name, len(panel_in_adata))
-
-        # --- UMAP coloured by cell type (compact, high-res) ---
-        if celltype_col in adata.obs.columns:
-            try:
-                fig, ax = plt.subplots(figsize=(4, 3.5))
-                sc.pl.umap(adata, color=celltype_col, ax=ax, show=False, frameon=False, size=6)
-                fig.tight_layout()
-                fig.savefig(plots_dir / "umap_celltypes.png", dpi=300, bbox_inches="tight")
-                plt.close(fig)
-            except Exception as exc:
-                logger.warning("Could not save celltype UMAP for %s: %s", panel_name, exc)
-
-            # --- Cell-type count bar chart ---
-            try:
-                ct_counts = adata.obs[celltype_col].value_counts().sort_values(ascending=True)
-                n_ct = len(ct_counts)
-                # Scale height tightly per cell type; cap width so it fits next to UMAP
-                fig_h = max(1.8, n_ct * 0.22)
-                fig2, ax2 = plt.subplots(figsize=(2.8, fig_h))
-                colors = plt.cm.tab20.colors  # up to 20 distinct colours
-                bar_colors = [colors[i % len(colors)] for i in range(n_ct)]
-                ax2.barh(ct_counts.index.tolist(), ct_counts.values.tolist(),
-                         color=bar_colors, edgecolor="white", linewidth=0.5)
-                # Add count labels on each bar
-                x_max = ct_counts.values.max()
-                for i, v in enumerate(ct_counts.values):
-                    ax2.text(v + x_max * 0.02, i, f"{v:,}", va="center", fontsize=6)
-                ax2.set_xlim(0, x_max * 1.30)
-                ax2.set_xlabel("Cell count", fontsize=8)
-                ax2.set_title("Cells per cell type", fontsize=9)
-                ax2.tick_params(axis="y", labelsize=7)
-                ax2.tick_params(axis="x", labelsize=7)
-                for spine in ["top", "right"]:
-                    ax2.spines[spine].set_visible(False)
-                fig2.tight_layout()
-                # 120 DPI keeps the image compact when rendered in the browser column
-                fig2.savefig(plots_dir / "celltype_counts.png", dpi=120, bbox_inches="tight")
-                plt.close(fig2)
-            except Exception as exc:
-                logger.warning("Could not save celltype count bar chart for %s: %s", panel_name, exc)
-
-        # --- Gene featureplots: individual per-gene PNGs + batch PNGs of 4 ---
-        gene_index: dict[str, str] = {}  # gene → filename mapping saved as JSON
-        batch_size = 4
-        for i in range(0, len(panel_in_adata), batch_size):
-            batch = panel_in_adata[i : i + batch_size]
-            batch_fname = f"featureplot_{i // batch_size + 1:03d}.png"
-            try:
-                fig, axes = plt.subplots(1, len(batch), figsize=(4 * len(batch), 3.5))
-                if len(batch) == 1:
-                    axes = [axes]
-                for ax, gene in zip(axes, batch):
-                    sc.pl.umap(adata, color=gene, ax=ax, show=False, frameon=False, title=gene, size=6)
-                fig.tight_layout()
-                fig.savefig(plots_dir / batch_fname, dpi=300, bbox_inches="tight")
-                plt.close(fig)
-            except Exception as exc:
-                logger.warning("Could not save featureplot batch %d for %s: %s", i // batch_size + 1, panel_name, exc)
-
-            # --- Individual per-gene featureplots ---
-            for gene in batch:
-                gene_fname = f"gene_{gene}.png"
-                try:
-                    fig, ax = plt.subplots(figsize=(4, 3.5))
-                    sc.pl.umap(adata, color=gene, ax=ax, show=False, frameon=False, title=gene, size=6)
-                    fig.tight_layout()
-                    fig.savefig(plots_dir / gene_fname, dpi=300, bbox_inches="tight")
-                    plt.close(fig)
-                    gene_index[gene] = gene_fname
-                except Exception as exc:
-                    logger.warning("Could not save individual featureplot for gene %s in %s: %s", gene, panel_name, exc)
-
-        # Save gene index JSON so the app can build the gene selector
-        try:
-            import json as _json
-            with open(plots_dir / "gene_index.json", "w") as fh:
-                _json.dump(gene_index, fh)
-        except Exception as exc:
-            logger.warning("Could not save gene_index.json for %s: %s", panel_name, exc)
-
-        # --- Dot plot ---
-        # For combination strategies we use the custom coloured dotplot so
-        # genes are colour-coded by their selection origin (rf_deg = red,
-        # dimred = blue).  Gene-source info is read preferentially from
-        # ranked_gene_list.csv (most reliable source of truth); if that file
-        # is absent we fall back to panel_adata.var["gene_source"].
-        if panel_in_adata and celltype_col in adata.obs.columns:
-            genes_to_show = panel_in_adata[:60]
-            n_groups = adata.obs[celltype_col].nunique()
-
-            # ── 1. Collect gene_source information ──────────────────────
-            gene_sources: dict[str, str] | None = None
-
-            # ranked_gene_list.csv lives one level above the evaluation dir
-            # (i.e., at the run root) — NOT inside gene_lists/.
-            ranked_csv = output_dir.parent / "ranked_gene_list.csv"
-            if ranked_csv.exists():
-                try:
-                    gl_df = pd.read_csv(ranked_csv, index_col=0)
-                    if "gene_source" in gl_df.columns:
-                        _src_map = {
-                            str(g): str(s)
-                            for g, s in zip(gl_df.index, gl_df["gene_source"].fillna("other"))
-                        }
-                        # Only activate combination mode when rf_deg or dimred
-                        # sources are actually present in the panel
-                        _known = {"rf_deg", "dimred"}
-                        if any(v in _known for v in _src_map.values()):
-                            # Restrict to genes that will actually be plotted
-                            gene_sources = {
-                                g: _src_map.get(g, "other") for g in genes_to_show
-                            }
-                            logger.debug(
-                                "  Read gene_source from %s for panel '%s'",
-                                ranked_csv, panel_name,
-                            )
-                except Exception as exc:
-                    logger.debug(
-                        "Could not read gene_source from %s: %s", ranked_csv, exc
-                    )
-
-            # Fallback: panel_adata.var (may exist if preprocessing preserved it)
-            if gene_sources is None:
-                if (
-                    "gene_source" in panel_adata.var.columns
-                    and panel_adata.var["gene_source"].notna().any()
-                ):
-                    _src_series = panel_adata.var["gene_source"].fillna("other").astype(str)
-                    _src_map = dict(zip(panel_adata.var_names, _src_series))
-                    _known = {"rf_deg", "dimred"}
-                    if any(v in _known for v in _src_map.values()):
-                        gene_sources = {g: _src_map.get(g, "other") for g in genes_to_show}
-
-            has_gene_source = gene_sources is not None
-
-            # ── 2. Detect dimred type for legend label (PCA vs NMF) ─────
-            _pname_lower = panel_name.lower()
-            if "_nmf_" in _pname_lower or _pname_lower.endswith("_nmf"):
-                _dimred_label = "NMF"
-            else:
-                _dimred_label = "PCA"
-
-            if has_gene_source:
-                # Combination strategy → coloured dotplot
-                try:
-                    _plot_dir = Path(__file__).parent.parent / "Plotting-module"
-                    if str(_plot_dir) not in sys.path:
-                        sys.path.insert(0, str(_plot_dir))
-
-                    # Guard against _constants collision (same technique as
-                    # generate_baseline_evaluation_plots)
-                    _stash = {k: sys.modules.pop(k) for k in ["_constants"]
-                              if k in sys.modules}
-                    try:
-                        from _combination_dotplot import plot_combination_dotplot
-                    finally:
-                        for k, v in _stash.items():
-                            sys.modules[k] = v
-                        sys.modules.pop("_constants", None)
-                        for k, v in _stash.items():
-                            sys.modules[k] = v
-
-                    plot_combination_dotplot(
-                        adata,
-                        var_names=genes_to_show,
-                        groupby=celltype_col,
-                        gene_sources=gene_sources,
-                        output_path=plots_dir / "dotplot.png",
-                        title=f"{panel_name} — {len(panel_in_adata)} genes × cell types",
-                        source_label_overrides={
-                            "rf_deg": "DEG",
-                            "dimred": _dimred_label,
-                        },
-                        dpi=300,
-                    )
-                    plt.close("all")
-                    logger.info("  Saved combination dotplot for '%s'", panel_name)
-                except Exception as exc:
-                    logger.warning("Could not save combination dotplot for %s: %s", panel_name, exc)
-                    has_gene_source = False  # fall through to standard dotplot
-
-            if not has_gene_source:
-                # Standard strategy → scanpy DotPlot
-                try:
-                    width = max(14, len(genes_to_show) * 0.4)
-                    dp = sc.pl.DotPlot(
-                        adata,
-                        var_names=genes_to_show,
-                        groupby=celltype_col,
-                        figsize=(width, max(5, n_groups * 0.4)),
-                        title=f"Panel genes ({len(panel_in_adata)}) × cell types",
-                    )
-                    dp.savefig(str(plots_dir / "dotplot.png"), dpi=300, bbox_inches="tight")
-                    plt.close("all")
-                except Exception as exc:
-                    logger.warning("Could not save dotplot for %s: %s", panel_name, exc)
-
-        logger.info("  Saved plots for '%s' to %s", panel_name, plots_dir)
-
-
-# ---------------------------------------------------------------------------
-# Plotting module integration — generate metric plots from saved CSVs
-# ---------------------------------------------------------------------------
-
-
-def generate_baseline_evaluation_plots(output_dir: Path) -> None:
-    """Call the Plotting-module functions to create metric PNGs from saved CSVs.
-
-    Reads the CSVs produced by :func:`run_baseline_evaluation` and calls the
-    ``_clustering_plots`` functions to produce publication-quality plots.  The
-    resulting PNGs are saved next to the CSVs inside each result sub-directory
-    so the app can find and display them.
-
-    Key detail: the Plotting-module has its own ``_constants.py`` with column
-    name constants (``COL_DATASET``, ``COL_ARI``, …) that differ from the
-    Evaluation-module's ``_constants.py``.  When Python has already loaded the
-    Evaluation-module's ``_constants`` it will be cached in ``sys.modules`` and
-    shadow the Plotting-module's version.  We therefore temporarily pop all
-    Evaluation-module flat-module entries from ``sys.modules``, load the
-    Plotting-module functions, then restore the originals.
-    """
-    import pandas as pd
-    import traceback
-
-    # Resolve the Plotting-module directory (sibling of Evaluation-module)
-    _eval_dir_abs = Path(__file__).parent.absolute()
-    _plot_dir = _eval_dir_abs.parent / "Plotting-module"
-    if not _plot_dir.exists():
-        logger.warning("Plotting-module not found at %s; skipping metric plots", _plot_dir)
-        return
-
-    logger.info("Generating baseline evaluation plots from saved CSVs...")
-    logger.info("  Plotting-module path: %s", _plot_dir)
-
-    import importlib.util as _ilu
-    import matplotlib
-    matplotlib.use("Agg")
-
-    # ------------------------------------------------------------------ #
-    # Load _clustering_plots via importlib.util.spec_from_file_location   #
-    # (exact file path) to completely bypass sys.path ambiguity.          #
-    #                                                                      #
-    # The Evaluation-module, Utility-module, and Plotting-module each     #
-    # have their own _constants.py.  Because Utility-module is added to   #
-    # sys.path[0] at startup, a plain `import _constants` would find the  #
-    # wrong version.  Loading by exact path sidesteps that entirely.      #
-    # ------------------------------------------------------------------ #
-    _constants_file = _plot_dir / "_constants.py"
-    _cplots_file    = _plot_dir / "_clustering_plots.py"
-
-    if not _constants_file.exists() or not _cplots_file.exists():
-        logger.error(
-            "Plotting-module files not found: %s or %s — skipping metric plots",
-            _constants_file, _cplots_file,
-        )
-        return
-
-    try:
-        # 1. Load Plotting-module's _constants as an isolated module object.
-        _pc_spec = _ilu.spec_from_file_location("_plot_module_constants", _constants_file)
-        _pc_mod  = _ilu.module_from_spec(_pc_spec)
-        _pc_spec.loader.exec_module(_pc_mod)
-
-        # 2. Temporarily register it under the bare name "_constants" so that
-        #    _clustering_plots.py's top-level `from _constants import …` finds
-        #    the correct version via sys.modules (no sys.path search needed).
-        _old_constants = sys.modules.pop("_constants", None)
-        sys.modules["_constants"] = _pc_mod
-        try:
-            # 3. Load _clustering_plots from its exact file path.
-            _cp_spec = _ilu.spec_from_file_location("_plot_clustering_plots", _cplots_file)
-            _cp_mod  = _ilu.module_from_spec(_cp_spec)
-            # Register before exec so any internal self-reference resolves:
-            sys.modules["_clustering_plots"] = _cp_mod
-            _cp_spec.loader.exec_module(_cp_mod)
-        finally:
-            # 4. Restore sys.modules to original state regardless of success.
-            sys.modules.pop("_constants", None)
-            sys.modules.pop("_clustering_plots", None)
-            if _old_constants is not None:
-                sys.modules["_constants"] = _old_constants
-
-        # 5. Extract functions from the loaded module (they reference the
-        #    Plotting-module's _constants via _cp_mod.__globals__ — still valid
-        #    even after the module is removed from sys.modules).
-        plot_clustering_quality_ari            = _cp_mod.plot_clustering_quality_ari
-        plot_clustering_quality_nmi            = _cp_mod.plot_clustering_quality_nmi
-        plot_neighborhood_preservation_by_k    = _cp_mod.plot_neighborhood_preservation_by_k
-        plot_optimal_neighborhood_preservation = _cp_mod.plot_optimal_neighborhood_preservation
-        plot_celltype_accuracy_barchart        = _cp_mod.plot_celltype_accuracy_barchart
-        plot_celltype_f1_heatmap               = _cp_mod.plot_celltype_f1_heatmap
-        logger.info("  Successfully loaded Plotting-module functions via importlib")
-
-    except Exception as exc:
-        logger.error("Could not load clustering plot functions: %s\n%s", exc, traceback.format_exc())
-        return
-
-    baseline_dir = output_dir / "Baseline-Evaluation" / "results"
-    if not baseline_dir.exists():
-        logger.info("No Baseline-Evaluation results found; skipping metric plots")
-        return
-
-    # --- Clustering ---
-    clustering_csv_dir = baseline_dir / "clustering"
-    if clustering_csv_dir.exists():
-        dfs = []
-        for f in clustering_csv_dir.glob("*.csv"):
-            try:
-                dfs.append(pd.read_csv(f))
-            except Exception:
-                pass
-        if dfs:
-            df = pd.concat(dfs, ignore_index=True)
-            logger.info("  Clustering df shape: %s, columns: %s", df.shape, list(df.columns))
-            # Restrict to PCA representation only
-            if "representation" in df.columns:
-                df = df[df["representation"].str.lower() == "pca"].copy()
-                logger.info("  Clustering df after PCA filter: %s rows", len(df))
-            try:
-                plot_clustering_quality_ari(df, str(clustering_csv_dir))
-                plot_clustering_quality_nmi(df, str(clustering_csv_dir))
-                logger.info("  Clustering plots saved to %s", clustering_csv_dir)
-            except Exception as exc:
-                logger.warning("Could not create clustering plots: %s\n%s", exc, traceback.format_exc())
-
-    # --- Neighborhood ---
-    neighborhood_csv_dir = baseline_dir / "neighborhood"
-    if neighborhood_csv_dir.exists():
-        dfs = []
-        for f in neighborhood_csv_dir.glob("*.csv"):
-            try:
-                dfs.append(pd.read_csv(f))
-            except Exception:
-                pass
-        if dfs:
-            df = pd.concat(dfs, ignore_index=True)
-            logger.info("  Neighborhood df shape: %s, columns: %s", df.shape, list(df.columns))
-            try:
-                plot_neighborhood_preservation_by_k(df, str(neighborhood_csv_dir))
-                # plot_optimal_neighborhood_preservation skipped (not needed)
-                logger.info("  Neighborhood plots saved to %s", neighborhood_csv_dir)
-            except Exception as exc:
-                logger.warning("Could not create neighborhood plots: %s\n%s", exc, traceback.format_exc())
-
-    # --- Celltype classification ---
-    celltype_csv_dir = baseline_dir / "celltype"
-    if celltype_csv_dir.exists():
-        dfs = []
-        for f in celltype_csv_dir.glob("*.csv"):
-            try:
-                dfs.append(pd.read_csv(f))
-            except Exception:
-                pass
-        if dfs:
-            df = pd.concat(dfs, ignore_index=True)
-            logger.info("  Celltype df shape: %s, columns: %s", df.shape, list(df.columns))
-            try:
-                plot_celltype_accuracy_barchart(df, str(celltype_csv_dir))
-                plot_celltype_f1_heatmap(df, str(celltype_csv_dir))
-                logger.info("  Celltype plots saved to %s", celltype_csv_dir)
-            except Exception as exc:
-                logger.warning("Could not create celltype plots: %s\n%s", exc, traceback.format_exc())
-
-    logger.info("Baseline evaluation plots complete.")
-
-
-# ---------------------------------------------------------------------------
-# Plotting module integration — variability (NMF) evaluation plots
-# ---------------------------------------------------------------------------
-
-
-def generate_variability_evaluation_plots(output_dir: Path) -> None:
-    """Generate variability metric plots using the Plotting-module's _variability_plots.py.
-
-    Reads NMF CSVs from
-    ``output_dir/Variability-Evaluation/results/nmf/``, reconstructs
-    the dict structure expected by the Plotting-module, then calls
-    ``plot_aggregated_celltype_metrics`` and ``plot_celltype_evaluation_results``
-    to produce publication-quality PNGs.
-
-    The same ``importlib.util.spec_from_file_location`` technique used in
-    :func:`generate_baseline_evaluation_plots` is applied here to avoid the
-    three-way ``_constants.py`` / ``_clustering_plots.py`` collision.
-    """
-    import ast
-    import re as _re_var
-    import traceback
-    import importlib.util as _ilu
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import pandas as pd
-
-    # ------------------------------------------------------------------ #
-    # Helper: parse dict strings that contain np.float32(…) calls        #
-    # ------------------------------------------------------------------ #
-    def _parse_ct_dict(raw: str) -> dict:
-        cleaned = _re_var.sub(r"np\.\w+\(([^)]+)\)", r"\1", str(raw))
-        return ast.literal_eval(cleaned)
-
-    def _pick_metric_value(row: pd.Series, base_col: str) -> float:
-        """Read metric value from either legacy unsuffixed or aggregated *_mean schema."""
-        val = row.get(base_col, np.nan)
-        if pd.notna(val):
-            return float(val)
-        return float(row.get(f"{base_col}_mean", np.nan))
-
-    def _pick_metric_std(row: pd.Series, base_col: str) -> float:
-        """Read metric std from aggregated *_std schema if present."""
-        std = row.get(f"{base_col}_std", np.nan)
-        if pd.isna(std):
-            return float("nan")
-        return float(std)
-
-    # ------------------------------------------------------------------ #
-    # Locate NMF CSVs                                                      #
-    # ------------------------------------------------------------------ #
-    variability_dir = output_dir / "Variability-Evaluation" / "results" / "nmf"
-    if not variability_dir.exists():
-        logger.info("No Variability-Evaluation NMF results found; skipping plots")
-        return
-
-    csv_files = sorted(variability_dir.glob("*.csv"))
-    if not csv_files:
-        logger.info("No NMF CSVs found in %s; skipping plots", variability_dir)
-        return
-
-    logger.info("Generating variability evaluation plots from %d CSV(s)...", len(csv_files))
-
-    # ------------------------------------------------------------------ #
-    # Load Plotting-module functions via importlib (bypass _constants     #
-    # collision — identical technique to generate_baseline_evaluation_plots)
-    # ------------------------------------------------------------------ #
-    _eval_dir_abs = Path(__file__).parent.absolute()
-    _plot_dir     = _eval_dir_abs.parent / "Plotting-module"
-
-    if not _plot_dir.exists():
-        logger.warning("Plotting-module not found at %s; skipping variability plots", _plot_dir)
-        return
-
-    _constants_file    = _plot_dir / "_constants.py"
-    _cplots_file       = _plot_dir / "_clustering_plots.py"
-    _vplots_file       = _plot_dir / "_variability_plots.py"
-
-    for _f in (_constants_file, _cplots_file, _vplots_file):
-        if not _f.exists():
-            logger.error("Plotting-module file missing: %s — skipping variability plots", _f)
-            return
-
-    try:
-        # 1. Load _constants from its exact path
-        _pc_spec = _ilu.spec_from_file_location("_plot_module_constants", _constants_file)
-        _pc_mod  = _ilu.module_from_spec(_pc_spec)
-        _pc_spec.loader.exec_module(_pc_mod)
-
-        # 2. Temporarily register so downstream imports resolve correctly
-        _old_constants = sys.modules.pop("_constants", None)
-        sys.modules["_constants"] = _pc_mod
-        try:
-            # 3. Load _clustering_plots (needed by _variability_plots)
-            _cp_spec = _ilu.spec_from_file_location("_plot_clustering_plots", _cplots_file)
-            _cp_mod  = _ilu.module_from_spec(_cp_spec)
-            sys.modules["_clustering_plots"] = _cp_mod
-            _cp_spec.loader.exec_module(_cp_mod)
-
-            # 4. Load _variability_plots
-            _vp_spec = _ilu.spec_from_file_location("_plot_variability_plots", _vplots_file)
-            _vp_mod  = _ilu.module_from_spec(_vp_spec)
-            sys.modules["_variability_plots"] = _vp_mod
-            _vp_spec.loader.exec_module(_vp_mod)
-
-        finally:
-            sys.modules.pop("_constants",         None)
-            sys.modules.pop("_clustering_plots",   None)
-            sys.modules.pop("_variability_plots",  None)
-            if _old_constants is not None:
-                sys.modules["_constants"] = _old_constants
-
-        plot_aggregated_celltype_metrics  = _vp_mod.plot_aggregated_celltype_metrics
-        plot_celltype_evaluation_results  = _vp_mod.plot_celltype_evaluation_results
-        logger.info("  Loaded _variability_plots functions via importlib")
-
-    except Exception as exc:
-        logger.error("Could not load _variability_plots: %s\n%s", exc, traceback.format_exc())
-        return
-
-    # ------------------------------------------------------------------ #
-    # Columns that are NOT cell-type names in the NMF CSV                 #
-    # ------------------------------------------------------------------ #
-    _META_COLS = {
-        "mse_train_baseline", "mse_test_baseline", "mse_test_probe",
-        "expvar_train_baseline", "expvar_test_baseline", "expvar_test_probe",
-        "mse_ratio", "expvar_ratio", "probeset_size", "probeset_genes_found",
-        "dataset", "gene_list", "analysis_type", "celltype",
-        "weighted_mse_test_probe", "weighted_mse_test_baseline",
-        "weighted_expvar_test_probe", "weighted_expvar_test_baseline",
-        "macro_mse_test_probe", "macro_mse_test_baseline",
-        "macro_expvar_test_probe", "macro_expvar_test_baseline",
-        "total_cells", "n_celltypes_processed", "n_celltypes_skipped",
-        "mse_train_probe", "expvar_train_probe",
-    }
-
-    # ------------------------------------------------------------------ #
-    # Process each CSV                                                     #
-    # ------------------------------------------------------------------ #
-    for csv_path in csv_files:
-        probeset_name = csv_path.stem   # e.g. "Xenium-Filter_All-Genes_rf_nmf_100"
-        try:
-            df = pd.read_csv(csv_path)
-
-            global_row  = df[df["analysis_type"] == "global"]
-            summary_row = df[(df["analysis_type"] == "per_celltype") & (df["celltype"] == "summary")]
-            ct_row      = df[(df["analysis_type"] == "per_celltype") & (df["celltype"] == "celltype_results")]
-
-            # ---------------------------------------------------------- #
-            # Build the evaluation_results dict expected by _variability_ #
-            # plots.py                                                     #
-            #                                                              #
-            # {probeset_name: {                                            #
-            #     "nmf_celltype_summary": {...},                           #
-            #     "nmf_celltype_celltype_results": {ct: {...},...}         #
-            # }}                                                           #
-            # ---------------------------------------------------------- #
-            probeset_result: dict = {}
-
-            # --- Summary block ---
-            if not summary_row.empty:
-                sr = summary_row.iloc[0]
-                probeset_result["nmf_celltype_summary"] = {
-                    "weighted_mse_test_probe": _pick_metric_value(sr, "weighted_mse_test_probe"),
-                    "macro_mse_test_probe": _pick_metric_value(sr, "macro_mse_test_probe"),
-                    "weighted_expvar_test_probe": _pick_metric_value(sr, "weighted_expvar_test_probe"),
-                    "macro_expvar_test_probe": _pick_metric_value(sr, "macro_expvar_test_probe"),
-                    "weighted_mse_test_baseline": _pick_metric_value(sr, "weighted_mse_test_baseline"),
-                    "macro_mse_test_baseline": _pick_metric_value(sr, "macro_mse_test_baseline"),
-                    "weighted_expvar_test_baseline": _pick_metric_value(sr, "weighted_expvar_test_baseline"),
-                    "macro_expvar_test_baseline": _pick_metric_value(sr, "macro_expvar_test_baseline"),
-                    # Propagate fold-level variability when available in aggregated CSVs.
-                    "weighted_mse_test_probe_std": _pick_metric_std(sr, "weighted_mse_test_probe"),
-                    "macro_mse_test_probe_std": _pick_metric_std(sr, "macro_mse_test_probe"),
-                    "weighted_expvar_test_probe_std": _pick_metric_std(sr, "weighted_expvar_test_probe"),
-                    "macro_expvar_test_probe_std": _pick_metric_std(sr, "macro_expvar_test_probe"),
-                }
-
-            # --- Per-celltype block ---
-            if not ct_row.empty:
-                ct_data_row = ct_row.iloc[0]
-                ct_cols = [c for c in df.columns if c not in _META_COLS]
-                ct_results: dict = {}
-                for col in ct_cols:
-                    raw = ct_data_row.get(col, None)
-                    if pd.isna(raw) or raw is None:
-                        continue
-                    try:
-                        d = _parse_ct_dict(raw)
-                        if isinstance(d, dict):
-                            # Normalise key names to match constants used in _variability_plots.py
-                            ct_results[col] = {
-                                "mse_test_probe":    float(d.get("mse_test_probe",    0)),
-                                "expvar_test_probe": float(d.get("expvar_test_probe", 0)),
-                                "mse_test_baseline": float(d.get("mse_test_baseline", 0)),
-                                "expvar_test_baseline": float(d.get("expvar_test_baseline", 0)),
-                                "n_cells":           int(d.get("n_cells", 0)),
-                                "skipped":           bool(d.get("skipped", False)),
-                            }
-                    except Exception as parse_exc:
-                        logger.debug("  Could not parse celltype '%s': %s", col, parse_exc)
-                if ct_results:
-                    probeset_result["nmf_celltype_celltype_results"] = ct_results
-
-            if not probeset_result:
-                logger.warning("  No usable data in %s — skipping", csv_path.name)
-                continue
-
-            evaluation_results = {probeset_name: probeset_result}
-            plots_dir = str(variability_dir)
-
-            # ---------------------------------------------------------- #
-            # Call Plotting-module functions                               #
-            # ---------------------------------------------------------- #
-            logger.info("  Calling plot_aggregated_celltype_metrics for '%s'", probeset_name)
-            try:
-                plot_aggregated_celltype_metrics(
-                    evaluation_results,
-                    plots_dir,
-                    title_suffix=f" — {probeset_name}",
-                )
-            except Exception as exc:
-                logger.warning("  plot_aggregated_celltype_metrics failed: %s\n%s",
-                               exc, traceback.format_exc())
-
-            logger.info("  Calling plot_celltype_evaluation_results for '%s'", probeset_name)
-            try:
-                plot_celltype_evaluation_results(
-                    evaluation_results,
-                    plots_dir,
-                    title_suffix=f" — {probeset_name}",
-                )
-            except Exception as exc:
-                logger.warning("  plot_celltype_evaluation_results failed: %s\n%s",
-                               exc, traceback.format_exc())
-
-        except Exception as exc:
-            logger.warning("Could not generate variability plots for %s: %s\n%s",
-                           csv_path.name, exc, traceback.format_exc())
-
-    logger.info("Variability evaluation plots complete.")
-
-
-def generate_tangram_vs_nmf_fold_aggregate_plots(output_dir: Path) -> None:
-    """Create Tangram vs NMF aggregate comparison plots per panel.
-
-    NMF values are aggregated from per-fold summary rows (mean ± std).
-    Tangram currently runs once with shared splits and therefore contributes
-    a single value (no fold std) for each metric.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import pandas as pd
-
-    tangram_ct_dir = output_dir / "Tangram-Evaluation" / "per_celltype"
-    nmf_per_fold_dir = output_dir / "Variability-Evaluation" / "results" / "nmf" / "per_fold"
-    out_dir = output_dir / "Tangram-Evaluation" / "plots"
-
-    if not tangram_ct_dir.exists() or not nmf_per_fold_dir.exists():
-        logger.info("Tangram/NMF comparison inputs missing; skipping Tangram-vs-NMF aggregate plots")
-        return
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    metric_specs = [
-        ("macro_mse", "Macro MSE", True),
-        ("weighted_mse", "Weighted MSE", True),
-        ("macro_expvar", "Macro ExpVar", False),
-        ("weighted_expvar", "Weighted ExpVar", False),
-    ]
-
-    created = 0
-    for tangram_csv in sorted(tangram_ct_dir.glob("*.csv")):
-        panel = tangram_csv.stem
-        nmf_csv = nmf_per_fold_dir / f"{panel}.csv"
-        if not nmf_csv.exists():
-            logger.debug("No matching NMF per-fold CSV for Tangram panel %s", panel)
-            continue
-
-        try:
-            tg_df = pd.read_csv(tangram_csv)
-            nmf_df = pd.read_csv(nmf_csv)
-        except Exception as exc:
-            logger.warning("Could not read Tangram/NMF CSV for %s: %s", panel, exc)
-            continue
-
-        tg_summary = tg_df[tg_df.get("celltype") == "__summary__"]
-        nmf_summary_rows = nmf_df[
-            (nmf_df.get("analysis_type") == "per_celltype")
-            & (nmf_df.get("celltype") == "summary")
-        ]
-
-        if tg_summary.empty or nmf_summary_rows.empty:
-            logger.debug("Missing summary rows for %s (tangram=%s, nmf=%s)", panel, not tg_summary.empty, not nmf_summary_rows.empty)
-            continue
-
-        tg_row = tg_summary.iloc[0]
-        nmf_mean = {
-            "macro_mse": float(nmf_summary_rows["macro_mse_test_probe"].mean()),
-            "weighted_mse": float(nmf_summary_rows["weighted_mse_test_probe"].mean()),
-            "macro_expvar": float(nmf_summary_rows["macro_expvar_test_probe"].mean()),
-            "weighted_expvar": float(nmf_summary_rows["weighted_expvar_test_probe"].mean()),
-        }
-        nmf_std = {
-            "macro_mse": float(nmf_summary_rows["macro_mse_test_probe"].std(ddof=1)),
-            "weighted_mse": float(nmf_summary_rows["weighted_mse_test_probe"].std(ddof=1)),
-            "macro_expvar": float(nmf_summary_rows["macro_expvar_test_probe"].std(ddof=1)),
-            "weighted_expvar": float(nmf_summary_rows["weighted_expvar_test_probe"].std(ddof=1)),
-        }
-        tg_vals = {
-            "macro_mse": float(tg_row.get("macro_mse", np.nan)),
-            "weighted_mse": float(tg_row.get("weighted_mse", np.nan)),
-            "macro_expvar": float(tg_row.get("macro_expvar", np.nan)),
-            "weighted_expvar": float(tg_row.get("weighted_expvar", np.nan)),
-        }
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-        for ax, mse_panel in zip(axes, [True, False]):
-            specs = [s for s in metric_specs if s[2] == mse_panel]
-            labels = [s[1] for s in specs]
-            keys = [s[0] for s in specs]
-            x = np.arange(len(labels))
-            width = 0.38
-
-            nmf_y = [nmf_mean[k] for k in keys]
-            nmf_err = [0.0 if np.isnan(nmf_std[k]) else nmf_std[k] for k in keys]
-            tg_y = [tg_vals[k] for k in keys]
-
-            ax.bar(
-                x - width / 2,
-                nmf_y,
-                width,
-                yerr=nmf_err,
-                capsize=4,
-                color="#1f77b4",
-                alpha=0.88,
-                label="NMF (fold mean ± std)",
-            )
-            ax.bar(
-                x + width / 2,
-                tg_y,
-                width,
-                color="#ff9800",
-                alpha=0.88,
-                label="Tangram (single run)",
-            )
-            ax.set_xticks(x)
-            ax.set_xticklabels(labels, rotation=20, ha="right")
-            ax.grid(axis="y", alpha=0.25, linestyle="--")
-            ax.set_ylabel("Score")
-            ax.set_title("MSE" if mse_panel else "Explained Variance")
-            ax.legend(fontsize=14, loc="best")
-
-        fig.suptitle(f"Tangram vs NMF Aggregate Metrics ({panel})")
-        fig.tight_layout()
-        out = out_dir / f"{panel}_tangram_vs_nmf_fold_aggregate.png"
-        fig.savefig(out, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        created += 1
-
-    logger.info("Created %d Tangram-vs-NMF aggregate comparison plot(s)", created)
+        if mech_ct:
+            # Summary row: aggregated macro/weighted metrics
+            summary = mech_ct.get("summary", {})
+            if summary:
+                row = {**summary, "dataset": panel_name, "gene_list": panel_name, "celltype": "summary", "analysis_type": "per_celltype"}
+                if fold is not None:
+                    row["fold"] = fold
+                nmf_rows.append(row)
+            # Per-cell-type rows: one row per cell type with individual metrics
+            for ct, res in mech_ct.get("celltype_results", {}).items():
+                row = {**res, "dataset": panel_name, "gene_list": panel_name, "celltype": ct, "analysis_type": "per_celltype"}
+                if fold is not None:
+                    row["fold"] = fold
+                nmf_rows.append(row)
 
 
 # ---------------------------------------------------------------------------
@@ -2137,18 +1689,57 @@ def generate_tangram_vs_nmf_fold_aggregate_plots(output_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _aggregate_scalar_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute mean/std across a list of flat dicts with numeric values.
+
+    Non-numeric values (arrays, strings, etc.) are kept from the first dict.
+    Keys starting with ``_`` (internal arrays such as ``_mean_ref``) are
+    excluded from mean/std computation but preserved from the first dict.
+
+    Args:
+        dicts: List of flat dicts with numeric values to aggregate.
+
+    Returns:
+        Dict with ``{key}_mean`` and ``{key}_std`` for each numeric key, plus
+        non-numeric entries copied from ``dicts[0]``.
+    """
+    if not dicts:
+        return {}
+    scalar_keys = [
+        k for k, v in dicts[0].items()
+        if isinstance(v, (int, float)) and not k.startswith("_")
+    ]
+    agg: dict[str, Any] = {}
+    for k in scalar_keys:
+        vals = [d[k] for d in dicts if k in d and not np.isnan(d[k])]
+        agg[f"{k}_mean"] = float(np.mean(vals)) if vals else np.nan
+        # ddof=1 (sample sd) to match pandas' default in _aggregate_fold_results and
+        # the seed-robustness aggregation — one convention module-wide (#39).
+        agg[f"{k}_std"] = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+    for k, v in dicts[0].items():
+        if not isinstance(v, (int, float)):
+            agg[k] = v
+    return agg
+
+
 def _aggregate_tangram_fold_results(
     fold_results: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Average scalar Tangram metrics across folds; keep arrays from fold 0.
+    """Aggregate Tangram results across folds using a two-stage approach.
+
+    Stage 1 — per-celltype across folds: for each cell type, compute mean/std
+    of ``mse``, ``expvar``, etc. over all valid folds.
+
+    Stage 2 — macro/weighted across cell types: recompute summary metrics from
+    the per-celltype fold-averaged values using :func:`_aggregate_per_celltype_metrics`.
 
     Args:
         fold_results: List of per-fold result dicts from
             :func:`run_tangram_reconstruction_check`.
 
     Returns:
-        Aggregated result dict with ``_mean`` and ``_std`` suffixes for scalars
-        and ``n_folds`` added.
+        Aggregated result dict with keys ``"global"``, ``"per_celltype"``,
+        ``"per_celltype_summary"``, and ``"n_folds"``.
     """
     if not fold_results:
         return {}
@@ -2159,19 +1750,55 @@ def _aggregate_tangram_fold_results(
     if not valid:
         return {**fold_results[0], "n_folds": 0}
 
-    aggregated: dict[str, Any] = {}
-    # Determine scalar keys from the first valid result
-    scalar_keys = [k for k, v in valid[0].items() if isinstance(v, (int, float))]
-    for key in scalar_keys:
-        values = [r[key] for r in valid if key in r]
-        aggregated[f"{key}_mean"] = float(np.mean(values))
-        aggregated[f"{key}_std"] = float(np.std(values))
-    # Keep non-scalar entries (arrays, DataFrames) from fold 0
-    for key, val in valid[0].items():
-        if not isinstance(val, (int, float)):
-            aggregated[key] = val
-    aggregated["n_folds"] = len(valid)
-    return aggregated
+    # Aggregate global metrics (flat dict of scalars)
+    global_dicts = [
+        r["global"] for r in valid
+        if "global" in r and not r["global"].get("skipped")
+    ]
+    global_agg = _aggregate_scalar_dicts(global_dicts)
+
+    # Stage 1: per-celltype across folds — mean/std per ct
+    all_cts: set[str] = set()
+    for r in valid:
+        all_cts.update((r.get("per_celltype") or {}).keys())
+
+    per_ct_agg: dict[str, dict[str, Any]] = {}
+    for ct in all_cts:
+        ct_dicts = [
+            r["per_celltype"][ct]
+            for r in valid
+            if ct in (r.get("per_celltype") or {})
+            and not r["per_celltype"][ct].get("skipped")
+        ]
+        if ct_dicts:
+            per_ct_agg[ct] = _aggregate_scalar_dicts(ct_dicts)
+
+    # Stage 2: macro/weighted from per-ct means → summary row.
+    # Build a synthetic per-ct dict using fold-averaged mse/expvar values so
+    # _aggregate_per_celltype_metrics() can compute macro/weighted scores with
+    # the same logic used within individual folds.
+    synthetic_per_ct: dict[str, dict[str, Any]] = {}
+    # n_cells comes from the first valid fold (cell counts don't change across folds)
+    first_per_ct = valid[0].get("per_celltype") or {}
+    for ct, agg_metrics in per_ct_agg.items():
+        n_cells = first_per_ct.get(ct, {}).get("n_cells", 0)
+        synthetic_per_ct[ct] = {
+            "mse": agg_metrics.get("mse_mean", np.nan),
+            "expvar": agg_metrics.get("expvar_mean", np.nan),
+            "n_cells": n_cells,
+            "skipped": False,
+        }
+
+    summary_agg: dict[str, Any] = {}
+    if _RECONSTRUCTION_AVAILABLE and synthetic_per_ct:
+        summary_agg = _aggregate_per_celltype_metrics(synthetic_per_ct)
+
+    return {
+        "global": global_agg,
+        "per_celltype": per_ct_agg,
+        "per_celltype_summary": summary_agg,
+        "n_folds": len(valid),
+    }
 
 
 def run_tangram_stage(
@@ -2186,9 +1813,8 @@ def run_tangram_stage(
     Uses the same ``splits`` object as :func:`run_variability_evaluation` so
     that NMF and Tangram operate on identical train/test partitions.
 
-    Note: With k-fold, Tangram runs ``n_splits × n_panels`` times. Tangram is
-    compute-intensive (~1000 epochs per fit), so k-fold is significantly slower
-    than a simple split. Use ``--split_mode simple`` if runtime is a concern.
+    Note: Tangram runs ``n_splits × n_panels`` times and is compute-intensive
+    (~1000 epochs per fit); lower ``--n_splits`` if runtime is a concern.
 
     Args:
         adata_full: Full-transcriptome AnnData reference.
@@ -2234,6 +1860,7 @@ def run_tangram_stage(
                     test_idx=test_idx,
                     per_celltype_splits=per_celltype_splits,
                     nmf_counts_input=config.nmf_counts_input,
+                    fold=fold,
                 )
             except Exception as exc:
                 logger.warning(
@@ -2243,11 +1870,21 @@ def run_tangram_stage(
             fold_results_per_panel[panel_name].append(result)
             gc.collect()
 
-    # Aggregate across folds
-    results = {
-        name: _aggregate_tangram_fold_results(fold_list)
-        for name, fold_list in fold_results_per_panel.items()
-    }
+    # Aggregate across folds and save aggregated results
+    results: dict[str, Any] = {}
+    for name, fold_list in fold_results_per_panel.items():
+        agg = _aggregate_tangram_fold_results(fold_list)
+        results[name] = agg
+        # Save aggregated (mean/std) results to global/ and per_celltype/
+        _save_tangram_results(
+            tangram_dir,
+            name,
+            global_metrics=agg.get("global") or None,
+            per_celltype_results=agg.get("per_celltype") or None,
+            per_celltype_summary=agg.get("per_celltype_summary") or None,
+            fold=None,
+        )
+        logger.info("Saved aggregated Tangram results for '%s' (%d folds)", name, agg.get("n_folds", 0))
     return results
 
 
@@ -2285,6 +1922,8 @@ def main() -> None:
     if config.mode in ("preprocess", "both"):
         run_preprocessing_stage(config)
         _log_memory("after preprocessing")
+        gc.collect()  # ensure the raw AnnData loaded inside run_preprocessing_stage is freed
+                      # before we load the preprocessed reference + all panel h5ads
 
     if config.mode == "preprocess":
         logger.info("Preprocessing complete. Use --mode evaluate to run evaluation.")
@@ -2323,29 +1962,74 @@ def main() -> None:
     splits = generate_evaluation_splits(
         adata_full,
         celltype_col=config.celltype_col,
-        split_mode=config.split_mode,
-        test_size=config.test_size,
         n_splits=config.n_splits,
         random_state=config.random_state,
     )
     logger.info(
-        "Generated %d split(s) (mode=%s, test_size=%.2f, random_state=%d)",
-        len(splits), config.split_mode, config.test_size, config.random_state,
+        "Generated %d stratified fold(s) (random_state=%d)",
+        len(splits), config.random_state,
     )
 
-    if config.evaluation_type in ("baseline", "both"):
+    if config.evaluation_type in ("baseline", "all"):
         run_baseline_evaluation(
             preprocessed_datasets=preprocessed_datasets,
             output_dir=config.output_dir,
             celltype_col=config.celltype_col,
-            dimensionality_reduction=config.dimensionality_reduction,
             external_names=external_names,
+            celltype_clf_max_depth=config.celltype_clf_max_depth,
         )
         _log_memory("after baseline evaluation")
-        generate_baseline_evaluation_plots(output_dir=config.output_dir)
-        _log_memory("after baseline evaluation plots")
 
-    if config.evaluation_type in ("variability", "both"):
+    if config.evaluation_type in ("biology", "all"):
+        gene_list_paths: dict[str, str] = {}
+        reference_celltypes: list[str] | None = None
+        if config.pathway_per_celltype:
+            if config.celltype_col in adata_full.obs:
+                reference_celltypes = (
+                    adata_full.obs[config.celltype_col].astype(str).unique().tolist()
+                )
+            if config.pathway_celltype_gene_source == "informative":
+                if config.gene_list_files_txt and config.gene_list_files_txt.exists():
+                    gene_list_paths = {
+                        extract_genelist_name_from_path(p.strip()): p.strip()
+                        for p in config.gene_list_files_txt.read_text().splitlines()
+                        if p.strip()
+                    }
+                elif config.gene_lists_dir and config.gene_lists_dir.exists():
+                    _, gene_list_paths = load_all_gene_lists(
+                        str(config.gene_lists_dir), adata_full, return_paths=True
+                    )
+                # --external_panels/--external_names map directly by their given name --
+                # no path-derived naming risk, so these are always safe to add (merged,
+                # not exclusive with gene_list_files_txt/gene_lists_dir above).
+                if config.external_panels and config.external_names:
+                    gene_list_paths.update(
+                        dict(zip(config.external_names, config.external_panels))
+                    )
+                if not gene_list_paths:
+                    logger.warning(
+                        "--pathway_per_celltype --pathway_celltype_gene_source informative "
+                        "needs --gene_lists_dir, --gene_list_files_txt, or "
+                        "--external_panels/--external_names; per-cell-type pass will be "
+                        "skipped for every panel."
+                    )
+        run_biology_evaluation(
+            preprocessed_datasets=preprocessed_datasets,
+            output_dir=config.output_dir,
+            libraries=config.pathway_libraries,
+            organism=config.pathway_organism,
+            sleep=config.pathway_sleep,
+            top_n=config.pathway_top_n,
+            per_celltype=config.pathway_per_celltype,
+            per_celltype_gene_source=config.pathway_celltype_gene_source,
+            per_celltype_min_genes=config.pathway_celltype_min_genes,
+            gene_list_paths=gene_list_paths,
+            celltype_col=config.celltype_col,
+            reference_celltypes=reference_celltypes,
+        )
+        _log_memory("after biology evaluation")
+
+    if config.evaluation_type in ("variability", "all"):
         run_variability_evaluation(
             adata_full=adata_full,
             preprocessed_datasets=preprocessed_datasets,
@@ -2356,10 +2040,12 @@ def main() -> None:
             random_state=config.random_state,
             external_names=external_names,
             nmf_counts_input=config.nmf_counts_input,
+            nmf_objective=config.nmf_objective,
+            expvar_mode=config.expvar_mode,
+            expvar_modes=config.expvar_modes or [config.expvar_mode],
+            gene_subsets=config.gene_subsets,
         )
         _log_memory("after variability evaluation")
-        generate_variability_evaluation_plots(output_dir=config.output_dir)
-        _log_memory("after variability evaluation plots")
 
     # ── Tangram (optional) ────────────────────────────────────────────
     if config.include_tangram:
@@ -2371,17 +2057,6 @@ def main() -> None:
             splits=splits,
         )
         _log_memory("after tangram")
-        generate_tangram_vs_nmf_fold_aggregate_plots(output_dir=config.output_dir)
-        _log_memory("after tangram-vs-nmf aggregate plots")
-
-    # ── Feature plots & dot plots ──────────────────────────────────────
-    generate_panel_plots(
-        adata_full=adata_full,
-        preprocessed_datasets=preprocessed_datasets,
-        celltype_col=config.celltype_col,
-        output_dir=config.output_dir,
-    )
-    _log_memory("after feature plots")
 
     logger.info("=" * 80)
     logger.info("PIPELINE COMPLETE – outputs in: %s", config.output_dir)

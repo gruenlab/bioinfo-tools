@@ -11,11 +11,7 @@ import glob
 import logging
 import os
 import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
 
-import numpy as np
 import scanpy as sc
 
 from _clustering_plots import plot_umap_for_representation
@@ -41,7 +37,7 @@ def find_h5ad_files_matching_panel(preprocessed_dir, panel_pattern):
     preprocessed_dir : str
         Directory containing preprocessed h5ad files
     panel_pattern : str
-        Pattern to match (e.g., 'dt_nmf', 'dt_pca', 'Spapros')
+        Pattern to match (e.g., 'RecoVar', 'rf_deg', 'Spapros')
         
     Returns:
     --------
@@ -132,31 +128,27 @@ def preprocess_for_umap(adata, n_neighbors=15, n_pcs=30, dimred_type='pca'):
         else:
             rep_key = 'X_pca'
         
-        # Check if representation exists
+        # Require representation to be pre-computed by the pipeline — never recompute here
         if rep_key not in adata.obsm:
-            logging.warning(f"{rep_key} not found. Computing {dimred_type.upper()}...")
-            if dimred_type == 'pca':
-                sc.pp.pca(adata, n_comps=min(n_pcs, adata.n_vars - 1))
-            else:
-                # For NMF, we need non-negative data
-                logging.info("Computing NMF requires non-negative data...")
-                # This is a simplified approach - adjust as needed
-                from sklearn.decomposition import NMF
-                nmf = NMF(n_components=min(n_pcs, adata.n_vars - 1), random_state=42)
-                adata.obsm['X_nmf'] = nmf.fit_transform(np.abs(adata.X.toarray() if hasattr(adata.X, 'toarray') else adata.X))
-        
+            raise ValueError(
+                f"{rep_key!r} not found in adata.obsm. "
+                f"Run the selection/evaluation preprocessing pipeline first to compute {dimred_type.upper()} embeddings."
+            )
+
         # Compute neighbors
         sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=n_pcs, use_rep=rep_key)
-    
-    # Check if Leiden clustering has been computed
+
+    # Require Leiden clustering to be pre-computed by the preprocessing pipeline
     if 'leiden' not in adata.obs:
-        logging.info("Computing Leiden clustering...")
-        sc.tl.leiden(adata, resolution=1.0)
+        raise ValueError(
+            "'leiden' clustering not found in adata.obs. "
+            "Run the evaluation preprocessing pipeline first to compute Leiden clusters."
+        )
     
     return adata
 
 
-def plot_panel_umaps(adata_path, panel_name, output_dir, celltype_col, png_dpi=300):
+def plot_panel_umaps(adata_path, panel_name, output_dir, celltype_col, png_dpi=DEFAULT_PNG_DPI):
     """
     Plot UMAPs for a specific panel.
     
@@ -211,8 +203,9 @@ def plot_panel_umaps(adata_path, panel_name, output_dir, celltype_col, png_dpi=3
                 PNG_DPI=png_dpi,
                 celltype_col=celltype_col
             )
+            # plot_umap_for_representation now returns a LIST (one file per colouring)
             if plot_path:
-                saved_plots.append(plot_path)
+                saved_plots.extend(plot_path)
     else:
         # Plot single dimensionality reduction
         logging.info(f"  Generating UMAP for {dimred_type.upper()}...")
@@ -226,7 +219,7 @@ def plot_panel_umaps(adata_path, panel_name, output_dir, celltype_col, png_dpi=3
             celltype_col=celltype_col
         )
         if plot_path:
-            saved_plots.append(plot_path)
+            saved_plots.extend(plot_path)
     
     logging.info(f"  ✓ Completed {panel_name}: {len(saved_plots)} plot(s) saved")
     return saved_plots
@@ -253,7 +246,7 @@ def parse_arguments():
     
     # Panel selection
     parser.add_argument('--panels',
-                       help='Comma-separated list of panel patterns to plot (e.g., "dt_nmf,dt_pca,Spapros")')
+                       help='Comma-separated list of panel patterns to plot (e.g., "RecoVar,rf_deg,Spapros")')
     
     parser.add_argument('--full_transcriptome',
                        help='Path to full transcriptome h5ad file')
@@ -262,8 +255,8 @@ def parse_arguments():
     parser.add_argument('--celltype_col', default='cell_type',
                        help='Column name for cell type annotations (default: cell_type)')
     
-    parser.add_argument('--png_dpi', type=int, default=300,
-                       help='DPI for saved plots (default: 300)')
+    parser.add_argument('--png_dpi', type=int, default=DEFAULT_PNG_DPI,
+                       help=f'DPI for saved plots (default: {DEFAULT_PNG_DPI})')
     
     parser.add_argument('--n_neighbors', type=int, default=15,
                        help='Number of neighbors for UMAP (default: 15)')

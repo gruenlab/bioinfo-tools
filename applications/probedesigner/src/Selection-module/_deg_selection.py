@@ -2,9 +2,6 @@
 
 This module provides functions for selecting genes based on differential expression
 analysis across cell types or clusters. Uses GeneListBuilder for unified output format.
-
-Author: Refactored from _selection.py
-Date: 2026-02-08
 """
 
 from __future__ import annotations
@@ -12,24 +9,27 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 import scanpy as sc
 from anndata import AnnData
 
 # Use absolute imports (for script execution)
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 from _constants import (
     COL_CELLTYPE,
-    COL_GENE,
-    COL_RANK,
-    COL_SELECTION_SCORE,
     DEFAULT_DEG_MAX_PVAL,
-    DEFAULT_DEG_MIN_FOLD_CHANGE,
     DEFAULT_DEG_METHOD,
     DEFAULT_MIN_CELLS_PER_CELLTYPE,
     DEFAULT_PROBESET_SIZE,
 )
-from _gene_list_builder import GeneListBuilder
+from _gene_list_builder import GeneListBuilder, panel_information_filename
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ def filter_celltypes_by_min_cells(
     return valid_celltypes, excluded_celltypes, celltype_counts
 
 
-def select_DEGs(
+def select_degs(
     adata: AnnData,
     probeset_size: int = DEFAULT_PROBESET_SIZE,
     celltype_column: str = COL_CELLTYPE,
@@ -95,12 +95,18 @@ def select_DEGs(
     """Select genes based on differential expression analysis.
 
     Performs differential gene expression (DEG) analysis for each category in the
-    specified column (e.g., cell types or clusters). Ranks ALL genes by DEG score
-    (log2FC * -log10(adj_pval)), excludes only genes with pval_adj > max_pval,
-    and marks top N genes as selected.
+    specified column (e.g., cell types or clusters). Ranks genes within each group
+    by the scanpy ``rank_genes_groups`` ``scores`` column (the Wilcoxon Z-statistic
+    for the default ``method='wilcoxon'``), excludes only genes with
+    ``pvals_adj > max_pval``, and marks the top ``n_genes_per_group`` per group as
+    selected. Groups are processed in categorical order; a gene claimed by an
+    earlier group is not re-selected by a later one (later groups fill their quota
+    from their next-best unclaimed genes). Each gene's stored ``celltype`` / score
+    is that of the group where it scored highest.
 
-    Note: min_fold_change is NOT used for exclusion, only for ranking. This ensures
-    enough genes remain for downstream Xenium filtering.
+    Note: fold change is not used at all — neither to exclude nor to rank. Only the
+    adjusted p-value gates selection, which keeps enough genes for downstream Xenium
+    filtering.
 
     Args:
         adata: Processed AnnData object (log-normalized)
@@ -115,7 +121,7 @@ def select_DEGs(
     Returns:
         GeneListBuilder with:
             - selected_genes: DEG markers
-            - selection_score: DEG score (log2fc * -log10(adj_pval))
+            - selection_score: scanpy rank_genes_groups score (Wilcoxon Z-statistic by default)
             - rank: Per-group rank
             - celltype: Source cell type
             - filter_reason: Why genes were excluded
@@ -124,9 +130,9 @@ def select_DEGs(
         ValueError: If no valid cell types remain after filtering
 
     Examples:
-        >>> builder = select_DEGs(adata, probeset_size=500, celltype_column='celltype')
+        >>> builder = select_degs(adata, probeset_size=500, celltype_column='celltype')
         >>> df = builder.to_dataframe()
-        >>> logger.info(f"Selected {len(builder.get_selected_genes())} DEGs")
+        >>> logger.info(f"Selected {len(builder.get_selected_genes('initial'))} DEGs")
     """
     logger.info("=== Starting DEG-based gene selection ===")
     logger.info(f"Target probeset size: {probeset_size}")
@@ -185,8 +191,7 @@ def select_DEGs(
     deg_df = _extract_deg_results(adata, groups)
     logger.info(f"Extracted {len(deg_df)} DEG results across all groups")
 
-    # Use scanpy's 'scores' directly for ranking (for Wilcoxon: Z-score, for t-test: t-statistic)
-    # No need for redundant calculation - scanpy already provides proper ranking metric
+    # Rank on scanpy's 'scores' column directly (Wilcoxon: Z-score, t-test: t-statistic).
     logger.info(f"Using scanpy '{method}' scores for ranking (higher = more significant)")
 
     # Filter DEGs by p-value ONLY (exclude genes with high p-value)
@@ -195,8 +200,14 @@ def select_DEGs(
     logger.info(f"After p-value filter: {len(deg_df_filtered)} genes remain (ranked by scanpy scores)")
     logger.info(f"Excluded: {len(deg_df) - len(deg_df_filtered)} genes with pval_adj > {max_pval}")
 
-    # Add ALL genes passing pval filter to builder (for comprehensive tracking and replacement)
-    for _, row in deg_df_filtered.iterrows():
+    # Add ALL genes passing the p-value filter to the builder (for comprehensive
+    # tracking and as the replacement pool). A gene significant in several groups
+    # is stored once, attributed to the group where it scored highest.
+    deg_best_per_gene = (
+        deg_df_filtered.sort_values("scores", ascending=False)
+        .drop_duplicates("gene", keep="first")
+    )
+    for _, row in deg_best_per_gene.iterrows():
         builder.add_gene(
             gene=row["gene"],
             selection_score=row["scores"],  # Use scanpy's score directly
@@ -209,26 +220,33 @@ def select_DEGs(
             },
         )
 
-    # Select top genes per group
+    # Select the top n_genes_per_group per group, iterating groups in categorical
+    # order. `selected_set` gives real cross-group de-duplication: a gene already
+    # claimed by an earlier group is not re-selected by a later one. (The builder's
+    # `initial` flag can't be used for this here — it is only promoted to `final`
+    # later, in run_single_selection.py, so `get_selected_genes()` is empty now.)
     genes_per_group_actual = {}
-    selected_count = 0
+    selected_set: set[str] = set()
 
     for group in groups:
         group_degs = deg_df_filtered[deg_df_filtered["group"] == group].copy()
         group_degs = group_degs.sort_values("scores", ascending=False)
 
-        # Mark top genes as selected
-        top_genes = []
+        # Mark the group's top unclaimed genes as selected
+        claimed = []
         for idx, (_, row) in enumerate(group_degs.iterrows()):
+            if len(claimed) >= n_genes_per_group:
+                break
             gene = row["gene"]
-            if gene not in builder.get_selected_genes() and len(top_genes) < n_genes_per_group:
+            if gene not in selected_set:
                 builder.mark_selected(gene, rank=idx + 1)
-                top_genes.append(gene)
-                selected_count += 1
+                selected_set.add(gene)
+                claimed.append(gene)
 
-        genes_per_group_actual[group] = len(top_genes)
-        logger.info(f"Group '{group}': selected {len(top_genes)} genes")
+        genes_per_group_actual[group] = len(claimed)
+        logger.info(f"Group '{group}': selected {len(claimed)} genes")
 
+    selected_count = len(selected_set)
     logger.info(f"Total unique genes selected: {selected_count}")
 
     # Handle gap-filling if needed
@@ -243,7 +261,7 @@ def select_DEGs(
             deg_df,
             groups,
             probeset_size,
-            selected_count,
+            selected_set,
         )
 
     # Save results if directory provided
@@ -262,7 +280,10 @@ def select_DEGs(
             genes_per_group_actual,
         )
 
-    logger.info(f"DEG selection complete: {len(builder.get_selected_genes())} genes selected from {n_groups} groups")
+    logger.info(
+        f"DEG selection complete: {len(builder.get_selected_genes('initial'))} genes "
+        f"selected from {n_groups} groups"
+    )
     return builder
 
 
@@ -333,7 +354,7 @@ def _fill_deg_gap(
     deg_df: pd.DataFrame,
     groups: list[str],
     probeset_size: int,
-    current_count: int,
+    selected_set: set[str],
 ) -> int:
     """Fill remaining slots by relaxing filtering criteria.
 
@@ -343,51 +364,61 @@ def _fill_deg_gap(
         deg_df: Unfiltered DEG results
         groups: List of groups
         probeset_size: Target size
-        current_count: Current number of selected genes
+        selected_set: Names of genes already selected; mutated in place as more
+            genes are claimed so the de-duplication guard stays correct.
 
     Returns:
         Updated count of selected genes
     """
     # Try filtered results first (next best genes)
     for group in groups:
-        if current_count >= probeset_size:
+        if len(selected_set) >= probeset_size:
             break
 
         group_degs = deg_df_filtered[deg_df_filtered["group"] == group].copy()
         group_degs = group_degs.sort_values("scores", ascending=False)
 
         for _, row in group_degs.iterrows():
+            if len(selected_set) >= probeset_size:
+                break
             gene = row["gene"]
-            if gene not in builder.get_selected_genes() and current_count < probeset_size:
+            if gene not in selected_set:
                 builder.mark_selected(gene)
-                current_count += 1
+                selected_set.add(gene)
 
     # If still not enough, use unfiltered results
-    if current_count < probeset_size:
-        gap = probeset_size - current_count
+    if len(selected_set) < probeset_size:
+        gap = probeset_size - len(selected_set)
         logger.warning(f"Still need {gap} more genes. Using unfiltered DEG results...")
 
         for group in groups:
-            if current_count >= probeset_size:
+            if len(selected_set) >= probeset_size:
                 break
 
             group_degs = deg_df[deg_df["group"] == group].copy()
             group_degs = group_degs.sort_values("scores", ascending=False)
 
             for _, row in group_degs.iterrows():
+                if len(selected_set) >= probeset_size:
+                    break
                 gene = row["gene"]
-                if gene not in builder.get_selected_genes() and current_count < probeset_size:
+                if gene not in selected_set:
                     # Add gene if not already tracked
                     if gene not in builder.get_all_genes():
                         builder.add_gene(
                             gene=gene,
-                            selection_score=row["deg_score"],
+                            selection_score=row["scores"],
                             celltype=row["group"],
+                            metadata={
+                                "logfoldchanges": row["logfoldchanges"],
+                                "pvals": row["pvals"],
+                                "pvals_adj": row["pvals_adj"],
+                            },
                         )
                     builder.mark_selected(gene)
-                    current_count += 1
+                    selected_set.add(gene)
 
-    return current_count
+    return len(selected_set)
 
 
 def _save_deg_results(
@@ -433,7 +464,7 @@ def _save_deg_results(
     logger.info(f"Saved filtered DEG results to: {deg_filtered_file}")
 
     # Save selected genes
-    builder.to_csv(os.path.join(results_dir, "selected_genes.csv"))
+    builder.to_csv(os.path.join(results_dir, panel_information_filename("deg_only")))
 
     # Save summary
     summary_file = os.path.join(results_dir, "deg_selection_summary.txt")
@@ -444,12 +475,11 @@ def _save_deg_results(
         f.write(f"Method: {method}\n")
         f.write(f"Number of groups: {n_groups}\n")
         f.write(f"Target probeset size: {probeset_size}\n")
-        f.write(f"Actual probeset size: {len(builder.get_selected_genes())}\n")
+        f.write(f"Actual probeset size: {len(builder.get_selected_genes('initial'))}\n")
         f.write(f"Target genes per group: {n_genes_per_group}\n\n")
         f.write(f"Filter criteria:\n")
         f.write(f"  - Max adj. p-value: {max_pval} (EXCLUSION only)\n")
-        f.write(f"  - Note: Genes ranked by log2FC, not excluded by fold change\n\n")
-        f.write(f"  - Max adj. p-value: {max_pval}\n\n")
+        f.write(f"  - Note: genes ranked by the scanpy test statistic (Wilcoxon Z); fold change is not used\n\n")
         f.write(f"Results:\n")
         f.write(f"  - Total DEGs: {len(deg_df)}\n")
         f.write(f"  - Filtered DEGs: {len(deg_df_filtered)}\n\n")

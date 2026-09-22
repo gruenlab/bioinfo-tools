@@ -20,7 +20,6 @@ except ImportError:
 __all__ = [
     'is_anndata_raw',
     'is_anndata_raw_layer',
-    'X_is_raw',
 ]
 
 logger = logging.getLogger(__name__)
@@ -117,20 +116,3 @@ def is_anndata_raw_layer(adata: AnnData, layer_name: str) -> bool:
         return True
 
     return bool(np.allclose(non_zero_data, np.round(non_zero_data)))
-
-
-def X_is_raw(adata: AnnData, X: bool = True) -> bool:
-    """
-    Simplified check if AnnData contains raw data.
-
-    Args:
-        adata: AnnData object to check.
-        X: If True, check .X; if False, check layers["counts"].
-
-    Returns:
-        True if data appears to be raw integer counts.
-    """
-    if X:
-        return np.array_equal(adata.X.sum(axis=0).astype(int), adata.X.sum(axis=0))
-    else:
-        return np.array_equal(adata.layers["counts"].sum(axis=0).astype(int), adata.layers["counts"].sum(axis=0))

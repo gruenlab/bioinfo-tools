@@ -20,12 +20,9 @@ DEFAULT_N_COMPONENTS_NMF: int = 5
 DEFAULT_RANDOM_STATE: int = 42
 """Random state seed for reproducibility."""
 
-# =============================================================================
-# Normalization
-# =============================================================================
-
-NORMALIZE_TARGET_SUM: float = 1e4
-"""Target sum for normalization (CPM scaling)."""
+# Normalization: sc.pp.normalize_total(adata) is called with no target_sum,
+# i.e. scanpy's default (per-cell median) -- matches Evaluation-module's
+# convention. No constant needed here since no fixed value is passed.
 
 # =============================================================================
 # Gene Selection
@@ -68,7 +65,6 @@ __all__ = [
     'DEFAULT_N_COMPONENTS_PCA',
     'DEFAULT_N_COMPONENTS_NMF',
     'DEFAULT_RANDOM_STATE',
-    'NORMALIZE_TARGET_SUM',
     'DEFAULT_N_HVG',
     'DEFAULT_HVG_FLAVOR',
     'DEFAULT_MIN_GENES_PER_CELL',

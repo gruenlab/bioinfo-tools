@@ -1,9 +1,7 @@
 """Stability analysis plotting functions.
 
 This module contains publication-quality plotting functions for visualizing
-gene selection stability and metric variability across pipeline iterations.
-
-Functions moved from Analysis-scripts/run_stability_analysis.py and
+gene selection stability and metric variability across pipeline iterations,
 optimized for publication quality with increased font sizes and DPI.
 """
 
@@ -17,6 +15,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scanpy as sc
+
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
 
 try:
     from ._constants import (
@@ -81,7 +87,7 @@ def plot_gene_frequency(
         Total number of stability iterations
     top_n : int, optional
         Maximum number of genes to display (None = all)
-    png_dpi : int, default ANALYSIS_PNG_DPI (600)
+    png_dpi : int, default ANALYSIS_PNG_DPI (300)
         Resolution for saved PNG
     output_filename : str, default "gene_frequency.png"
         File name used inside ``{output_dir}/plots/``
@@ -170,7 +176,7 @@ def plot_gene_overlap(
         Output directory (plots/ subdirectory will be created)
     n_iterations : int
         Total number of stability iterations
-    png_dpi : int, default ANALYSIS_PNG_DPI (600)
+    png_dpi : int, default ANALYSIS_PNG_DPI (300)
         Resolution for saved PNG
     output_filename : str, default "gene_overlap.png"
         File name used inside ``{output_dir}/plots/``
@@ -331,7 +337,7 @@ def plot_metrics_summary(
         Metric table with summary rows.
     output_dir : Path
         Output directory (plots/ subdirectory will be created)
-    png_dpi : int, default ANALYSIS_PNG_DPI (600)
+    png_dpi : int, default ANALYSIS_PNG_DPI (300)
         Resolution for saved PNG
     """
     try:
@@ -522,7 +528,7 @@ def plot_aggregate_metrics_summary(
         DataFrame with aggregate metrics columns
     output_dir : Path
         Output directory (plots/ subdirectory will be created)
-    png_dpi : int, default ANALYSIS_PNG_DPI (600)
+    png_dpi : int, default ANALYSIS_PNG_DPI (300)
         Resolution for saved PNG
 
     Outputs
@@ -670,7 +676,7 @@ def plot_feature_umaps(
 ) -> None:
     """UMAP feature plots for every gene that was selected in at least one iteration.
 
-    **Publication-optimized** with higher DPI default (600 instead of 150).
+    Higher DPI default (ANALYSIS_PNG_DPI, 300) than the matplotlib default.
 
     A cell-type overview UMAP is saved first, followed by batched gene-expression
     feature plots (16 genes per grid figure).  A UMAP embedding is computed on the
@@ -686,8 +692,8 @@ def plot_feature_umaps(
         Column name in adata.obs for cell types
     output_dir : Path
         Output directory (plots/feature_plots/ subdirectory will be created)
-    png_dpi : int, default ANALYSIS_PNG_DPI (600)
-        Resolution for saved PNG (increased from 150 for publication quality)
+    png_dpi : int, default ANALYSIS_PNG_DPI (300)
+        Resolution for saved PNG.
     """
     try:
         feature_dir = output_dir / "plots" / "feature_plots"

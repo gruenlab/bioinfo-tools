@@ -11,7 +11,7 @@ Dataset names follow the convention::
 Examples::
 
     Scanpy-Filter_All-Genes_deg_only_100
-    Xenium-Filter_HVG-Subset_dt_nmf_DT0.25_Dimred0.75_per_celltype_method_a_5factors_200_5k-addon
+    Xenium-Filter_HVG-Subset_RecoVar_RF_0.25_Dimred_0.75_5factors_200_5k-addon
     Scanpy-Filter_Spapros_100_mMulti-addon_cell-type-specific-filling
 """
 
@@ -42,10 +42,17 @@ _FILLING_STRATEGIES: tuple[str, ...] = (
     "DEG-based-filling",
 )
 
+# Order matters: ``RecoVar_PCA`` must precede ``RecoVar`` (substring), and the
+# hybrid ``RecoVar_RF_..._Dimred_...`` names are matched by a regex *before* this
+# loop so that the ``_RecoVar_`` substring in a hybrid name is not mistaken for
+# the bare ``RecoVar`` strategy.
 _SIMPLE_STRATEGIES: tuple[str, ...] = (
     "deg_only",
-    "dt_simple",
-    "dt_deg",
+    "rf_simple",
+    "rf_deg",
+    "dimred_only",
+    "RecoVar_PCA",
+    "RecoVar",
     "hvg",
     "random",
 )
@@ -74,15 +81,15 @@ def extract_strategy_from_dataset_name(
         A 3-tuple of ``(strategy, filling_method, n_factors)`` where:
 
         - *strategy* is the core strategy identifier
-          (e.g. ``"deg_only"``, ``"dt_pca_DT0.5_Dimred0.5_global_method_a"``).
+          (e.g. ``"deg_only"``, ``"RecoVar_RF_0.25_Dimred_0.75"``).
         - *filling_method* is one of the gap-filling identifiers or ``None``.
         - *n_factors* is the number of NMF/PCA factors, or ``None`` if absent.
 
     Example:
         >>> extract_strategy_from_dataset_name(
-        ...     "Scanpy-Filter_All-Genes_dt_nmf_DT0.25_Dimred0.75_per_celltype_method_a_5factors_100"
+        ...     "Scanpy-Filter_All-Genes_RecoVar_RF_0.25_Dimred_0.75_5factors_100"
         ... )
-        ('dt_nmf_DT0.25_Dimred0.75_per_celltype_method_a', None, 5)
+        ('RecoVar_RF_0.25_Dimred_0.75', None, 5)
     """
     import os  # keep stdlib import; os.path is lightweight
 
@@ -115,6 +122,19 @@ def extract_strategy_from_dataset_name(
     if "5k" in parts and "5k-addon" not in name:
         return ("5k", filling_method, n_factors)
 
+    # Hybrid strategies: RecoVar / RecoVar_PCA + RF share + dimred share.
+    # Matched before the simple-strategy loop so the ``_RecoVar_`` substring in a
+    # hybrid name is not mistaken for the bare ``RecoVar`` strategy.
+    combo_match = re.search(
+        r"RecoVar(_PCA)?_RF_([\d.]+)_Dimred_([\d.]+)",
+        name,
+    )
+    if combo_match:
+        pca_flag, rf_ratio, dimred_ratio = combo_match.groups()
+        prefix = "RecoVar_PCA" if pca_flag else "RecoVar"
+        strategy = f"{prefix}_RF_{rf_ratio}_Dimred_{dimred_ratio}"
+        return (strategy, filling_method, n_factors)
+
     # Simple strategies
     for strategy in _SIMPLE_STRATEGIES:
         if f"_{strategy}_" in name or name.endswith(f"_{strategy}"):
@@ -126,22 +146,14 @@ def extract_strategy_from_dataset_name(
     if "HVG" in parts and parts.index("HVG") > 1:
         return ("HVG", filling_method, n_factors)
 
-    # Dimensionality-reduction-only strategies: pca/nmf + global/per_celltype + method_a/b
-    dimred_match = re.search(r"(pca|nmf)_(global|per_celltype)_method_([ab])", name)
+    # Dimensionality-reduction-only Modules_v2 legacy names: pca/nmf +
+    # global/per_celltype, with an optional trailing ``_method_a``/``_method_b``.
+    dimred_match = re.search(r"(pca|nmf)_(global|per_celltype)(?:_method_([ab]))?", name)
     if dimred_match:
         dimred_type, analysis_type, method = dimred_match.groups()
-        return (f"{dimred_type}_{analysis_type}_method_{method}", filling_method, n_factors)
-
-    # Hybrid strategies: dt_pca/dt_nmf + ratio parameters
-    combo_match = re.search(
-        r"dt_(pca|nmf)_DT([\d.]+)_Dimred([\d.]+)_(global|per_celltype)_method_([ab])",
-        name,
-    )
-    if combo_match:
-        dimred_type, dt_ratio, dimred_ratio, analysis_type, method = combo_match.groups()
-        strategy = (
-            f"dt_{dimred_type}_DT{dt_ratio}_Dimred{dimred_ratio}_{analysis_type}_method_{method}"
-        )
+        strategy = f"{dimred_type}_{analysis_type}"
+        if method:
+            strategy += f"_method_{method}"
         return (strategy, filling_method, n_factors)
 
     logger.warning("Could not extract strategy from dataset name: %s", dataset_name)
@@ -298,7 +310,7 @@ def filter_datasets_by_keywords(
     """Filter dataset names whose strategy matches any keyword.
 
     Matching is case-insensitive and supports partial matches so that
-    e.g. ``"pca_global"`` matches ``"pca_global_method_a"``.
+    e.g. ``"RecoVar"`` matches ``"RecoVar_RF_0.25_Dimred_0.75"``.
 
     Args:
         dataset_names: All available dataset names.
@@ -341,7 +353,6 @@ def filter_datasets_by_args(
             - ``hvg_subset_options``: list of ``"true"``/``"false"`` strings.
             - ``reduction_types``: list of reduction types.
             - ``analysis_types``: list of analysis types.
-            - ``dimred_methods``: list of dimred methods.
             - ``dt_percentages``: list of DT percentage floats.
             - ``dimred_percentages``: list of Dimred percentage floats.
             - ``run_celltype_specific_filling``: ``"true"``/``"false"`` or ``None``.
@@ -430,12 +441,6 @@ def _file_passes_all_filters(
     if filter_args.get("analysis_types"):
         if not any(at in strategy.lower() for at in filter_args["analysis_types"]):
             logger.debug("Excluded %s: no analysis type matched", filename)
-            return False
-
-    # Dimred method
-    if filter_args.get("dimred_methods"):
-        if not any(dm.replace("_", "") in strategy.lower() for dm in filter_args["dimred_methods"]):
-            logger.debug("Excluded %s: no dimred method matched", filename)
             return False
 
     # DT percentages

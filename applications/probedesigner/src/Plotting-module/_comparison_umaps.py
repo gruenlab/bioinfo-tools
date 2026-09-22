@@ -15,6 +15,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scanpy as sc
 
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 try:
     from ._constants import ANALYSIS_PNG_DPI
 except ImportError:

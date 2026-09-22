@@ -6,7 +6,7 @@ during pipeline operations. Based on patterns from the Spapros pipeline.
 Example usage:
     from utility_module._resource_tracker import ResourceTracker
 
-    tracker = ResourceTracker("selection_rf_nmf")
+    tracker = ResourceTracker("selection_RecoVar")
     tracker.start()
 
     # ... your operation ...

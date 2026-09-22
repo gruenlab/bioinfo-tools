@@ -6,14 +6,15 @@ This module provides data preprocessing utilities that serve three distinct pipe
 
 ## Overview
 
-Four scripts cover the full preprocessing needs of the pipeline:
+Five scripts cover the preprocessing needs of the pipeline:
 
 | Script | Context | Role |
 |--------|---------|------|
 | `preprocess_for_selection.py` | Selection pipeline | Importable function + CLI; produces filter/HVG combinations for selection |
-| `preprocess_for_evaluation.py` | Evaluation pipeline | CLI; preprocesses all selected gene-list panels for evaluation |
+| `preprocess_for_evaluation.py` | Evaluation pipeline | CLI; preprocesses selected gene-list panels for evaluation (currently incompatible with `run_selection_pipeline.py` output — see below) |
 | `preprocess_reference_for_evaluation.py` | Evaluation + Analysis | Importable function + CLI; produces reference h5ad with UMAP/Leiden |
 | `preprocess_for_analysis.py` | Analysis scripts | CLI wrapper; delegates to `preprocess_reference_for_evaluation.py` |
+| `filter_blacklist_genes.py` | pre-selection | CLI; writes a blacklist-filtered copy of a raw h5ad + `{stem}_filter_parameters.json`. Imports `apply_blacklist_filter` from `Selection-module`. |
 
 ## Directory Structure
 
@@ -24,7 +25,8 @@ Preprocessing-module/
 ├── preprocess_for_selection.py            # Selection pipeline preprocessing
 ├── preprocess_for_evaluation.py           # Evaluation panel preprocessing (CLI)
 ├── preprocess_reference_for_evaluation.py # Reference data preprocessing (importable + CLI)
-└── preprocess_for_analysis.py             # Analysis script preprocessing (CLI wrapper)
+├── preprocess_for_analysis.py             # Analysis script preprocessing (CLI wrapper)
+└── filter_blacklist_genes.py              # Blacklist-filter a raw h5ad (CLI)
 ```
 
 ## Critical Rule: Raw Counts Preservation
@@ -46,7 +48,7 @@ assert "counts" in adata.layers, "Raw counts missing — run preprocessing first
 ```
 Raw counts (.X or .layers["counts"])
   ↓
-sc.pp.normalize_total(target_sum=1e4)   # CPM normalization
+sc.pp.normalize_total()                 # scanpy default target_sum (per-cell median)
   ↓
 sc.pp.log1p()                           # Log-normalization
   ↓
@@ -65,31 +67,36 @@ sc.tl.leiden()                          # Leiden clustering
 
 **File:** `preprocess_for_selection.py`
 
-**Importable via:** `from preprocessing import preprocess_for_selection`
+**Importable via:** there is no `preprocessing` package (hyphenated dir). Add the module
+dir to `sys.path` and `from preprocess_for_selection import preprocess_for_selection`.
 
-**Signature:**
+**Signature** (`preprocess_for_selection.py`):
 ```python
 def preprocess_for_selection(
     input_file: str,
     output_dir: str,
     celltype_column: str = "celltype",
-    filter_methods: List[str] = None,        # default: ["scanpy", "no_filter"]
-    hvg_option: str = "both",               # "all_genes", "hvg", or "both"
-    n_components_pca: int = 50,
-    n_components_nmf: int = 5,
-    random_state: int = 42,
+    filter_methods: List[str] | None = None,  # default: ["scanpy", "no_filter"]
+    hvg_option: str = "both",                 # "all_genes", "hvg", or "both"
+    n_components_pca: int = DEFAULT_N_COMPONENTS_PCA,
+    n_hvg: int = DEFAULT_N_HVG,               # 8000
+    hvg_flavor: str = DEFAULT_HVG_FLAVOR,     # "cell_ranger"
+    random_state: int = DEFAULT_RANDOM_STATE,
 ) -> None
 ```
+There is **no** `n_components_nmf` parameter — this stage does not compute NMF.
 
 **Output structure:**
 ```
 output_dir/
 └── {filter_name}_{hvg_name}/
-    ├── preprocessed.h5ad     # Normalized + embedded AnnData
-    ├── pca_loadings.csv      # Gene × PC loading matrix
-    ├── nmf_loadings.csv      # Gene × NMF-component loading matrix
+    ├── preprocessed.h5ad     # log-normalized .X, layers["counts"], X_pca
     └── metadata.json         # Parameters used
 ```
+No `pca_loadings.csv` / `nmf_loadings.csv` is written by this stage.
+
+`preprocess_for_selection.py` also exports a `preprocess_for_analysis` function (thin
+wrapper that inserts `Evaluation-module/` on `sys.path`); it has no in-cut caller.
 
 **Supported filter methods:**
 - `"scanpy"` — standard QC filtering (min cells/genes thresholds from `_constants.py`)
@@ -97,7 +104,7 @@ output_dir/
 
 **Supported HVG options:**
 - `"all_genes"` — use all genes
-- `"hvg"` — use only highly variable genes (n=2000 default)
+- `"hvg"` — use only highly variable genes (`DEFAULT_N_HVG = 8000` by default, `cell_ranger` flavor)
 - `"both"` — produce both outputs in separate subdirectories
 
 ---
@@ -124,11 +131,11 @@ def preprocess_reference_for_analysis_scripts(
 - `layers["counts"]` — preserved raw counts
 - `.X` — log-normalized expression
 - `.obsm["X_pca"]` — PCA embedding
-- `.obsm["X_nmf"]` — NMF embedding (if `dimensionality_reduction` is `"nmf"` or `"both"`)
+- `.obsm["X_nmf"]` — NMF embedding (if `dimensionality_reduction` is `"nmf"` or `"both"`; computed independently in this script using `sklearn.NMF`, not via Evaluation-module)
 - `.obsm["X_umap"]` — UMAP coordinates
 - `.obs["leiden"]` — Leiden cluster assignments
 
-**Note:** Uses `importlib.util` to load its own `_constants.py` by absolute path — this avoids a name collision with `Evaluation-module/_constants.py` and is an acknowledged exception to the no-importlib rule in the project.
+**Note:** Uses `importlib.util` to load its own `_constants.py` by absolute path — this avoids a name collision with `Evaluation-module/_constants.py` and is an acknowledged exception to the no-importlib rule in the project. NMF computation in this script is self-contained: it uses `sklearn.NMF` directly, not the `nico2_lib` `NmfPredictor` wrapper used by `Evaluation-module`.
 
 ---
 
@@ -137,7 +144,7 @@ def preprocess_reference_for_analysis_scripts(
 Preprocesses all gene-list panels produced by the Selection-module so they are ready for evaluation. It discovers gene lists automatically from the selection output directory, then calls `process_data_for_panel_evaluation()` from the Evaluation-module for each panel.
 
 **Cross-module dependencies:**
-- `Evaluation-module._preprocessing.process_data_for_panel_evaluation` — core preprocessing logic
+- `Evaluation-module._preprocessing.process_data_for_panel_evaluation` — core preprocessing logic (panel subsetting + PCA embedding; the script still passes the `--dimensionality_reduction` flag through)
 - `Utility-module._utils.convert_ensembl_to_gene_symbols` — ENSEMBL → gene symbol conversion
 
 **CLI Arguments:**
@@ -152,15 +159,20 @@ Preprocesses all gene-list panels produced by the Selection-module so they are r
 | `--external_names` | str(s) | No | Names for external panels |
 | `--external_probeset_sizes` | int(s) | No | Sizes to subset external panels to (0 or -1 = use all) |
 | `--add_10x_panels` | choice | No | Combine with 10x panels: `both`, `mMulti`, `5k`, `no-10x-panel`, `all` |
-| `--celltype_column` | str | No | Cell type column in obs (default: `celltypes_v2`) |
+| `--celltype_column` | str | No | Cell type column in obs (default: `celltypes_v2` for this script — differs from the `celltype` default used elsewhere; `preprocess_reference_for_evaluation.py` has no such flag and is hard-pinned to `celltype`) |
 | `--n_neighbors` | int | No | KNN neighbors for UMAP (default: 15) |
-| `--dimensionality_reduction` | choice | No | `pca`, `nmf`, or `both` (default: `both`) |
+| `--dimensionality_reduction` | choice | No | `pca`, `nmf`, or `both` (default: `both`; passed through to `process_data_for_panel_evaluation`) |
 | `--log_level` | choice | No | `DEBUG`, `INFO`, `WARNING`, `ERROR` (default: `INFO`) |
 
 *At least one of `--gene_lists_dir` or `--gene_list_files_txt` is required.
 
 **Gene list discovery priority** (within each subdirectory):
-1. `ranked_gene_list.csv` — filters rows where `final_selection == True`
+1. A Selection-module gene-list CSV (`ranked_gene_list.csv`, or a
+   `{strategy}_panel_information.csv`/`RecoVar_panel_information.csv`) — filters rows using
+   the first present of `final_selection` / `in_panel` / `selected_final` (the
+   Selection-module's current canonical column is `in_panel`; older files may instead carry
+   `final_selection` or `selected_final` — if you see empty panels, check which column name
+   is present)
 2. `selected_genes.csv` — uses all rows
 3. HVG/random fallback
 
@@ -188,7 +200,6 @@ python preprocess_for_analysis.py \
 |----------|---------|-------------|
 | `DEFAULT_N_COMPONENTS_PCA` | 50 | PCA components |
 | `DEFAULT_N_COMPONENTS_NMF` | 5 | NMF components |
-| `NORMALIZE_TARGET_SUM` | 1e4 | CPM normalization target |
 | `DEFAULT_N_HVG` | 8000 | HVG count |
 | `DEFAULT_HVG_FLAVOR` | `"cell_ranger"` | Scanpy HVG flavor |
 | `DEFAULT_MIN_GENES_PER_CELL` | 100 | Min genes per cell for QC filter |

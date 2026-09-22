@@ -13,18 +13,16 @@ from __future__ import annotations
 
 # -------------------- Data & Analysis --------------------
 
-DEFAULT_CELLTYPE_COLUMN: str = "new_annot"
-DEFAULT_EVALUATION_TYPE: str = "both"          # Options: "baseline", "variability", "both"
-DEFAULT_DIMENSIONALITY_REDUCTION: str = "pca"  # Options: "pca", "nmf", "both"
-DEFAULT_DIM_REDUCTION_PREPROCESS: str = "both"
+DEFAULT_CELLTYPE_COLUMN: str = "cluster"       # wired to run_evaluation.py --celltype_col
+DEFAULT_EVALUATION_TYPE: str = "all"           # Options: "baseline", "variability", "biology", "all", "tangram_only"
+DEFAULT_DIM_REDUCTION_PREPROCESS: str = "both"  # which embeddings preprocessing computes: "pca"/"nmf"/"both"
 
 # -------------------- Numerical Parameters --------------------
 
-DEFAULT_N_COMPONENTS: int = 5       # NMF components
-DEFAULT_N_NEIGHBORS: int = 15       # kNN graph construction
-DEFAULT_TEST_SIZE: float = 0.3      # Train/test split ratio
-DEFAULT_RANDOM_STATE: int = 42      # Reproducibility seed
-DEFAULT_TANGRAM_N_EPOCHS: int = 500 # Tangram mapping epochs
+DEFAULT_N_COMPONENTS: int = 5        # NMF components
+DEFAULT_N_NEIGHBORS: int = 15        # kNN graph construction
+DEFAULT_RANDOM_STATE: int = 42       # Reproducibility seed
+DEFAULT_TANGRAM_N_EPOCHS: int = 1000 # Tangram mapping epochs (wired to --tangram_n_epochs)
 
 # =============================================================================
 # INTERNAL ALGORITHM PARAMETERS
@@ -43,30 +41,43 @@ DEFAULT_SUBSAMPLE_SIZE: int = 500
 # Train/test split ratio expressed as inverse (4 → 80/20 split)
 DEFAULT_SPLIT_RATIO: int = 4
 
+# Depth cap for the DecisionTreeClassifier in evaluate_celltype_identification, applied
+# identically to every panel (not tuned per panel). Set to 15 after the eval-tree depth
+# sweep (docs/doc-pipeline/eval-celltype-clf-maxdepth-sweep.md): at depth 10 a cluster of
+# lineage-adjacent cell types (T/NK/ILC1s/cDC1s/cDC2s/Mig.cDCs/Monocytes) collapsed to
+# F1 ~ 0 on genuinely good panels because the tree ran out of splits before isolating
+# their leaves; depth 15 recovers them (panel macro_f1 0.61 -> 0.94) while depth 20 begins
+# to overfit small panels. The metric row still records the actual depth as
+# `classifier_max_depth`.
+DEFAULT_CELLTYPE_CLF_MAX_DEPTH: int = 15
+
 # -------------------- Tangram Reconstruction --------------------
 
 # Minimum cells per cell type to run per-cell-type Tangram mapping
 MIN_CELLS_PER_CELLTYPE: int = 30
 
-# =============================================================================
-# FILE AND DIRECTORY NAMING
-# =============================================================================
+# -------------------- NMF reconstruction --------------------
 
-RESULTS_DIRNAME: str = "results"
-LOGS_DIRNAME: str = "logs"
-PREPROCESSED_DIRNAME: str = "preprocessed"
-
-# Standard output filenames
-CLUSTERING_RESULTS_FILENAME: str = "clustering_evaluation_results.csv"
-VARIABILITY_RESULTS_FILENAME: str = "variability_evaluation_results.csv"
-TANGRAM_RESULTS_FILENAME: str = "tangram_reconstruction_results.csv"
-
-# Plot settings
-DEFAULT_PNG_DPI: int = 300
-
-# =============================================================================
-# LOGGING CONFIGURATION
-# =============================================================================
-
-LOG_FORMAT: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-LOG_DATE_FORMAT: str = "%Y-%m-%d %H:%M:%S"
+# Fixed kwargs forwarded to nico2_lib NmfPredictor (selection + evaluation).
+# KEEP IN SYNC WITH Selection-module/_constants.py. This is the Frobenius/cd fallback
+# default only -- the actual solver/beta_loss/init/max_iter used by every NMF call is now
+# resolved per-run by Utility-module/_nmf_objective.py (data-space-driven: raw counts ->
+# mu/Kullback-Leibler, lognorm -> this cd/Frobenius set), overridable via --nmf_objective /
+# nmf_objective=. NmfPredictor.fit()/.predict() honour solver + beta_loss + init + max_iter;
+# alpha_*/l1_ratio remain no-ops, so those entries document intent only.
+NMF_SOLVER: str = "cd"
+NMF_BETA_LOSS: str = "frobenius"
+NMF_INIT: str = "nndsvd"
+NMF_MAX_ITER: int = 1000
+NMF_ALPHA_W: float = 0.0
+NMF_ALPHA_H: float = 0.0
+NMF_L1_RATIO: float = 0.0
+NMF_PREDICTOR_FIXED_KWARGS: dict = dict(
+    solver=NMF_SOLVER,
+    beta_loss=NMF_BETA_LOSS,
+    init=NMF_INIT,
+    max_iter=NMF_MAX_ITER,
+    alpha_W=NMF_ALPHA_W,
+    alpha_H=NMF_ALPHA_H,
+    l1_ratio=NMF_L1_RATIO,
+)

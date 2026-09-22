@@ -3,15 +3,21 @@
 This module provides an optional reconstruction check that uses Tangram
 to map probe-panel expression back to the full transcriptome. It is
 disabled by default and only runs when explicitly requested via the
-``--include-tangram`` flag or ``EvaluationConfig.include_tangram = True``.
+``--include_tangram`` flag or ``EvaluationConfig.include_tangram = True``.
 
-Note:
-    Tangram operates on the **full dataset** (no train/test split). This is
-    a method-level limitation rather than a pipeline choice.
+When ``train_idx`` / ``test_idx`` (or ``per_celltype_splits``) are supplied the
+mapping is fit on the train cells and scored on the held-out test cells; without
+them Tangram maps the full dataset.
+
+Scoring conventions (fixed 2026-09-20; earlier Tangram results were invalid):
+  * the reference matrix is taken from the SAME space Tangram mapped on
+    (``nmf_counts_input="raw"`` -> ``layers["counts"]``), not from ``adata.X``;
+  * the projected expression is divided by ``n_sc / n_sp`` (see
+    ``reconstruct_with_tangram``) so one spot corresponds to one cell.
 
 Usage::
 
-    from evaluation._reconstruction import run_tangram_reconstruction_check
+    from _tangram import run_tangram_reconstruction_check
 
     if config.include_tangram:
         tangram_results = run_tangram_reconstruction_check(
@@ -27,7 +33,6 @@ Usage::
 from __future__ import annotations
 
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -60,15 +65,8 @@ from metrics import (
 logger = logging.getLogger(__name__)
 
 _UTILITY_DIR = Path(__file__).parent.parent / "Utility-module"
-if _UTILITY_DIR.exists():
-    sys.path.insert(0, str(_UTILITY_DIR))
-try:
-    from _validation import is_anndata_raw_layer, is_anndata_raw  # type: ignore[import]
-except ImportError:
-    def is_anndata_raw_layer(adata, layer_name: str) -> bool:  # type: ignore[misc]
-        return True
-    def is_anndata_raw(adata) -> bool:  # type: ignore[misc]
-        return True
+sys.path.insert(0, str(_UTILITY_DIR))
+from _validation import is_anndata_raw_layer, is_anndata_raw  # type: ignore[import]
 
 __all__ = [
     "reconstruct_with_tangram",
@@ -135,6 +133,9 @@ def reconstruct_with_tangram(
             Must be provided together with *test_idx*.
         test_idx: Integer position array of test cells into *adata_full*.
             Must be provided together with *train_idx*.
+        nmf_counts_input: Which matrix Tangram maps on — ``"raw"`` (default, uses
+            ``layers["counts"]``) or ``"lognorm"`` (uses ``.X``). Validated against
+            the actual content of both AnnData objects.
 
     Returns:
         AnnData with reconstructed gene-expression values (test cells when
@@ -224,7 +225,26 @@ def reconstruct_with_tangram(
     # ad_ge is a voxel-by-gene AnnData similar to spatial data ad_sp, but where gene expression has been projected from the single cells
     logger.info("Tangram mapping complete – projecting genes...")
     ad_ge = project_genes_unfiltered(adata_map=ad_map, adata_sc=ad_sc)
-    logger.info("Tangram reconstruction complete.")
+
+    # Put the projection on a per-cell scale. Tangram's mapping matrix is a softmax over
+    # spots for every sc cell (each sc cell's mass sums to 1), and the projection is
+    # M.T @ X_sc, so every spot receives on average n_sc / n_sp cells' worth of
+    # expression (~4x with a 5-fold split), not one cell's. Dividing by n_sc / n_sp
+    # makes the mean prediction per spot equal the mean training expression ("one cell
+    # per spot"), so MSE / ExpVar against a single held-out cell are comparable with
+    # NMF / Ridge / scVI. (Tangram's own tutorials only use scale-invariant cosine
+    # similarity, which is why this never shows up there.) Without a split, n_sc == n_sp
+    # and the divisor is 1.
+    import scipy.sparse
+
+    scale_divisor = ad_sc.n_obs / ad_sp.n_obs
+    X_ge = ad_ge.X.toarray() if scipy.sparse.issparse(ad_ge.X) else np.asarray(ad_ge.X)
+    ad_ge.X = (X_ge / scale_divisor).astype(np.float32)
+    ad_ge.uns["scale_divisor"] = float(scale_divisor)
+    logger.info(
+        "Tangram reconstruction complete (per-cell scale divisor n_sc/n_sp = %.3f).",
+        scale_divisor,
+    )
     return ad_ge
 
 
@@ -233,23 +253,45 @@ def reconstruct_with_tangram(
 # ---------------------------------------------------------------------------
 
 
+# Gene-subset x expvar-mode grid written alongside the legacy ``mse`` / ``expvar``
+# keys. Same subsets/modes (and naming, minus the ``test_probe`` token) as the
+# NMF/PCA/ICA/Ridge evaluations, so the comparison plots can read all methods alike.
+_GRID_SUBSETS = ("all_genes", "panel_genes_only", "non_panel_genes_only")
+_GRID_MODES = ("global_mean", "variance_weighted_sum")
+
+
+def _panel_gene_mask(ref_genes: list[str], adata_subset: sc.AnnData) -> np.ndarray:
+    """Boolean mask over *ref_genes* marking the probe-panel genes.
+
+    Tangram lowercases var_names, so the match is case-insensitive.
+    """
+    panel_lower = {g.lower() for g in adata_subset.var_names}
+    return np.array([g.lower() in panel_lower for g in ref_genes], dtype=bool)
+
+
 def _calculate_reconstruction_metrics(
     X_ref: np.ndarray,
     X_pred: np.ndarray,
+    panel_mask: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Compute a standard suite of reconstruction quality metrics.
 
     Args:
         X_ref: Original data matrix (n_cells × n_genes).
         X_pred: Reconstructed data matrix (n_cells × n_genes).
+        panel_mask: Optional boolean mask over the gene axis marking probe-panel
+            genes. When given, ``mse_<subset>`` / ``expvar_<subset>_<mode>`` are
+            also written for ``panel_genes_only`` and ``non_panel_genes_only``
+            (``all_genes`` is always written). ``expvar`` / ``mse`` remain the
+            all-genes, global-mean values, unchanged.
 
     Returns:
         Dictionary with keys ``mse``, ``expvar``, ``rmse``, ``mae``,
         ``r2``, ``pearson``, ``n_cells``, ``n_genes``.
 
     Note:
-        Uses shared metric helpers from _variability.py to ensure identical
-        computation to NMF evaluation for cross-method comparability.
+        Uses the shared ``metrics`` helpers so the numbers are computed identically
+        to the NMF evaluation, for cross-method comparability.
     """
     # Use shared helpers to ensure identical computation to NMF
     mse = calculate_mse(X_ref, X_pred)
@@ -259,7 +301,22 @@ def _calculate_reconstruction_metrics(
     residual_var = float(np.var(X_ref - X_pred))
     total_var = float(np.var(X_ref))
 
+    grid: dict[str, float] = {}
+    masks: dict[str, np.ndarray | None] = {"all_genes": None}
+    if panel_mask is not None:
+        masks["panel_genes_only"] = panel_mask
+        masks["non_panel_genes_only"] = ~panel_mask
+    for subset, mask in masks.items():
+        if mask is not None and not mask.any():
+            continue
+        Xr = X_ref if mask is None else X_ref[:, mask]
+        Xp = X_pred if mask is None else X_pred[:, mask]
+        grid[f"mse_{subset}"] = calculate_mse(Xr, Xp)
+        for mode in _GRID_MODES:
+            grid[f"expvar_{subset}_{mode}"] = calculate_explained_variance(Xr, Xp, mode=mode)
+
     return {
+        **grid,
         "mse": mse,
         "expvar": expvar,
         "rmse": float(np.sqrt(mse)),
@@ -271,6 +328,10 @@ def _calculate_reconstruction_metrics(
         # Include diagnostic vars for transparency
         "residual_var": residual_var,
         "total_var": total_var,
+        # Scale sanity check: mean per-cell total expression, reference vs prediction.
+        # After the per-cell scale correction these should be of the same order.
+        "mean_total_ref": float(X_ref.sum(axis=1).mean()),
+        "mean_total_pred": float(X_pred.sum(axis=1).mean()),
     }
 
 
@@ -291,30 +352,51 @@ def _adata_to_dense(adata: sc.AnnData) -> np.ndarray:
     return np.asarray(X, dtype=np.float32)
 
 
-def _adata_to_dense_layer(adata: sc.AnnData, layer_name: str) -> np.ndarray:
-    """Return a specific layer as a dense float32 array.
+def _reference_matrix(
+    adata: sc.AnnData,
+    genes: list[str],
+    nmf_counts_input: str = "raw",
+) -> np.ndarray:
+    """Dense reference matrix in the SAME expression space Tangram mapped on.
+
+    ``reconstruct_with_tangram`` swaps ``layers["counts"]`` into ``.X`` only on its
+    own private copies, so the caller's ``adata_full`` keeps whatever ``.X`` it had
+    (log-normalised in the preprocessed evaluation files). Scoring the prediction
+    against ``adata_full.X`` therefore compared raw-count-scale predictions with
+    log-scale targets (MSE ~120, ExpVar ~ -1000). The reference must be taken from
+    the matrix matching *nmf_counts_input* instead.
 
     Args:
-        adata: AnnData object.
-        layer_name: Name of the layer to extract.
+        adata: Reference AnnData (test cells already selected).
+        genes: Gene names (original case) to extract.
+        nmf_counts_input: ``"raw"`` -> ``layers["counts"]``; ``"lognorm"`` -> ``.X``.
 
     Returns:
-        Dense (n_cells × n_genes) float32 array.
+        Dense (n_cells × len(genes)) float32 array.
 
     Raises:
-        ValueError: If layer not found in adata.layers.
+        ValueError: If ``"raw"`` is requested but ``layers["counts"]`` is missing, or
+            *nmf_counts_input* is unknown.
     """
     import scipy.sparse
 
-    if layer_name not in adata.layers:
+    sub = adata[:, genes]
+    if nmf_counts_input == "raw":
+        if "counts" not in sub.layers:
+            raise ValueError(
+                "nmf_counts_input='raw' requires adata.layers['counts'] for the "
+                "reference matrix, but it is missing."
+            )
+        M = sub.layers["counts"]
+    elif nmf_counts_input == "lognorm":
+        M = sub.X
+    else:
         raise ValueError(
-            f"Layer '{layer_name}' not found. Available: {list(adata.layers.keys())}"
+            f"Unknown nmf_counts_input='{nmf_counts_input}'. Choose 'raw' or 'lognorm'."
         )
-
-    X = adata.layers[layer_name]
-    if scipy.sparse.issparse(X):
-        X = X.toarray()
-    return np.asarray(X, dtype=np.float32)
+    if scipy.sparse.issparse(M):
+        M = M.toarray()
+    return np.asarray(M, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -339,11 +421,14 @@ def _run_tangram_per_celltype(
         celltype_col: obs column holding cell-type labels.
         num_epochs: Number of Tangram epochs per cell type.
         min_cells: Minimum cells needed to attempt reconstruction.
-        per_celltype_splits: Pre-computed per-celltype train/test index splits,
-            as returned by :func:`_variability.make_celltype_evaluation_splits`.
-            When provided, training cells serve as the sc reference and test
-            cells as the spatial target, so metrics are computed on held-out
-            data only.  Pass ``None`` to use all cells (original behaviour).
+        per_celltype_splits: Pre-computed per-celltype train/test index splits
+            (the ``per_celltype_splits`` element of a
+            :func:`_splits.generate_evaluation_splits` fold). When provided,
+            training cells serve as the sc reference and test cells as the
+            spatial target, so metrics are computed on held-out data only.
+            Pass ``None`` to use all cells.
+        nmf_counts_input: Matrix Tangram maps on — ``"raw"`` or ``"lognorm"`` —
+            forwarded to :func:`reconstruct_with_tangram`.
 
     Returns:
         Mapping of ``{celltype: metrics_dict}`` where each value has the
@@ -387,7 +472,12 @@ def _run_tangram_per_celltype(
                 ad_ct_ref = adata_full[test_ct_idx]
             else:
                 ad_ct_full = adata_full[mask].copy()
-                ad_ct_sub = adata_subset[mask].copy()
+                mask_sub = (
+                    adata_subset.obs[celltype_col] == ct
+                    if celltype_col in adata_subset.obs.columns
+                    else mask
+                )
+                ad_ct_sub = adata_subset[mask_sub].copy()
                 ad_ge = reconstruct_with_tangram(
                     ad_ct_full, ad_ct_sub, num_epochs=num_epochs,
                     nmf_counts_input=nmf_counts_input,
@@ -405,10 +495,13 @@ def _run_tangram_per_celltype(
                 if orig is not None:
                     ref_genes.append(orig)
                     ge_genes.append(g)
-            X_ref  = _adata_to_dense(ad_ct_ref[:, ref_genes])
+            X_ref  = _reference_matrix(ad_ct_ref, ref_genes, nmf_counts_input)
             X_pred = _adata_to_dense(ad_ge[:, ge_genes])
 
-            metrics = _calculate_reconstruction_metrics(X_ref, X_pred)
+            metrics = _calculate_reconstruction_metrics(
+                X_ref, X_pred, panel_mask=_panel_gene_mask(ref_genes, adata_subset)
+            )
+            metrics["scale_divisor"] = float(ad_ge.uns.get("scale_divisor", 1.0))
             metrics["skipped"] = False
             metrics["_mean_ref"]   = X_ref.mean(axis=0)
             metrics["_mean_pred"]  = X_pred.mean(axis=0)
@@ -443,8 +536,8 @@ def _aggregate_per_celltype_metrics(
         ``weighted_mse``, ``weighted_expvar``, and ``n_celltypes_used``.
 
     Note:
-        Uses shared aggregation helpers from _variability.py to ensure identical
-        computation to NMF evaluation for cross-method comparability.
+        Uses the shared ``metrics`` aggregation helpers so the numbers match the
+        NMF evaluation, for cross-method comparability.
     """
     # Filter out skipped celltypes and convert to format expected by shared helpers
     # The shared helpers expect keys like "mse_test_probe" and "expvar_test_probe"
@@ -467,13 +560,37 @@ def _aggregate_per_celltype_metrics(
     # Count valid cell types
     n_valid = len(valid_results)
 
-    return {
+    summary = {
         "macro_mse": macro_mse_val,
         "macro_expvar": macro_expvar_val,
         "weighted_mse": weighted_mse_val,
         "weighted_expvar": weighted_expvar_val,
         "n_celltypes_used": n_valid,
     }
+
+    # Gene-subset x mode grid (variance-weighted etc.): same helpers, other keys.
+    grid_keys = sorted({
+        k for m in per_celltype_results.values() if not m.get("skipped", False)
+        for k in m if k.startswith(("mse_", "expvar_")) and k.split("_", 1)[1] in _grid_suffixes()
+    })
+    for key in grid_keys:
+        valid = {
+            ct: {**m, key: m[key], "n_cells": m["n_cells"], "skipped": False}
+            for ct, m in per_celltype_results.items()
+            if not m.get("skipped", False) and key in m
+        }
+        if key.startswith("mse_"):
+            summary[f"macro_{key}"] = calculate_macro_mse(valid, metric_key=key)
+            summary[f"weighted_{key}"] = calculate_weighted_mse(valid, metric_key=key)
+        else:
+            summary[f"macro_{key}"] = calculate_macro_explained_variance(valid, metric_key=key)
+            summary[f"weighted_{key}"] = calculate_weighted_explained_variance(valid, metric_key=key)
+    return summary
+
+
+def _grid_suffixes() -> set[str]:
+    """Key suffixes (after ``mse_`` / ``expvar_``) written by the metric grid."""
+    return set(_GRID_SUBSETS) | {f"{s}_{m}" for s in _GRID_SUBSETS for m in _GRID_MODES}
 
 
 # ---------------------------------------------------------------------------
@@ -487,29 +604,43 @@ def _save_tangram_results(
     global_metrics: dict[str, Any] | None,
     per_celltype_results: dict[str, dict[str, Any]] | None,
     per_celltype_summary: dict[str, float] | None = None,
+    fold: int | None = None,
 ) -> None:
     """Persist Tangram results to CSV files.
 
-    Creates ``global/`` and ``per_celltype/`` sub-directories under
-    *output_dir*.
+    When *fold* is ``None`` results are written to ``global/`` and
+    ``per_celltype/`` directly under *output_dir* (aggregated output).
+    When *fold* is an integer they are written to ``per_fold/global/`` and
+    ``per_fold/per_celltype/`` with ``_fold{fold}`` appended to the stem.
 
     Args:
         output_dir: Root Tangram output directory.
         dataset_name: Panel / dataset identifier used as the filename stem.
         global_metrics: Metrics from global reconstruction, or ``None``.
         per_celltype_results: Per-cell-type metrics dict, or ``None``.
+        per_celltype_summary: Summary metrics (macro/weighted) to append as a
+            ``__summary__`` row, or ``None``.
+        fold: When set, save to a ``per_fold/`` subdirectory with fold-indexed
+            filenames.  ``None`` saves to the standard (aggregated) locations.
     """
     output_dir = Path(output_dir)
 
+    if fold is not None:
+        save_dir = output_dir / "per_fold"
+        stem = f"{dataset_name}_fold{fold}"
+    else:
+        save_dir = output_dir
+        stem = dataset_name
+
     if global_metrics is not None:
-        global_dir = output_dir / "global"
+        global_dir = save_dir / "global"
         global_dir.mkdir(parents=True, exist_ok=True)
         df = pd.DataFrame([{**global_metrics, "dataset": dataset_name, "mode": "global"}])
-        df.to_csv(global_dir / f"{dataset_name}.csv", index=False)
-        logger.info("Saved global Tangram metrics to %s", global_dir / f"{dataset_name}.csv")
+        df.to_csv(global_dir / f"{stem}.csv", index=False)
+        logger.info("Saved global Tangram metrics to %s", global_dir / f"{stem}.csv")
 
     if per_celltype_results:
-        ct_dir = output_dir / "per_celltype"
+        ct_dir = save_dir / "per_celltype"
         ct_dir.mkdir(parents=True, exist_ok=True)
         rows = [
             {"celltype": ct, "dataset": dataset_name, "mode": "per_celltype",
@@ -525,212 +656,8 @@ def _save_tangram_results(
                 **per_celltype_summary,
             })
         df = pd.DataFrame(rows)
-        df.to_csv(ct_dir / f"{dataset_name}.csv", index=False)
-        logger.info("Saved per-cell-type Tangram metrics to %s", ct_dir / f"{dataset_name}.csv")
-
-
-# ---------------------------------------------------------------------------
-# Alignment heatmap
-# ---------------------------------------------------------------------------
-
-
-def _plot_tangram_alignment_heatmap(
-    mean_ref: np.ndarray,
-    mean_pred: np.ndarray,
-    gene_names: list[str],
-    row_labels: list[str],
-    output_path: "Path",
-    title: str,
-    max_genes: int = None,
-) -> None:
-    """Save a 2-panel figure comparing original vs. reconstructed mean expression.
-
-    Panels:
-      1. Heatmap of original mean expression (rows = groups, cols = genes).
-      2. Heatmap of Tangram-reconstructed mean expression (same layout).
-
-    Args:
-        mean_ref: Original mean expression matrix, shape ``(n_groups, n_genes)``.
-        mean_pred: Reconstructed mean expression, same shape.
-        gene_names: Gene names corresponding to columns of *mean_ref*.
-        row_labels: Label for each row (cell types or ``["all cells"]``).
-        output_path: File path for the saved PNG.
-        title: Figure suptitle.
-        max_genes: Deprecated parameter (kept for backwards compatibility but ignored).
-            Now always shows all genes.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    mean_ref  = np.asarray(mean_ref,  dtype=float)
-    mean_pred = np.asarray(mean_pred, dtype=float)
-
-    # Use all genes (no filtering)
-    n_genes = len(gene_names)
-    n_rows = len(row_labels)
-
-    # Shared colour scale for both heatmap panels
-    vmin = float(min(mean_ref.min(), mean_pred.min()))
-    vmax = float(max(mean_ref.max(), mean_pred.max()))
-
-    # Calculate figure dimensions
-    fig_h  = max(4.0, n_rows * 0.35 + 1.5)
-    fig_w  = max(12.0, n_genes * 0.15)
-
-    fig, axes = plt.subplots(
-        1, 2, figsize=(fig_w, fig_h),
-        gridspec_kw={"width_ratios": [1, 1]},
-    )
-
-    _xt = list(range(n_genes))
-    _yt = list(range(n_rows))
-
-    # Determine font size based on number of genes
-    gene_fontsize = 5 if n_genes > 50 else (6 if n_genes > 30 else 7)
-
-    # Panel 1 — original
-    im = axes[0].imshow(mean_ref, aspect="auto", vmin=vmin, vmax=vmax, cmap="viridis")
-    axes[0].set_title("Original", fontsize=10)
-    axes[0].set_yticks(_yt)
-    axes[0].set_yticklabels(row_labels, fontsize=7)
-    axes[0].set_xticks(_xt)
-    axes[0].set_xticklabels(gene_names, rotation=90, fontsize=gene_fontsize)
-    axes[0].set_xlabel(f"All genes (n={n_genes})", fontsize=8)
-    plt.colorbar(im, ax=axes[0], shrink=0.6)
-
-    # Panel 2 — reconstructed
-    im2 = axes[1].imshow(mean_pred, aspect="auto", vmin=vmin, vmax=vmax, cmap="viridis")
-    axes[1].set_title("Tangram reconstructed", fontsize=10)
-    axes[1].set_yticks(_yt)
-    axes[1].set_yticklabels(row_labels, fontsize=7)
-    axes[1].set_xticks(_xt)
-    axes[1].set_xticklabels(gene_names, rotation=90, fontsize=gene_fontsize)
-    axes[1].set_xlabel(f"All genes (n={n_genes})", fontsize=8)
-    plt.colorbar(im2, ax=axes[1], shrink=0.6)
-
-    fig.suptitle(title, fontsize=11, y=1.01)
-    fig.tight_layout()
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved alignment heatmap to %s", output_path)
-
-
-def _plot_tangram_correlation_heatmap(
-    mean_ref: np.ndarray,
-    mean_pred: np.ndarray,
-    gene_names: list[str],
-    row_labels: list[str],
-    output_path: "Path",
-    title: str,
-) -> None:
-    """Save a heatmap showing reconstruction quality metrics per cell type.
-
-    Creates a cell-type × metric heatmap with:
-      - Pearson correlation (original vs reconstructed mean expression)
-      - MSE (mean squared error)
-      - Explained variance
-
-    Strategy: Average gene expression across cells of each cell type first,
-    then compute metrics between original and reconstructed mean profiles.
-
-    Args:
-        mean_ref: Original mean expression matrix, shape ``(n_groups, n_genes)``.
-        mean_pred: Reconstructed mean expression, same shape.
-        gene_names: Gene names corresponding to columns of *mean_ref*.
-        row_labels: Label for each row (cell types or ``["all cells"]``).
-        output_path: File path for the saved PNG.
-        title: Figure suptitle.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    from scipy.stats import pearsonr as _pearsonr
-
-    mean_ref  = np.asarray(mean_ref,  dtype=float)
-    mean_pred = np.asarray(mean_pred, dtype=float)
-
-    n_celltypes = mean_ref.shape[0]
-    n_genes = mean_ref.shape[1]
-
-    # Compute metrics per cell type
-    metrics = []
-    for i in range(n_celltypes):
-        ref_profile = mean_ref[i, :]
-        pred_profile = mean_pred[i, :]
-
-        # Pearson correlation
-        if n_genes > 1:
-            corr, _ = _pearsonr(ref_profile, pred_profile)
-        else:
-            corr = np.nan
-
-        # MSE
-        mse = float(np.mean((ref_profile - pred_profile) ** 2))
-
-        # Explained variance (1 - residual_variance / total_variance)
-        total_var = float(np.var(ref_profile))
-        residual_var = float(np.var(ref_profile - pred_profile))
-        expvar = 1.0 - (residual_var / total_var) if total_var > 0 else np.nan
-
-        metrics.append({
-            "celltype": row_labels[i],
-            "Pearson R": corr,
-            "MSE": mse,
-            "Explained Var": expvar,
-        })
-
-    # Create DataFrame
-    df = pd.DataFrame(metrics).set_index("celltype")
-
-    # Create heatmap
-    fig, ax = plt.subplots(figsize=(6, max(4, n_celltypes * 0.4)))
-
-    # Normalize MSE to 0-1 range for better color comparison
-    # (Lower MSE is better, so we invert it: 1 - normalized_MSE)
-    mse_max = df["MSE"].max()
-    df["MSE (norm)"] = 1.0 - (df["MSE"] / mse_max) if mse_max > 0 else 0.0
-
-    # Prepare data for heatmap (Pearson R, Explained Var, and normalized inverted MSE)
-    heatmap_data = df[["Pearson R", "Explained Var", "MSE (norm)"]]
-
-    # Create heatmap with annotations
-    sns.heatmap(
-        heatmap_data.T,  # Transpose so metrics are rows
-        annot=True,
-        fmt=".3f",
-        cmap="RdYlGn",  # Red-Yellow-Green: higher is better
-        vmin=0,
-        vmax=1,
-        cbar_kws={"label": "Quality (higher = better)"},
-        linewidths=0.5,
-        linecolor="white",
-        ax=ax,
-    )
-
-    ax.set_xlabel("Cell Type", fontsize=10)
-    ax.set_ylabel("Metric", fontsize=10)
-    ax.set_title(title, fontsize=11)
-
-    # Add note about MSE normalization
-    fig.text(
-        0.5, 0.01,
-        f"Note: MSE shown as 1 - (MSE / max_MSE) for visualization (higher = better). Max MSE = {mse_max:.2f}",
-        ha="center",
-        fontsize=7,
-        style="italic",
-    )
-
-    fig.tight_layout(rect=[0, 0.03, 1, 1])
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved correlation heatmap to %s", output_path)
-
+        df.to_csv(ct_dir / f"{stem}.csv", index=False)
+        logger.info("Saved per-cell-type Tangram metrics to %s", ct_dir / f"{stem}.csv")
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -750,13 +677,13 @@ def run_tangram_reconstruction_check(
     train_idx: np.ndarray | None = None,
     test_idx: np.ndarray | None = None,
     per_celltype_splits: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
-    plot_heatmaps: bool = True,
     nmf_counts_input: str = "raw",
+    fold: int | None = None,
 ) -> dict[str, Any]:
     """Run the Tangram reconstruction check for a single panel.
 
     This function is the primary entry point called by ``run_evaluation.py``
-    when ``--include-tangram`` is active. It skips gracefully if Tangram
+    when ``--include_tangram`` is active. It skips gracefully if Tangram
     is not installed.
 
     Args:
@@ -774,15 +701,17 @@ def run_tangram_reconstruction_check(
             and evaluated on *test_idx* cells.  Pass ``None`` to use all cells.
         test_idx: Integer position array of global test cells (paired with
             *train_idx*).  Pass ``None`` to use all cells.
-        per_celltype_splits: Pre-computed per-celltype train/test splits, as
-            returned by :func:`_variability.make_celltype_evaluation_splits`.
-            Passed to per-cell-type reconstruction so the same cells are used
-            here as in the NMF per-cell-type evaluation.  Pass ``None`` to use
-            all cells per cell type (original behaviour).
-        plot_heatmaps: If ``True`` (default), save alignment heatmaps to
-            ``output_dir/plots/`` after each reconstruction stage.  Each
-            heatmap compares original vs. reconstructed mean expression per
-            cell type and includes a per-gene Pearson R panel.
+        per_celltype_splits: Pre-computed per-celltype train/test splits (the
+            ``per_celltype_splits`` element of a
+            :func:`_splits.generate_evaluation_splits` fold). Passed to
+            per-cell-type reconstruction so the same cells are used here as in
+            the NMF per-cell-type evaluation.  Pass ``None`` to use all cells
+            per cell type.
+        nmf_counts_input: Matrix Tangram maps on — ``"raw"`` (default) or
+            ``"lognorm"`` — forwarded to :func:`reconstruct_with_tangram`.
+        fold: When provided, passed to :func:`_save_tangram_results` so
+            results are written to ``per_fold/`` with a fold-indexed filename
+            instead of overwriting the main output file.
 
     Returns:
         Dictionary with keys ``"global"`` and/or ``"per_celltype"`` holding
@@ -842,52 +771,18 @@ def run_tangram_reconstruction_check(
 
             # Reference data: test cells when a split is provided, all cells otherwise
             adata_ref = adata_full[test_idx] if test_idx is not None else adata_full
-            X_ref  = _adata_to_dense(adata_ref[:, ref_genes])
+            X_ref  = _reference_matrix(adata_ref, ref_genes, nmf_counts_input)
             X_pred = _adata_to_dense(ad_ge[:, ge_genes])
-            global_metrics = _calculate_reconstruction_metrics(X_ref, X_pred)
+            global_metrics = _calculate_reconstruction_metrics(
+                X_ref, X_pred, panel_mask=_panel_gene_mask(ref_genes, adata_subset)
+            )
+            global_metrics["scale_divisor"] = float(ad_ge.uns.get("scale_divisor", 1.0))
             result["global"] = global_metrics
             logger.info(
                 "Global Tangram complete: MSE=%.4f, ExpVar=%.4f",
                 global_metrics["mse"],
                 global_metrics["expvar"],
             )
-
-            if plot_heatmaps:
-                try:
-                    heatmap_path = output_dir / "plots" / f"{dataset_name}_global_heatmap.png"
-                    corr_heatmap_path = output_dir / "plots" / f"{dataset_name}_global_correlation_heatmap.png"
-                    if celltype_col in adata_ref.obs.columns:
-                        ct_labels = adata_ref.obs[celltype_col].values
-                        cell_types_sorted = sorted(np.unique(ct_labels))
-                        mean_ref_by_ct  = np.array([X_ref [ct_labels == ct].mean(axis=0) for ct in cell_types_sorted])
-                        mean_pred_by_ct = np.array([X_pred[ct_labels == ct].mean(axis=0) for ct in cell_types_sorted])
-                        _plot_tangram_alignment_heatmap(
-                            mean_ref_by_ct, mean_pred_by_ct, ref_genes, cell_types_sorted,
-                            output_path=heatmap_path,
-                            title=f"{dataset_name} — Global Tangram alignment",
-                        )
-                        _plot_tangram_correlation_heatmap(
-                            mean_ref_by_ct, mean_pred_by_ct, ref_genes, cell_types_sorted,
-                            output_path=corr_heatmap_path,
-                            title=f"{dataset_name} — Per-celltype reconstruction quality",
-                        )
-                    else:
-                        _plot_tangram_alignment_heatmap(
-                            X_ref.mean(axis=0, keepdims=True),
-                            X_pred.mean(axis=0, keepdims=True),
-                            ref_genes, ["all cells"],
-                            output_path=heatmap_path,
-                            title=f"{dataset_name} — Global Tangram alignment",
-                        )
-                        _plot_tangram_correlation_heatmap(
-                            X_ref.mean(axis=0, keepdims=True),
-                            X_pred.mean(axis=0, keepdims=True),
-                            ref_genes, ["all cells"],
-                            output_path=corr_heatmap_path,
-                            title=f"{dataset_name} — Reconstruction quality",
-                        )
-                except Exception as plot_exc:
-                    logger.warning("Could not save global alignment heatmap: %s", plot_exc)
 
         except Exception as exc:
             logger.warning("Global Tangram failed for '%s': %s", dataset_name, exc, exc_info=True)
@@ -915,42 +810,6 @@ def run_tangram_reconstruction_check(
             summary["n_celltypes_used"],
         )
 
-        if plot_heatmaps:
-            try:
-                valid_cts = [
-                    ct for ct, m in per_celltype_results.items()
-                    if not m.get("skipped") and "_mean_ref" in m
-                ]
-                if len(valid_cts) >= 2:
-                    # Gene lists may differ per cell type (tg.pp_adatas filters
-                    # zero-expression genes per run).  Use the intersection so
-                    # all rows have the same length before stacking.
-                    gene_sets = [set(per_celltype_results[ct]["_gene_names"]) for ct in valid_cts]
-                    common_genes = sorted(gene_sets[0].intersection(*gene_sets[1:]))
-                    if common_genes:
-                        mean_ref_rows, mean_pred_rows = [], []
-                        for ct in valid_cts:
-                            gene_idx = {g: i for i, g in enumerate(per_celltype_results[ct]["_gene_names"])}
-                            idx = [gene_idx[g] for g in common_genes]
-                            mean_ref_rows.append(per_celltype_results[ct]["_mean_ref"][idx])
-                            mean_pred_rows.append(per_celltype_results[ct]["_mean_pred"][idx])
-                        _plot_tangram_alignment_heatmap(
-                            np.array(mean_ref_rows), np.array(mean_pred_rows),
-                            common_genes, valid_cts,
-                            output_path=output_dir / "plots" / f"{dataset_name}_per_celltype_heatmap.png",
-                            title=f"{dataset_name} — Per-cell-type Tangram alignment",
-                        )
-                        _plot_tangram_correlation_heatmap(
-                            np.array(mean_ref_rows), np.array(mean_pred_rows),
-                            common_genes, valid_cts,
-                            output_path=output_dir / "plots" / f"{dataset_name}_per_celltype_correlation_heatmap.png",
-                            title=f"{dataset_name} — Per-celltype reconstruction quality",
-                        )
-                    else:
-                        logger.warning("No common genes across cell types — skipping per-celltype heatmap.")
-            except Exception as plot_exc:
-                logger.warning("Could not save per-celltype alignment heatmap: %s", plot_exc)
-
     # Save results
     _save_tangram_results(
         output_dir,
@@ -958,6 +817,7 @@ def run_tangram_reconstruction_check(
         global_metrics=global_metrics if run_global and not result.get("global", {}).get("skipped") else None,
         per_celltype_results=per_celltype_results,
         per_celltype_summary=result.get("per_celltype_summary"),
+        fold=fold,
     )
 
     return result

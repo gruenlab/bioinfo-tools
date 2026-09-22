@@ -12,12 +12,19 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Union
 
-import numpy as np
 import pandas as pd
 
 # Use absolute imports (for script execution)
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 from _constants import (
     COL_GENE,
     COL_RANK,
@@ -25,19 +32,155 @@ from _constants import (
     COL_SELECTION_STRATEGY,
     COL_ANALYSIS_TYPE,
     COL_CELLTYPE,
+    COL_INFORMATIVE_CELLTYPES,
     COL_MEAN_EXPRESSION,
+    COL_RF_CONTRIBUTING_CELLTYPES,
     COL_SELECTED_INITIAL,
     COL_PASSED_XENIUM,
-
     COL_FINAL_SELECTION,
     COL_XENIUM_FAILURE_REASON,
-
-    COL_REPLACED_BY,
-    COL_REPLACES_GENE,
-    COL_REPLACEMENT_REASON,
+    RF_CONTRIBUTING_CELLTYPE_SEP,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Single-strategy output filename map -- shared by every writer (run_single_selection.py
+# and each strategy module's own intermediate save) and every reader (run_selection_pipeline.py's
+# validation helpers, Evaluation-module/Plotting-module/Analysis-scripts gene-list discovery)
+# so the name is defined exactly once. Combination-strategy output
+# (RecoVar_panel_information.csv) is a separate, fixed name, not covered by this map.
+_STRATEGY_PANEL_INFORMATION_FILENAMES = {
+    "deg_only": "deg_only_panel_information.csv",
+    "hvg": "hvg_panel_information.csv",
+    "random": "random_panel_information.csv",
+    "rf_simple": "rf_simple_panel_information.csv",
+    "rf_deg": "rf_deg_panel_information.csv",
+}
+
+
+def panel_information_filename(strategy: str, reduction_type: Optional[str] = None) -> str:
+    """Return the output filename for a single selection strategy's ranked gene list.
+
+    See docs/doc-pipeline/audit_3.md, "Selection-module CSV output reorganization".
+
+    Args:
+        strategy: One of deg_only, hvg, random, rf_simple, rf_deg, dimred_only.
+        reduction_type: Required when strategy == "dimred_only" -- "nmf" or "pca".
+
+    Returns:
+        e.g. "rf_deg_panel_information.csv", "nmf_panel_information.csv".
+
+    Raises:
+        ValueError: Unknown strategy, or dimred_only without a reduction_type.
+    """
+    if strategy == "dimred_only":
+        if reduction_type not in ("nmf", "pca"):
+            raise ValueError(
+                f"panel_information_filename('dimred_only', ...) requires "
+                f"reduction_type='nmf' or 'pca', got {reduction_type!r}"
+            )
+        return f"{reduction_type}_panel_information.csv"
+    if strategy not in _STRATEGY_PANEL_INFORMATION_FILENAMES:
+        raise ValueError(f"Unknown strategy for panel_information_filename: {strategy!r}")
+    return _STRATEGY_PANEL_INFORMATION_FILENAMES[strategy]
+
+
+def _is_real_celltype(value: Any) -> bool:
+    """True when ``value`` is a usable cell-type label (not NaN/blank/'global')."""
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return bool(text) and text.lower() != "global"
+
+
+def _known_celltype_vocabulary(df: pd.DataFrame) -> set[str]:
+    """Real single-name cell types seen in a frame's ``celltype`` / ``rf_celltype``."""
+    known: set[str] = set()
+    for col in (COL_CELLTYPE, "rf_celltype"):
+        if col in df.columns:
+            known.update(
+                str(v).strip() for v in df[col].tolist() if _is_real_celltype(v)
+            )
+    return known
+
+
+def _split_contributing_celltypes(value: Any, known: set[str]) -> list[str]:
+    """Split a ``", "``-joined ``contributing_celltypes`` string into names.
+
+    Cell-type names can themselves contain ``", "``; fragments are split on
+    ``", "`` and then adjacent fragments are greedily re-joined into the longest
+    run that forms a name in ``known``. Fragments that are not part of a known
+    multi-fragment name pass through unchanged, so an incomplete vocabulary
+    degrades gracefully (at worst it over-splits one name, never collapses the
+    whole list into a single token).
+    """
+    if not _is_real_celltype(value):
+        return []
+    frags = [f.strip() for f in str(value).strip().split(", ") if f.strip()]
+    if not frags:
+        return []
+    if not known or all(f in known for f in frags):
+        return frags
+
+    out: list[str] = []
+    i = 0
+    while i < len(frags):
+        matched = None
+        for j in range(len(frags), i, -1):
+            candidate = ", ".join(frags[i:j])
+            if candidate in known:
+                matched = (candidate, j)
+                break
+        if matched:
+            out.append(matched[0])
+            i = matched[1]
+        else:
+            out.append(frags[i])
+            i += 1
+    return out
+
+
+def derive_informative_celltypes(
+    df: pd.DataFrame, sep: str = RF_CONTRIBUTING_CELLTYPE_SEP
+) -> pd.Series:
+    """Per-gene, ``sep``-joined list of every cell type a gene is informative for.
+
+    Unifies the per-source attribution columns already present in a ranked gene
+    list so that
+    ``df[COL_INFORMATIVE_CELLTYPES].str.split(sep).explode().value_counts()``
+    gives the genes-per-cell-type coverage directly — no separate file needed:
+
+    * random-forest genes → ``rf_contributing_celltypes`` (already ``sep``-joined)
+    * NMF/dimred and cell-type gap-fill genes → ``contributing_celltypes``
+      (``", "``-joined; split comma-safely against the frame's own cell-type names)
+    * everything else → the single ``celltype`` value
+
+    Returns an empty string for genes with no attributable cell type.
+    """
+    known = _known_celltype_vocabulary(df)
+    has_rf = COL_RF_CONTRIBUTING_CELLTYPES in df.columns
+    has_contrib = "contributing_celltypes" in df.columns
+    has_celltype = COL_CELLTYPE in df.columns
+
+    values: list[str] = []
+    for _, row in df.iterrows():
+        names: list[str] = []
+        if has_rf:
+            rf_val = row[COL_RF_CONTRIBUTING_CELLTYPES]
+            if _is_real_celltype(rf_val):
+                names = [t.strip() for t in str(rf_val).split(sep) if t.strip()]
+        if not names and has_contrib:
+            names = _split_contributing_celltypes(row["contributing_celltypes"], known)
+        if not names and has_celltype and _is_real_celltype(row[COL_CELLTYPE]):
+            names = [str(row[COL_CELLTYPE]).strip()]
+        values.append(sep.join(dict.fromkeys(names)))
+    return pd.Series(values, index=df.index)
 
 
 class GeneListBuilder:
@@ -56,7 +199,7 @@ class GeneListBuilder:
     - Exports to pandas DataFrame or CSV
     
     Attributes:
-        strategy_name: Name of selection strategy (e.g., 'deg_only', 'rf_nmf').
+        strategy_name: Name of selection strategy (e.g., 'deg_only', 'RecoVar').
         analysis_type: Type of analysis ('global' or 'per_celltype').
         gene_records: Dict mapping gene names to metadata dicts.
         
@@ -113,9 +256,9 @@ class GeneListBuilder:
             value: Value to store.
 
         Examples:
-            >>> builder.add_metadata('strategy', 'rf_nmf')
+            >>> builder.add_metadata('strategy', 'RecoVar')
             >>> builder.metadata['strategy']
-            'rf_nmf'
+            'RecoVar'
         """
         self.metadata[key] = value
 
@@ -188,14 +331,11 @@ class GeneListBuilder:
                     celltype_mapping.get(gene, 'global')
                     if celltype_mapping else 'global'
                 ),
-                COL_MEAN_EXPRESSION: None,  # Set later if available
+                COL_MEAN_EXPRESSION: None,  # populated by set_mean_expression() if data available
                 COL_SELECTED_INITIAL: False,
                 COL_PASSED_XENIUM: None,
                 COL_FINAL_SELECTION: False,
                 COL_XENIUM_FAILURE_REASON: None,
-                COL_REPLACED_BY: None,
-                COL_REPLACES_GENE: None,
-                COL_REPLACEMENT_REASON: None,
             }
             
             # Add component if provided
@@ -391,69 +531,20 @@ class GeneListBuilder:
             f"{'PASSED' if passed else 'FAILED'}"
             f"{' (' + failure_reason + ')' if failure_reason else ''}"
         )
-    
-    def record_replacement(
-        self,
-        failed_gene: str,
-        replacement_gene: str,
-        reason: str
-    ) -> None:
+
+    def set_mean_expression(self, mean_expr: Dict[str, float]) -> None:
         """
-        Track gene replacements.
-        
+        Populate the ``mean_expression`` column for tracked genes.
+
         Args:
-            failed_gene: Gene that failed filter.
-            replacement_gene: Gene that replaced it.
-            reason: Reason for replacement (e.g., 'xenium_filter', 'duplicate').
-            
-        Raises:
-            KeyError: If either gene not found in gene_records.
-            
-        Examples:
-            >>> builder.record_replacement('Gene1', 'Gene2', 'xenium_filter')
+            mean_expr: Mapping of gene name to a mean-expression value. Genes not
+                in the mapping keep their existing value (``None`` by default).
         """
-        if failed_gene not in self.gene_records:
-            raise KeyError(
-                f"Failed gene '{failed_gene}' not found in gene_records"
-            )
-        
-        if replacement_gene not in self.gene_records:
-            raise KeyError(
-                f"Replacement gene '{replacement_gene}' not found in gene_records"
-            )
-        
-        # Update failed gene
-        self.gene_records[failed_gene][COL_REPLACED_BY] = replacement_gene
-        self.gene_records[failed_gene][COL_REPLACEMENT_REASON] = reason
-        
-        # Update replacement gene
-        self.gene_records[replacement_gene][COL_REPLACES_GENE] = failed_gene
-        self.gene_records[replacement_gene][COL_REPLACEMENT_REASON] = reason
-        
-        logger.debug(
-            f"Replacement recorded: {failed_gene} → {replacement_gene} "
-            f"(reason: {reason})"
-        )
-    
-    def set_mean_expression(
-        self,
-        mean_expr_dict: Dict[str, float]
-    ) -> None:
-        """
-        Set mean expression values for genes.
-        
-        Args:
-            mean_expr_dict: Dict mapping gene names to mean expression values.
-            
-        Examples:
-            >>> builder.set_mean_expression({'Gene1': 12.5, 'Gene2': 8.3})
-        """
-        logger.debug(f"Setting mean expression for {len(mean_expr_dict)} genes")
-        
-        for gene, expr in mean_expr_dict.items():
-            if gene in self.gene_records:
-                self.gene_records[gene][COL_MEAN_EXPRESSION] = expr
-    
+        for gene, value in mean_expr.items():
+            record = self.gene_records.get(gene)
+            if record is not None:
+                record[COL_MEAN_EXPRESSION] = value
+
     def to_dataframe(self) -> pd.DataFrame:
         """
         Export gene list to pandas DataFrame.
@@ -605,82 +696,6 @@ class GeneListBuilder:
             component_loading=record.get('component_loading'),
         )
 
-    def get_filter_statistics(self) -> Dict[str, int]:
-        """
-        Get statistics about filter results.
-        
-        Returns:
-            Dict with counts of passed/failed genes for each filter.
-            
-        Examples:
-            >>> stats = builder.get_filter_statistics()
-            >>> stats['xenium_passed']
-            45
-        """
-        stats = {
-            'total_genes': len(self.gene_records),
-            'selected_initial': sum(
-                1 for r in self.gene_records.values()
-                if r.get(COL_SELECTED_INITIAL, False)
-            ),
-            'selected_final': sum(
-                1 for r in self.gene_records.values()
-                if r.get(COL_FINAL_SELECTION, False)
-            ),
-            'xenium_passed': sum(
-                1 for r in self.gene_records.values()
-                if r.get(COL_PASSED_XENIUM, False)
-            ),
-            'xenium_failed': sum(
-                1 for r in self.gene_records.values()
-                if r.get(COL_PASSED_XENIUM) is False
-            ),
-            'replacements_made': sum(
-                1 for r in self.gene_records.values()
-                if r.get(COL_REPLACES_GENE) is not None
-            ),
-        }
-        
-        return stats
-    
-    def summary(self) -> str:
-        """
-        Get a human-readable summary of the gene list.
-        
-        Returns:
-            Multi-line string with key statistics.
-            
-        Examples:
-            >>> print(builder.summary())
-            GeneListBuilder Summary
-            =======================
-            Strategy: deg_only
-            Analysis: per_celltype
-            Total genes: 1000
-            ...
-        """
-        stats = self.get_filter_statistics()
-        
-        summary_lines = [
-            "GeneListBuilder Summary",
-            "=======================",
-            f"Strategy: {self.strategy_name}",
-            f"Analysis: {self.analysis_type}",
-            f"Total genes: {stats['total_genes']}",
-            f"",
-            "Selection:",
-            f"  Initial: {stats['selected_initial']}",
-            f"  Final: {stats['selected_final']}",
-            f"",
-            "Filtering:",
-            f"  Xenium passed: {stats['xenium_passed']}",
-            f"  Xenium failed: {stats['xenium_failed']}",
-            f"",
-            f"Replacements made: {stats['replacements_made']}",
-        ]
-        
-        return "\n".join(summary_lines)
-    
     def __repr__(self) -> str:
         """String representation of GeneListBuilder."""
         return (
@@ -754,25 +769,8 @@ class GeneListBuilder:
             )
 
         col = COL_PASSED_XENIUM
-        
+
         return sum(
             1 for record in self.gene_records.values()
             if record.get(col) is False
         )
-    
-    def get_replacement_genes(self) -> List[str]:
-        """
-        Get genes that were added as replacements.
-        
-        Returns:
-            List of replacement gene names.
-            
-        Examples:
-            >>> replacements = builder.get_replacement_genes()
-            >>> len(replacements)
-            5
-        """
-        return [
-            gene for gene, record in self.gene_records.items()
-            if record.get(COL_REPLACES_GENE) is not None
-        ]

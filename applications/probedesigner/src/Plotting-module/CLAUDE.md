@@ -1,10 +1,23 @@
 # Plotting-Module Documentation
 
+> **Stale sections (2026 audit).** `_combination_dotplot.py` / `plot_combination_dotplot`
+> were removed as dead code — every "Combination Dotplot" section below is obsolete.
+> `global-gene-filling` no longer exists in the RecoVar Selection module. The
+> Modules_v2-era strategy vocabulary (`dt_nmf`/`dt_pca`/`dt_simple`/`dt_deg`, the
+> ratio-in-name `dt_nmf_DT…_Dimred…`, the `method_a`/`method_b` loading-weight split,
+> and the `category-9` comparison mode) was retired: parsers and colour tables now use
+> `RecoVar` / `RecoVar_PCA` / `rf_simple` / `rf_deg` and key hybrid colours by dimred
+> share only. See `docs/doc-pipeline/audit_2.md` Q15. **DPI: the module standard is
+> `DEFAULT_PNG_DPI` / `ANALYSIS_PNG_DPI` = 600.** `plot_evaluation.py --png_dpi` is wired
+> through (Q6); `_selection_plots.py`, `plot_nmf_independent.py --dpi` and
+> `plot_umaps.py --png_dpi` all default to 600 (Q13-adjacent). Prose below that still says
+> "300 (default)" is stale. See `docs/doc-pipeline/audit_2.md` §8 / §11.
+
 ## Overview
 
 The Plotting-module provides comprehensive visualization functions for spatial transcriptomics probe panel evaluation and selection results. It supports visualization of clustering quality, neighborhood preservation, cell-type classification, NMF variability metrics, gene selection outcomes, and reconstruction comparisons.
 
-**Location:** `/home/gruengroup/helene/helene/SpatialProbeDesign_tmp/Code/Modules_v2/Plotting-module`
+**Location:** `Code/RecoVar/Plotting-module`
 
 **Core Libraries:**
 - **matplotlib** - Primary plotting engine
@@ -19,19 +32,20 @@ The Plotting-module provides comprehensive visualization functions for spatial t
 
 1. **`__init__.py`** - Module initialization and exports
 2. **`_constants.py`** - Shared constants and configuration
-3. **`_clustering_plots.py`** - Clustering, kNN, and cell-type classification plots (129KB)
-4. **`_variability_plots.py`** - NMF variability metrics plots (64KB)
-5. **`_selection_plots.py`** - Gene selection result plots (39KB)
-6. **`_reconstruction_plots.py`** - Tangram reconstruction plots (12KB)
-7. **`_combination_dotplot.py`** - Multi-strategy combination dotplots (15KB)
-8. **`_stability_plots.py`** - Stability analysis visualization (gene frequency, overlap, metric summaries)
-9. **`_k_varying_plots.py`** - K-varying analysis visualization (reconstruction quality, gene stability, baseline comparison)
-10. **`_comparison_umaps.py`** - Raw-vs-log NMF factor UMAP comparison helpers
-11. **`plot_evaluation.py`** - Main CLI for evaluation result plots (53KB)
-12. **`plot_nmf_independent.py`** - NMF reconstruction comparison plots (21KB)
-13. **`plot_umaps.py`** - UMAP visualization (12KB)
-14. **`plot_raw_vs_log_factor_umaps.py`** - CLI for factor-grid UMAP comparison
-15. **`plot_pipeline_results.py`** - Unified CLI for all analysis types (k_varying, stability, evaluation, selection)
+3. **`_clustering_plots.py`** - Clustering, kNN, and cell-type classification plots
+4. **`_variability_plots.py`** - NMF variability metrics plots
+5. **`_selection_plots.py`** - Gene selection result plots
+6. **`_reconstruction_plots.py`** - Tangram-vs-NMF reconstruction plots
+7. **`_stability_plots.py`** - Stability analysis visualization (gene frequency, overlap, metric summaries)
+8. **`_k_varying_plots.py`** - K-varying analysis visualization (reconstruction quality, gene stability, baseline comparison)
+9. **`_comparison_umaps.py`** - Raw-vs-log NMF factor UMAP comparison helpers
+10. **`plot_evaluation.py`** - Main CLI for evaluation result plots
+11. **`plot_nmf_independent.py`** - NMF reconstruction comparison plots
+12. **`plot_umaps.py`** - UMAP visualization
+13. **`plot_raw_vs_log_factor_umaps.py`** - CLI for factor-grid UMAP comparison
+14. **`plot_pipeline_results.py`** - Unified CLI for all analysis types (k_varying, stability, evaluation, selection)
+
+(`_combination_dotplot.py` was removed — it was dead code, imported by nothing.)
 
 ---
 
@@ -230,26 +244,34 @@ adata.obs['leiden']  # categorical with cluster assignments
 
 #### F1 Heatmap
 - **Rows:** Cell types
-- **Columns:** Datasets/panels
+- **Columns:** Datasets/panels (x-axis labels are the shortened method name via
+  `extract_display_name_from_dataset`, e.g. `"RecoVar"`, not the full settings string)
 - **Color:** F1 score (viridis colormap)
+- **Output:** PNG only (`celltype_f1score_heatmap.png`) + the pivot matrix as CSV — no
+  PDF export
 - **Purpose:** Cell-type classification performance overview
 
-#### Accuracy Bar Chart
-- **Bars:** Horizontal bars per dataset
-- **Color:** Light blue with dark blue edges
-- **Purpose:** Overall classification accuracy comparison
+#### Celltype Classification Diagnostics — Global (`plot_celltype_classification_diagnostics_global`)
+- **Layout:** One figure, three side-by-side bar-chart panels — Macro F1, Weighted F1,
+  Accuracy — one bar per dataset in each, all three sharing the same dataset ordering
+  (sorted by Macro F1 descending)
+- **Colors:** Macro F1 blue (`#42a5f5`), Weighted F1 teal (`#00838f`), Accuracy dark
+  blue (`#1565c0`) with a magenta (`#ad1457`) dashed max-accuracy reference line —
+  matched to `Experiments/Benchmark_seed-analysis/aggregated/Evaluation/plots/LCA/seedvar_clustering_100g_LCA_ari.svg`'s
+  palette
+- **Output:** `celltype_classification_diagnostics_global.png`
+- **Purpose:** Single-number, dataset-wide classification summary (accuracy plus both
+  F1 averaging conventions) complementing the per-cell-type F1 heatmap above
 
 #### Confusion Matrices
-- **Layout:** Grid of heatmaps (one per fold)
+- **Layout:** One heatmap per call (raw counts, and a separate row-normalised variant)
+- **Title:** Shortened method name (`extract_display_name_from_dataset`), not the raw
+  settings-laden panel name
+- **Filename:** `confusion_matrix.png` / `confusion_matrix_normalized.png` — no panel
+  name in the filename (settings/seed/size live in the output folder path)
 - **Axes:** True vs. predicted cell types
 - **Color:** Sequential colormap
 - **Purpose:** Detailed classification error analysis
-
-#### Feature Importance Heatmaps
-- **Rows:** Top N genes
-- **Columns:** Cell types
-- **Color:** Importance scores
-- **Purpose:** Identify key genes for classification
 
 ---
 
@@ -286,12 +308,73 @@ adata.obs['leiden']  # categorical with cluster assignments
 - **Y-axis:** Gene count or fraction
 - **Purpose:** Understand gene selection provenance
 
-#### Gene Expression Dotplot
+#### Genes Per Cell Type (`plot_genes_per_celltype`)
+- **Layout:** Single-panel vertical bar chart, one bar per cell type + a trailing
+  `(unattributed)` bar
+- **Y-axis:** number of distinct panel genes informative for that cell type (a gene
+  informative for *k* cell types counts once toward each)
+- **Reads:** the `informative_celltypes` column on a `{strategy}_panel_information.csv` /
+  `RecoVar_panel_information.csv` (combination or single-strategy) — written by
+  `Selection-module`; the plot is just
+  `df['informative_celltypes'].str.split('|').explode().value_counts()` drawn as bars.
+  Falls back to merging `contributing_celltypes` / `rf_contributing_celltypes` /
+  `rf_celltype` / `celltype` for files without the column (e.g. the trimmed
+  `rf_deg_panel_information.csv`/`rf_simple_panel_information.csv` schema, whose only
+  cell-type column is `rf_celltype`).
+- **Colour:** plain (`#4c72b0`); `(unattributed)` grey; optional `highlight_celltypes`
+  list drawn `#c0392b` with a legend
+- **Writes:** the PNG only — **no CSV** (the counts live in the panel-information CSV)
+- **Purpose:** diagnostic of per-cell-type gene coverage for the selection module
+
+#### Gene Expression Dotplot (`plot_final_gene_dotplot`)
 - **Style:** Scanpy-style dotplot
-- **Dot color:** Mean expression (Reds colormap)
+- **Dot color:** Mean expression (`viridis` colormap by default)
 - **Dot size:** Fraction of cells expressing
-- **Gene labels:** Colored by source category
-- **Purpose:** Visualize expression patterns of selected genes
+- **Rows:** All cell types (`groupby`), so cross-reactivity/specificity of every
+  shown gene is visible regardless of which genes are on the x-axis
+- **Called once per cell type** by `run_combination_selection.py::_generate_combination_dotplot`
+  (via `_build_per_celltype_gene_lists`) — one dotplot per cell type with ≥1
+  member gene, instead of one dotplot for the whole panel. Each cell type's plot is a
+  flat gene list (no bracket grouping) built from that gene's OWN selecting
+  component, keyed by `gene_source`, rather than the combined
+  `RecoVar_panel_information.csv`'s `primary_celltype`/`secondary_celltypes_nmf`
+  columns (those apply a value-based fallback where RF's attribution always
+  overwrites NMF's, discarding NMF's often much richer per-celltype signal — NMF is
+  fit *independently per cell type*, so there's no real "primary vs. secondary"
+  tiering to begin with, just "which cell type's fit selected this gene"):
+  - `"random forest"` / `"gap-fill (random forest)"` genes: membership = RF's Gini
+    argmax (`rf_celltype`) plus any other cell type crossing
+    `RF_CONTRIBUTING_CELLTYPE_MIN_SHARE` in `rf_celltype_scores` (usually just the
+    argmax in practice).
+  - `"NMF"` / `"gap-fill (NMF)"` genes: membership = the dimred component's
+    `celltype` union its `informative_celltypes`.
+  - `"overlap"` genes: the union of both — selected independently by both methods, so
+    a gene can legitimately land on more than one cell type's plot.
+  - `"force_include"` genes, or a gene missing from the relevant component file(s):
+    unattributed — go into one extra flat `unattributed_final_gene_dotplot.png`.
+- **Gene order (x-axis):** hierarchical clustering via
+  `_selection_plots._order_genes_by_celltype_contribution()`, called per cell type
+  right before plotting (not applied to the unattributed fallback plot, which has no
+  single target cell type to order against). Each gene's mean expression per
+  `groupby` category is z-scored per-row (relative pattern, not absolute magnitude);
+  genes are clustered on those z-scored profiles (`scipy.cluster.hierarchy.linkage`,
+  average linkage, correlation distance); the resulting tree is walked from the root,
+  ordering each merge's two children by mean z-scored value in the *target* cell type
+  (higher first). Net effect: genes most specific to the target cell type lead,
+  tapering to least-specific, while genes with similar expression patterns stay
+  clustered adjacently. Falls back to input order (non-fatal) if fewer than 3 genes,
+  the target cell type isn't in `adata.obs[groupby]`, or clustering fails.
+- **Title:** `"Panel genes for {celltype}"` (via the `title` parameter, rendered
+  with `plt.suptitle`) when called this way; `title=None` (no title) otherwise, e.g.
+  the legacy `Analysis-scripts/pipeline/plot_recovar_selection.py` driver, which
+  still calls this function with the whole panel in one flat, unbracketed dotplot.
+- **Chunking:** within any one call (whole-panel or per-cell-type), gene lists of
+  more than 100 genes are still split into multiple figures of at most 100 genes
+  each (`..._chunk1.png`, `..._chunk2.png`, ..., title suffixed `" (part i/N)"` for
+  chunks after the first) so each dotplot stays legible; 100 genes or fewer keep the
+  single unsuffixed filename.
+- **Purpose:** Visualize expression patterns of selected genes, broken down by which
+  cell type they mark
 
 #### Feature Importance Plots
 - **Layout:** Horizontal bar chart (top N genes per fold)
@@ -323,6 +406,14 @@ adata.obs['leiden']  # categorical with cluster assignments
 
 ---
 
+### 4b. Cross-method reconstruction comparison (`_method_comparison_plots.py`, CLI `plot_method_comparison.py`)
+- **Layout:** 2 rows (all genes / non-panel genes only) x 3 columns (ExpVar global-mean, ExpVar variance-weighted, MSE, log scale). x = NMF, PCA, ICA, Ridge (raw), Ridge (lognorm), Tangram, each tagged with the data space it was run in; bars = one per panel (RecoVar raw sel., RecoVar lognorm sel., Spapros); error bars = std across CV folds.
+- **Inputs:** the shared per-method results root (`nmf/`, `PCA/`, `ICA/`, `ridge-regression/`, `tangram/<panel>/global/`); a missing file or column raises instead of drawing NaN.
+- **Outputs:** `reconstruction_method_comparison.png`, `..._values.csv` (long table, all subsets x modes x MSE), `plot_parameters.json`.
+- **Caveat:** MSE is only comparable within a data space (raw vs lognorm). scVI is not in the method table yet (its evaluation is blocked, see `docs/doc-pipeline/scvi-failure-report_audit3-validation.md`).
+
+---
+
 ### 5. Combination Dotplot (`_combination_dotplot.py`)
 
 #### Multi-Strategy Expression Dotplot
@@ -350,78 +441,37 @@ adata.obs['leiden']  # categorical with cluster assignments
 
 #### Simple Strategies
 ```python
-'deg_only':  '#fa9c4a'  # Orange
-'dt_simple': '#d56a0d'  # Dark orange
-'dt_deg':    '#875223'  # Brown
+'deg_only':   '#fa9c4a'  # Orange
+'rf_simple':  '#d56a0d'  # Dark orange
+'rf_deg':     '#875223'  # Brown
 ```
 
-#### NMF-Only Strategies (Pink/Magenta Family)
+#### Dimred-Only Strategies
 ```python
-'nmf_global_method_a':         '#ff99ff'  # Light magenta
-'nmf_global_method_b':         '#cc3399'  # Dark magenta
-'nmf_per_celltype_method_a':   '#cc0066'  # Dark pink
-'nmf_per_celltype_method_b':   '#800040'  # Very dark magenta
+'nmf':  '#cc0066'  # Dark pink
+'pca':  '#006600'  # Dark forest green
 ```
 
-#### PCA-Only Strategies (Green Family)
-```python
-'pca_global_method_a':         '#99ff99'  # Light green
-'pca_global_method_b':         '#339933'  # Dark green
-'pca_per_celltype_method_a':   '#006600'  # Dark forest green
-'pca_per_celltype_method_b':   '#003300'  # Very dark forest green
-```
+#### Hybrid RecoVar Strategies (RF + NMF, PURPLE Family)
 
-#### Hybrid dt_nmf Strategies
+Keyed by dimred (NMF) share percentage; lighter = smaller share, darker = larger:
+- `RecoVar_10`: `#DDAAFF` (very light purple)
+- `RecoVar_25`: `#BB88FF` (light purple)
+- `RecoVar_50`: `#9933FF` (vivid purple)
+- `RecoVar_75`: `#7700CC` (deep purple)
+- `RecoVar_90`: `#550099` (very deep purple)
 
-**Global + Method A (BRIGHT BLUE Family):**
-- Gradient from light blue to dark blue
-- `dt_nmf_10_global_a`: `#80C0FF` (light blue)
-- `dt_nmf_50_global_a`: `#0066CC` (medium blue)
-- `dt_nmf_90_global_a`: `#003D99` (dark blue)
+#### Hybrid RecoVar_PCA Strategies (RF + PCA, LIME-GREEN Family)
 
-**Global + Method B (ORANGE-RED Family):**
-- Gradient from light orange to dark red
-- `dt_nmf_10_global_b`: `#FFBB99` (light orange)
-- `dt_nmf_50_global_b`: `#FF4D00` (medium orange-red)
-- `dt_nmf_90_global_b`: `#CC1A00` (dark red)
+Keyed by dimred (PCA) share percentage:
+- `RecoVar_PCA_10`: `#CCFF88` (very light lime)
+- `RecoVar_PCA_25`: `#AAFF55` (light lime)
+- `RecoVar_PCA_50`: `#77DD22` (vivid lime)
+- `RecoVar_PCA_75`: `#55AA00` (deep lime green)
+- `RecoVar_PCA_90`: `#338800` (very deep lime green)
 
-**Per-Celltype + Method A (PURPLE Family):**
-- Gradient from light purple to dark purple
-- `dt_nmf_10_per_celltype_a`: `#DDAAFF` (light purple)
-- `dt_nmf_50_per_celltype_a`: `#9955CC` (medium purple)
-- `dt_nmf_90_per_celltype_a`: `#550099` (dark purple)
-
-**Per-Celltype + Method B (BURGUNDY Family):**
-- Gradient from light pink-burgundy to very dark burgundy
-- `dt_nmf_10_per_celltype_b`: `#EE88BB` (light pink-burgundy)
-- `dt_nmf_50_per_celltype_b`: `#995566` (medium burgundy)
-- `dt_nmf_90_per_celltype_b`: `#440022` (very dark burgundy)
-
-#### Hybrid dt_pca Strategies
-
-**Global + Method A (CYAN-TURQUOISE Family):**
-- Gradient from light cyan to dark teal
-- `dt_pca_10_global_a`: `#99FFDD` (light cyan)
-- `dt_pca_50_global_a`: `#33CCAA` (medium turquoise)
-- `dt_pca_90_global_a`: `#009966` (dark teal)
-
-**Global + Method B (YELLOW-AMBER Family):**
-- Gradient from light yellow to dark amber
-- `dt_pca_10_global_b`: `#FFEE99` (light yellow)
-- `dt_pca_50_global_b`: `#FFAA33` (medium amber)
-- `dt_pca_90_global_b`: `#CC7700` (dark amber)
-
-**Per-Celltype + Method A (LIME-GREEN Family):**
-- Gradient from light lime to dark green
-- `dt_pca_10_per_celltype_a`: `#CCFF88` (light lime)
-- `dt_pca_50_per_celltype_a`: `#66BB44` (medium green)
-- `dt_pca_90_per_celltype_a`: `#338800` (dark green)
-
-**Per-Celltype + Method B (TEAL-FOREST Family):**
-- Gradient from light teal to very dark forest
-- `dt_pca_10_per_celltype_b`: `#88CCAA` (light teal)
-- `dt_pca_50_per_celltype_b`: `#446655` (medium forest)
-- `dt_pca_90_per_celltype_b`: `#001515` (very dark forest)
+(`_clustering_plots.py` keys these dicts by integer share; `_variability_plots.py`'s
+`get_category_colors` uses the string keys shown above.)
 
 #### External Reference Panels
 ```python
@@ -442,32 +492,20 @@ adata.obs['leiden']  # categorical with cluster assignments
 
 ### Gene Source Colors
 
-Used in selection plots and combination dotplots:
-
-```python
-DEFAULT_SOURCE_COLORS = {
-    "rf_deg":                "#e31a1c",  # Red
-    "dimred":                "#1f78b4",  # Blue
-    "overlap→rf_deg":        "#ff7f00",  # Orange
-    "dimred_replacement":    "#6a3d9a",  # Purple
-    "force_include":         "#33a02c",  # Green
-    "gap_fill_celltype":     "#b15928",  # Brown
-    "gap_fill_global":       "#a6cee3",  # Light blue
-    "gap_fill_deg":          "#fb9a99",  # Light red
-    "other":                 "#888888"   # Grey
-}
-```
-
-**Source categories explained:**
-- **rf_deg** - Selected by random forest from DEGs
-- **dimred** - Selected from dimensionality reduction (NMF/PCA)
-- **overlap→rf_deg** - Overlap between methods, assigned to rf_deg
-- **dimred_replacement** - Replacement genes from dimred method
-- **force_include** - Manually forced inclusion
-- **gap_fill_celltype** - Cell-type-specific gap filling
-- **gap_fill_global** - Global gap filling
-- **gap_fill_deg** - DEG-based gap filling
-- **other** - Other or unclassified sources
+There is **no** module-level `DEFAULT_SOURCE_COLORS` constant. The gene-source colour
+dict is local to `plot_gene_source_distribution` in `_selection_plots.py` and keys on
+display labels (`'DT-unique'`, `'{reduction_type}-unique'`,
+`'Both (DT & {reduction_type})'`, `'Gap-filling: Cell-type'`, …), not the raw
+`gene_source` values the Selection module writes. The `gene_source` vocabulary for panel
+rows in `RecoVar_panel_information.csv` is: `"random forest"`, `"NMF"`, `"overlap"`
+(selected by both, credited to random forest), `force_include`, `"gap-fill (NMF)"`,
+`"gap-fill (random forest)"` (non-panel rows carry `"random forest"` / `"NMF"` too, for
+which candidate pool the gene came from). These are display strings — Selection-module's
+internal identifiers (`rf_deg`, `dimred`, `overlap→rf_deg`, `gap_fill_celltype`,
+`gap_fill_deg`) are renamed only at CSV-write time, via
+`run_combination_selection.py::_GENE_SOURCE_DISPLAY_RENAME`. (`dimred_replacement` and
+`gap_fill_global` are not produced — those features were removed from the Selection
+module.)
 
 ---
 
@@ -624,16 +662,19 @@ Examples:
 #### Neighborhood Preservation
 ```
 "Neighborhood Preservation by k"
-"Optimal Neighborhood Preservation"
-"Neighborhood Preservation Heatmap"
 ```
+(`plot_optimal_neighborhood_preservation` / `plot_neighborhood_preservation_heatmap`
+were removed — see "Removed" note under "Plot Types and Layouts" above.)
 
 #### Cell-Type Classification
 ```
-"Cell-Type Classification F1 Scores"
-"Cell-Type Classification Accuracy"
-"Confusion Matrix - Seed {seed}, Fold {fold}"
+"Celltype Identification Accuracy by Geneset"
+"Celltype Identification F1 (Macro vs. Weighted) by Geneset"
+"Confusion Matrix - {method_name}\nAccuracy: {accuracy:.4f} | Macro F1: {macro_f1:.4f}"
+"Confusion Matrix (row-normalised) - {method_name}\nAccuracy: ... | Macro F1: ..."
 ```
+`{method_name}` is the shortened display name from `extract_display_name_from_dataset`
+(e.g. `"RecoVar"`), not the raw settings-laden panel name.
 
 #### Variability Metrics
 ```
@@ -696,10 +737,17 @@ Examples:
 
 From `_constants.py`:
 ```python
-DEFAULT_PNG_DPI = 300
+DEFAULT_PNG_DPI = 600
+ANALYSIS_PNG_DPI = 600
 DEFAULT_FIGURE_FORMAT = "png"
 DEFAULT_COLORMAP = "viridis"
 ```
+
+**Note:** all save paths now use `DEFAULT_PNG_DPI` (600) as the baseline.
+`plot_evaluation.py --png_dpi` is wired through to `_clustering_plots.py` /
+`_variability_plots.py` (Q6); `_selection_plots.py`, `plot_nmf_independent.py --dpi`,
+`plot_umaps.py --png_dpi` and `plot_pipeline_results.py --dpi` all default to 600.
+See `docs/doc-pipeline/audit_2.md` §11 (Q6, Q13).
 
 ### File Naming Conventions
 
@@ -707,13 +755,17 @@ DEFAULT_COLORMAP = "viridis"
 ```
 clustering_quality_ari_{dim_reduction}.png
 clustering_quality_nmi_{dim_reduction}.png
-celltype_f1_heatmap.png
-celltype_accuracy_comparison.png
+celltype_f1score_heatmap.png                      # PNG only, no PDF; + celltype_f1score_matrix.csv
+celltype_classification_diagnostics_global.png    # 3 panels: Macro F1, Weighted F1, Accuracy
 neighborhood_preservation_by_k.png
-optimal_neighborhood_preservation.png
-neighborhood_preservation_heatmap.png
+neighborhood_jaccard_by_celltype_pca.png          # 2-decimal annotations
+confusion_matrix.png                              # no panel name in the filename
+confusion_matrix_normalized.png
 umap_visualization_{panel_name}.png
 ```
+(`optimal_neighborhood_preservation.png` / `neighborhood_preservation_heatmap.png` and
+their producing functions were removed — see the audit_3.md "Plotting-module polish"
+addendum.)
 
 #### Variability Plots
 ```
@@ -726,12 +778,16 @@ global_{method}_expvar_comparison.png
 ```
 
 **Method:** `nmf` or `mapping`
-**Suffix:** Optional, e.g., `_100genes`, `_category-9`
+**Suffix:** Optional, e.g., `_100genes`
 
 #### Selection Plots
 ```
-gene_source_distribution_{strategy_name}.png
-gene_expression_dotplot_{panel_name}.png
+gene_source_distribution.png                # no strategy suffix; settings live in the folder path
+genes_per_celltype.png                      # PNG only; counts live in the panel-information CSV
+{Celltype}_final_gene_dotplot.png           # one per cell type (run_combination_selection.py caller); <= 100 genes
+{Celltype}_final_gene_dotplot_chunk1.png, _chunk2.png, ...  # same, > 100 genes for that cell type
+unattributed_final_gene_dotplot.png         # panel genes with no informative_celltypes at all
+final_gene_dotplot.png / _chunk1.png, ...   # legacy plot_recovar_selection.py caller: whole panel, one flat dotplot
 confusion_matrix_seed{seed}_fold{fold}.png
 feature_importance_seed{seed}_fold{fold}.png
 f1_score_distribution.png
@@ -761,7 +817,7 @@ plt.savefig(path, dpi=png_dpi, bbox_inches='tight')
 ```
 
 **Parameters:**
-- `dpi`: 300 (default) or user-specified
+- `dpi`: 600 (default = `DEFAULT_PNG_DPI`) or user-specified
 - `bbox_inches='tight'`: Removes excess whitespace
 - `transparent=False`: White background (default)
 - `facecolor='white'`: Explicit white background
@@ -782,7 +838,7 @@ plt.savefig(path, dpi=png_dpi, bbox_inches='tight')
 **Usage:**
 ```bash
 python plot_evaluation.py \
-    --evaluation_type {baseline,variability,both} \
+    --evaluation_type {baseline,variability,all} \
     --panels panel1,panel2,panel3 \
     --output_dir /path/to/output \
     --results_dir /path/to/results \
@@ -812,12 +868,15 @@ python plot_raw_vs_log_factor_umaps.py \
 
 | Argument | Type | Required | Description |
 |----------|------|----------|-------------|
-| `--evaluation_type` | choice | Yes | Type of evaluation: `baseline`, `variability`, or `both` |
+| `--evaluation_type` | choice | Yes | Type of evaluation: `baseline`, `variability`, or `all` |
 | `--panels` | str | Yes | Comma-separated list of panel names |
 | `--output_dir` | path | Yes | Directory for output plots |
-| `--results_dir` | path | Yes | Directory containing CSV results |
+| `--results_dir` | path | No | Single result directory (use for `baseline` or `variability`, not `all`) |
+| `--baseline_results_dir` | path | No* | Baseline result directory — required when `--evaluation_type all` |
+| `--variability_results_dir` | path | No* | Variability result directory — required when `--evaluation_type all` |
+| `--allow_mixed_sizes` | flag | No | Allow panels with different gene counts in one figure |
 | `--group_name` | str | No | Name for this comparison group |
-| `--png_dpi` | int | No | Plot resolution (default: 300) |
+| `--png_dpi` | int | No | Plot resolution (default: 600; wired through to the plot functions since Q6) |
 
 **Baseline-specific flags:**
 | Argument | Type | Description |
@@ -838,13 +897,12 @@ python plot_raw_vs_log_factor_umaps.py \
 |----------|------|-------------|
 | `--external_names` | str | Comma-separated external panel names for special coloring |
 | `--tangram_results_dir` | path | Directory with Tangram results for reconstruction comparison |
-| `--baseline_full_nmf` | float | Full NMF baseline value for reference lines |
 
 **Example:**
 ```bash
 python plot_evaluation.py \
-    --evaluation_type both \
-    --panels dt_nmf_50_global_a,dt_nmf_75_global_a,HVG \
+    --evaluation_type all \
+    --panels RecoVar_RF_0.5_Dimred_0.5,RecoVar_RF_0.25_Dimred_0.75,HVG \
     --output_dir ./plots/comparison_v1 \
     --results_dir ./results/eval_20240115 \
     --group_name factor_comparison \
@@ -876,7 +934,7 @@ python plot_nmf_independent.py \
 | `--base_dir` | path | Yes | Base directory containing dataset subdirectories |
 | `--output_dir` | path | Yes | Directory for output plots |
 | `--methods` | str | No | Comma-separated methods to plot (default: neural_network,LVAE,tangram) |
-| `--dpi` | int | No | Plot resolution (default: 300) |
+| `--dpi` | int | No | Plot resolution (default: 600) |
 
 **Directory structure expected:**
 ```
@@ -924,16 +982,16 @@ python plot_umaps.py \
 | `--panels` | str | Yes | Comma-separated glob patterns for panel files |
 | `--full_transcriptome` | path | No | Path to full transcriptome h5ad (for comparison) |
 | `--celltype_col` | str | No | Column name for cell types (default: `cell_type`) |
-| `--png_dpi` | int | No | Plot resolution (default: 300) |
+| `--png_dpi` | int | No | Plot resolution (default: 600) |
 | `--n_neighbors` | int | No | UMAP n_neighbors parameter (default: 15) |
-| `--n_pcs` | int | No | Number of PCs to use (default: 50) |
+| `--n_pcs` | int | No | Number of PCs to use (default: 30) |
 
 **Example:**
 ```bash
 python plot_umaps.py \
     --preprocessed_dir ./data/preprocessed \
     --output_dir ./plots/umaps \
-    --panels "dt_nmf_*_100genes.h5ad,HVG_100genes.h5ad" \
+    --panels "RecoVar_*_100genes.h5ad,HVG_100genes.h5ad" \
     --full_transcriptome ./data/full_transcriptome.h5ad \
     --celltype_col cell_type \
     --n_neighbors 30 \
@@ -955,7 +1013,7 @@ python plot_pipeline_results.py \
     [--plot_types reconstruction,stability,metrics] \
     [--dpi 600] \
     [--format {png,pdf,svg}] \
-    [--color_scheme "nmf:#1f77b4,cnmf:#ff7f0e"] \
+    [--color_scheme "nmf:#1f77b4"] \
     [--metric_filter mse,expvar]
 ```
 
@@ -997,9 +1055,9 @@ python plot_pipeline_results.py \
 - Allows comparison of NMF component number effects
 
 **Example datasets:**
-- `dt_nmf_50_global_a_2factors`
-- `dt_nmf_50_global_a_5factors`
-- `dt_nmf_50_global_a_15factors`
+- `RecoVar_RF_0.5_Dimred_0.5_2factors`
+- `RecoVar_RF_0.5_Dimred_0.5_5factors`
+- `RecoVar_RF_0.5_Dimred_0.5_15factors`
 
 ---
 
@@ -1008,16 +1066,16 @@ python plot_pipeline_results.py \
 **Trigger:** When multiple panel sizes detected (e.g., 100, 200, 500 genes)
 
 **Behavior:**
-- Includes size in strategy labels: `"dt_nmf_75%_CT_abs (100)"`
+- Includes size in strategy labels: `"RecoVar 75% (100)"`
 - Separate legend entries for each size
 - Allows direct comparison of same strategy at different panel sizes
 - Color remains consistent, marker/linestyle varies
 
 **Example:**
 ```
-dt_nmf_75_global_a_100genes  → "dt_nmf_75%_global_a (100)"
-dt_nmf_75_global_a_200genes  → "dt_nmf_75%_global_a (200)"
-dt_nmf_75_global_a_500genes  → "dt_nmf_75%_global_a (500)"
+RecoVar_RF_0.25_Dimred_0.75_100genes  → "RecoVar 75% (100)"
+RecoVar_RF_0.25_Dimred_0.75_200genes  → "RecoVar 75% (200)"
+RecoVar_RF_0.25_Dimred_0.75_500genes  → "RecoVar 75% (500)"
 ```
 
 ---
@@ -1031,25 +1089,24 @@ dt_nmf_75_global_a_500genes  → "dt_nmf_75%_global_a (500)"
 |---------------|---------------|------------------|
 | `DEG-based-filling` | `"DEG-fill"` | As per base strategy + suffix |
 | `cell-type-specific-filling` | `"CT-fill"` | As per base strategy + suffix |
-| `global-gene-filling` | `"Global-fill"` | As per base strategy + suffix |
+
+(`global-gene-filling` / `"Global-fill"` no longer exists — global fill was removed from
+the Selection module.)
 
 **Purpose:** Distinguish panels with different gap-filling strategies
 
 **Example:**
 ```
-dt_nmf_50_global_a_DEG-based-filling → "dt_nmf_50%_global_a (DEG-fill)"
+RecoVar_RF_0.5_Dimred_0.5_DEG-based-filling → "RecoVar 50% (DEG-fill)"
 ```
 
 ---
 
 ### 4. Category-9 Special Formatting
 
-**Trigger:** When `group_name='category-9'`
-
-**Behavior:**
-- Special label formatting: `"Scanpy-All-Genes_dt_nmf_75%"`
-- Skips certain plots (e.g., heatmaps) that don't apply
-- Adjusted legend positioning for readability
+**Removed (2026 audit, Q15).** The `category-9` comparison mode (`group_name='category-9'`
+labels, filter+dimred colour keys, and the heatmap skip) was unreachable in the current
+CLI and has been deleted.
 
 **Purpose:** Handle special comparison category with different layout requirements
 
@@ -1093,15 +1150,27 @@ dt_nmf_50_global_a_DEG-based-filling → "dt_nmf_50%_global_a (DEG-fill)"
 **Inputs:** `neighborhood_results.csv`, strategy colors
 **Outputs:** Multi-line plot
 
-#### `plot_optimal_neighborhood_preservation()`
-**Purpose:** Bar plot of optimal preservation scores
+#### `plot_neighborhood_preservation_celltype_heatmap()`
+**Purpose:** Per-cell-type kNN Jaccard preservation heatmap (2-decimal annotations)
 **Inputs:** `neighborhood_results.csv`
-**Outputs:** Horizontal bar chart
+**Outputs:** `neighborhood_jaccard_by_celltype_pca.png`
+
+(`plot_optimal_neighborhood_preservation()` and `plot_neighborhood_preservation_heatmap()`
+were removed — see the audit_3.md "Plotting-module polish" addendum.)
 
 #### `plot_celltype_f1_heatmap()`
-**Purpose:** Heatmap of F1 scores
+**Purpose:** Heatmap of F1 scores; x-axis labels use the shortened method name
 **Inputs:** `celltype_results.csv`
-**Outputs:** Annotated heatmap
+**Outputs:** `celltype_f1score_heatmap.png` (PNG only, no PDF) + matrix CSV
+
+#### `plot_celltype_classification_diagnostics_global()`
+**Purpose:** Dataset-wide classification summary — three side-by-side bar-chart panels
+(Macro F1, Weighted F1, Accuracy), one bar per dataset each, sharing one dataset
+ordering (by Macro F1 descending); the Accuracy panel keeps the dashed max-accuracy
+reference line
+**Inputs:** `celltype_results.csv` (dataset-level rows; requires `weighted_f1`, added
+alongside `macro_f1` by `Evaluation-module/_clustering.py`)
+**Outputs:** `celltype_classification_diagnostics_global.png`
 
 #### `plot_umap_for_representation()`
 **Purpose:** UMAP visualization grid
@@ -1132,24 +1201,43 @@ dt_nmf_50_global_a_DEG-based-filling → "dt_nmf_50%_global_a (DEG-fill)"
 ### From `_selection_plots.py`
 
 #### `plot_gene_source_distribution()`
-**Purpose:** Show gene provenance breakdown
+**Purpose:** Show gene provenance breakdown; title uses the shortened method name
+(no ODT category — dead code removed)
 **Inputs:** `final_panel_with_provenance.csv`
-**Outputs:** Stacked/grouped bar chart with source colors
+**Outputs:** `gene_source_distribution.png` (no strategy/settings suffix)
+
+#### `plot_genes_per_celltype()`
+**Purpose:** Per-cell-type gene coverage (how many panel genes are informative for each
+cell type) from the `informative_celltypes` column
+**Inputs:** a combination `RecoVar_panel_information.csv` or single-strategy
+`{strategy}_panel_information.csv` (or a passed df)
+**Outputs:** `genes_per_celltype.png` (PNG only — no CSV, no strategy suffix)
+**Wired into:** `plot_pipeline_results.py --analysis_type selection`
 
 #### `plot_final_gene_dotplot()`
-**Purpose:** Expression dotplot with source-colored labels
+**Purpose:** Expression dotplot, all cell types as rows; called once per cell type by
+`run_combination_selection.py` (see "Gene Expression Dotplot" above), or once for the
+whole panel by the legacy `plot_recovar_selection.py` driver
 **Inputs:** AnnData object + provenance CSV
-**Outputs:** Scanpy-style dotplot
+**Outputs:** `{Celltype}_final_gene_dotplot.png` (or `_chunk1.png`/`_chunk2.png`/...
+when that cell type has more than 100 informative genes) per cell type, plus
+`unattributed_final_gene_dotplot.png` when applicable; `final_gene_dotplot.png` for
+the legacy whole-panel caller
 
 #### `plot_feature_importances()`
 **Purpose:** Top feature importance per fold
 **Inputs:** `feature_importance.csv`
 **Outputs:** Multi-panel horizontal bar charts
 
-#### `plot_confusion_matrices()`
-**Purpose:** Classification confusion matrices
-**Inputs:** `confusion_matrix.csv`
-**Outputs:** Grid of heatmaps
+#### `plot_confusion_matrix()` (`_clustering_plots.py`)
+**Purpose:** Classification confusion matrices; title uses the shortened method name
+**Inputs:** `y_test`/`y_pred` arrays (reproduces the eval classifier directly, not a CSV)
+**Outputs:** `confusion_matrix.png` / `confusion_matrix_normalized.png` (no panel name
+in the filename)
+
+Note: `_selection_plots.py` has a *different*, unrelated `plot_confusion_matrix()`
+(seed/fold-based, reads a pre-computed `confusion_matrix.csv`) — the two are not the
+same function; only the `_clustering_plots.py` one changed here.
 
 ---
 
@@ -1232,7 +1320,7 @@ dt_nmf_50_global_a_DEG-based-filling → "dt_nmf_50%_global_a (DEG-fill)"
 - Consider splitting into multiple plot groups if >20 strategies
 
 ### 3. Publication-Quality Plots
-- Use 300 DPI (default) for papers
+- 600 DPI is the default (publication quality); override per journal if needed
 - Adjust font sizes if needed for specific journals
 - Consider manually editing labels for very long strategy names
 - Use `bbox_inches='tight'` (automatic) to remove excess whitespace
@@ -1240,7 +1328,8 @@ dt_nmf_50_global_a_DEG-based-filling → "dt_nmf_50%_global_a (DEG-fill)"
 ### 4. Troubleshooting
 
 **Issue:** Colors not assigned correctly
-**Solution:** Check panel naming follows convention: `{strategy}_{percent}_{scope}_{method}`
+**Solution:** Check panel naming follows convention: `{Filter}_{Baseline}_{strategy}_{N-genes}`,
+where hybrid strategies are `RecoVar_RF_<rf>_Dimred_<dimred>` / `RecoVar_PCA_RF_<rf>_Dimred_<dimred>`
 
 **Issue:** Missing data in plots
 **Solution:** Verify CSV files have expected columns (see Input Data Formats)
@@ -1286,7 +1375,7 @@ import warnings
 
 ### Overview
 
-Functions for visualizing gene selection stability and metric variability across pipeline iterations. These functions have been moved from `Analysis-scripts/run_stability_analysis.py` to the centralized Plotting-module with publication-quality improvements.
+Functions for visualizing gene selection stability and metric variability across pipeline iterations, with publication-quality improvements.
 
 **Module:** `_stability_plots.py`
 
@@ -1486,24 +1575,12 @@ plot_feature_umaps(adata, selected_genes, "cell_type", output_dir)
 
 ---
 
-### CLI Integration
+### Usage
 
-Plotting is integrated into `Analysis-scripts/run_stability_analysis.py`:
-
-```bash
-python run_stability_analysis.py \
-    --input_file data.h5ad \
-    --output_dir results/stability \
-    --n_iterations 5 \
-    --mode same_data \
-    --strategy rf_nmf \
-    --probeset_size 100 \
-    --reduction_type nmf \
-    --analysis_type per_celltype \
-    --n_components 5
-```
-
-**Plots are automatically generated in:** `{output_dir}/plots/`
+Callers import these functions directly from `_stability_plots.py` (see the Usage Example above)
+and pass in their own `gene_df`/`metrics_df` tables — there is no dedicated CLI wrapper for this
+module; any `Analysis-scripts/` script producing stability data in the expected formats can call
+these functions to generate the plots.
 
 ---
 
@@ -1555,8 +1632,6 @@ STABILITY_METRIC_COLOR = "#2196F3" # Blue (for metric bars)
 
 ## Contact and Support
 
-For issues, questions, or contributions related to the Plotting-module, please refer to the main project documentation or contact the development team.
+For issues, questions, or contributions related to the Plotting-module, please refer to the main project documentation.
 
-**Module version:** 2.0
-**Last updated:** 2024
-**Compatibility:** Python 3.8+
+**Module version:** 2.0.0

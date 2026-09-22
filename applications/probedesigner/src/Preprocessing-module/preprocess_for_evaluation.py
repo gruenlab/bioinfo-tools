@@ -44,8 +44,8 @@ python preprocess_for_evaluation.py \\
 Output structure:
 -----------------
 output_dir/
-├── dt_simple_100.h5ad
-├── dt_nmf_200.h5ad
+├── rf_deg_100.h5ad
+├── RecoVar_200.h5ad
 ├── Method1_500.h5ad
 └── logs/
     └── preprocess_YYYYMMDD_HHMMSS.log
@@ -64,7 +64,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 import scanpy as sc
 
@@ -153,7 +152,8 @@ def load_gene_list_from_csv(filepath: str) -> List[str]:
     1. Single column with genes (may or may not have header)
     2. Multi-column with a 'gene' column (e.g., NS-Forest format)
     3. First column contains genes (standard format)
-    4. ranked_gene_list.csv with 'selected_final' column (filters to True values)
+    4. ranked_gene_list.csv with a panel-membership column — one of
+       ``final_selection`` / ``in_panel`` / ``selected_final`` (filters to True rows)
 
     Args:
         filepath: Path to CSV file.
@@ -164,13 +164,21 @@ def load_gene_list_from_csv(filepath: str) -> List[str]:
     try:
         df = pd.read_csv(filepath)
 
-        # Check if this is a ranked_gene_list.csv with selected_final column
-        if 'selected_final' in df.columns and 'gene' in df.columns:
-            logging.info(f"Found ranked_gene_list.csv format with selected_final column in {os.path.basename(filepath)}")
-            # Filter to only genes where selected_final == True
-            df_selected = df[df['selected_final'] == True]
+        # ranked_gene_list.csv: keep only the final panel rows. The Selection module
+        # writes 'final_selection' and 'in_panel'; 'selected_final' is an older name.
+        panel_cols = [c for c in ('final_selection', 'in_panel', 'selected_final')
+                      if c in df.columns]
+        if panel_cols and 'gene' in df.columns:
+            flag_col = panel_cols[0]
+            logging.info(
+                f"Found ranked_gene_list.csv format with '{flag_col}' column in "
+                f"{os.path.basename(filepath)}"
+            )
+            df_selected = df[df[flag_col] == True]
             genes = df_selected['gene'].tolist()
-            logging.info(f"Filtered to {len(genes)} genes with selected_final=True (from {len(df)} total genes)")
+            logging.info(
+                f"Filtered to {len(genes)} genes with {flag_col}=True (from {len(df)} total genes)"
+            )
             genes = [g for g in genes if pd.notna(g)]
             return genes
 
@@ -207,9 +215,9 @@ def load_gene_list_from_csv(filepath: str) -> List[str]:
 def extract_genelist_name_from_path(csv_file: str) -> str:
     """Extract a standardized gene list name from a file path.
 
-    Handles both old and new directory structures:
-    OLD: .../Filter/Baseline/Strategy/Size-genes/results/selected_genes.csv
-    NEW: .../Filter/Baseline/Strategy/N_factors/Size-genes/results/selected_genes.csv
+    Handles both directory-layout variants:
+    - .../Filter/Baseline/Strategy/Size-genes/results/selected_genes.csv
+    - .../Filter/Baseline/Strategy/N_factors/Size-genes/results/selected_genes.csv
 
     Args:
         csv_file: Path to a gene list CSV file.
@@ -270,9 +278,9 @@ def extract_genelist_name_from_path(csv_file: str) -> str:
 def load_all_gene_lists(gene_lists_dir: str, adata) -> Dict[str, List[str]]:
     """Load all gene lists from the Selection pipeline output directory.
 
-    Supports both old and new directory structures:
-    OLD: .../Filter/Baseline/Strategy/Size-genes/results/selected_genes.csv
-    NEW: .../Filter/Baseline/Strategy/N_factors/Size-genes/results/selected_genes.csv
+    Supports both directory-layout variants:
+    - .../Filter/Baseline/Strategy/Size-genes/results/selected_genes.csv
+    - .../Filter/Baseline/Strategy/N_factors/Size-genes/results/selected_genes.csv
 
     Files named 'intermediate_panel_before-gap-fill.csv' and bootstrap files
     are automatically excluded.
@@ -588,7 +596,6 @@ def preprocess_single_genelist(
             layer="counts",
             hvg=False,
             subset=False,
-            scale=False,
             dataset_name=genelist_name,
             dimensionality_reduction=dimensionality_reduction,
             filter_genes=False,   # Preserve exact panel composition

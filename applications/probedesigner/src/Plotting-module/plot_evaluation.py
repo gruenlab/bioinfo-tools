@@ -13,42 +13,47 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import numpy as np
 
 from _clustering_plots import (
     generate_method_specific_colors_and_markers,
-    generate_method_specific_colors,
-    extract_display_name_from_dataset,
     plot_clustering_quality_ari,
     plot_clustering_quality_nmi,
     plot_celltype_f1_heatmap,
-    plot_celltype_accuracy_barchart,
+    plot_celltype_classification_diagnostics_global,
     plot_neighborhood_preservation_by_k,
-    plot_optimal_neighborhood_preservation,
-    plot_neighborhood_preservation_heatmap,
+    plot_neighborhood_preservation_celltype_heatmap,
 )
 from _variability_plots import (
     get_category_colors,
     plot_celltype_evaluation_results,
     create_combined_plot_with_info,
     plot_aggregated_celltype_metrics,
+    plot_expvar_gene_subset_breakdown,
+    plot_expvar_gene_subset_breakdown_by_celltype,
+    plot_ridge_aggregated_celltype_metrics,
 )
 from _reconstruction_plots import (
-    load_tangram_per_celltype_csv,
     plot_reconstruction_per_celltype,
     plot_reconstruction_aggregated_metrics,
 )
-from _constants import DEFAULT_PNG_DPI
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
+from _constants import DEFAULT_PNG_DPI, METHOD_DISPLAY_NAMES
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "load_evaluation_results",
+    "load_baseline_results",
+    "load_variability_results",
     "main",
 ]
 
@@ -132,205 +137,128 @@ def prepare_global_combined_plot_data(df, group_type='nmf'):
 
 
 def convert_variability_df_to_dict(df, group_type='nmf'):
-    """
-    Convert variability results DataFrame back to dictionary format expected by plotting functions.
-    
-    The plotting functions expect:
-    evaluation_results[gene_list_name] = {
-        'nmf_celltype_summary': {...} or 'mapping_celltype_summary': {...},
-        'nmf_celltype_AT2': {...}, ...
-    }
+    """Convert variability results DataFrame to the nested dict format expected by plotting functions.
 
-    Or for global evaluation:
-    evaluation_results[gene_list_name] = {
-        'nmf_global_summary': {...} or 'mapping_global_summary': {...}
-    }
+    Reads pre-computed macro/weighted summary statistics from the dedicated
+    ``celltype="summary"`` row in the CSV (computed by the evaluation pipeline).
+    Does NOT recompute aggregates from per-cell-type rows.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     df : pd.DataFrame
-        DataFrame with columns: gene_list, celltype (optional), analysis_type, mse_*, expvar_*, etc.
+        DataFrame from a variability evaluation CSV.  Must have columns:
+        ``gene_list``, ``analysis_type``, optionally ``celltype``, and metric
+        columns (``mse_test_probe``, ``expvar_test_probe``, …).  Aggregated
+        CSVs produced by k-fold evaluation append ``_mean``/``_std`` suffixes;
+        this function reads both forms.
     group_type : str
-        Either 'nmf' or 'mapping'
-        
-    Returns:
-    --------
+        Prefix for result dict keys — either ``'nmf'`` or ``'mapping'``.
+
+    Returns
+    -------
     dict
-        Nested dictionary structure expected by plotting functions
+        ``{gene_list_name: {f'{group_type}_celltype_summary': {...},
+                            f'{group_type}_celltype_celltype_results': {...}}}``
     """
+
+    def _pick(row, col):
+        """Read a metric column, falling back to ``<col>_mean`` for aggregated CSVs."""
+        val = row.get(col, np.nan)
+        if pd.notna(val):
+            return float(val)
+        mean_val = row.get(f"{col}_mean", np.nan)
+        return float(mean_val) if pd.notna(mean_val) else np.nan
+
     evaluation_results = {}
-    
+
     for gene_list_name in df['gene_list'].unique():
         gene_list_df = df[df['gene_list'] == gene_list_name]
         results_dict = {}
-        
-        logger.info(f"Converting results for gene_list: {gene_list_name}")
-        logger.info(f"  DataFrame shape: {gene_list_df.shape}")
-        logger.info(f"  Columns: {list(gene_list_df.columns)}")
-        
-        # Check if this is per-celltype or global evaluation based on analysis_type column
-        has_per_celltype = 'analysis_type' in gene_list_df.columns and \
-                          (gene_list_df['analysis_type'] == 'per_celltype').any()
-        logger.info(f"  has_per_celltype: {has_per_celltype}")
-        
+
+        logger.info("Converting results for gene_list: %s (%d rows)", gene_list_name, len(gene_list_df))
+
+        has_per_celltype = (
+            'analysis_type' in gene_list_df.columns
+            and (gene_list_df['analysis_type'] == 'per_celltype').any()
+        )
+
         if has_per_celltype:
-            # Per-celltype evaluation
-            # Process each celltype row
-            celltype_results = {}
-            logger.info(f"  Processing {len(gene_list_df)} rows for celltype extraction")
-            for idx, row in gene_list_df.iterrows():
-                analysis_type = row.get('analysis_type')
-                celltype_val = row.get('celltype')
-                logger.debug(f"    Row {idx}: analysis_type={analysis_type}, celltype={celltype_val}")
-                
-                if row.get('analysis_type') == 'per_celltype' and pd.notna(row.get('celltype')) and row.get('celltype') != '':
-                    celltype = row['celltype']
-                    
-                    # Store full celltype results for later aggregation
-                    celltype_results[celltype] = {
-                        'mse_train_baseline': row.get('mse_train_baseline'),
-                        'mse_test_baseline': row.get('mse_test_baseline'),
-                        'mse_test_probe': row.get('mse_test_probe'),
-                        'expvar_train_baseline': row.get('expvar_train_baseline'),
-                        'expvar_test_baseline': row.get('expvar_test_baseline'),
-                        'expvar_test_probe': row.get('expvar_test_probe'),
-                        'mse_ratio': row.get('mse_ratio'),
-                        'expvar_ratio': row.get('expvar_ratio'),
-                        'n_cells': row.get('n_cells', 1),  # For weighted averaging
-                        'skipped': row.get('skipped', False)
+            celltype_results: dict = {}
+            summary_results: dict = {}
+
+            for _, row in gene_list_df.iterrows():
+                if row.get('analysis_type') != 'per_celltype':
+                    continue
+                celltype = row.get('celltype')
+                if pd.isna(celltype) or celltype == '':
+                    continue
+
+                if celltype == 'summary':
+                    # Read pre-computed weighted/macro aggregates — do NOT recompute
+                    summary_results = {
+                        'weighted_mse_test_baseline':   _pick(row, 'weighted_mse_test_baseline'),
+                        'weighted_mse_test_probe':      _pick(row, 'weighted_mse_test_probe'),
+                        'weighted_expvar_test_baseline': _pick(row, 'weighted_expvar_test_baseline'),
+                        'weighted_expvar_test_probe':   _pick(row, 'weighted_expvar_test_probe'),
+                        'macro_mse_test_baseline':      _pick(row, 'macro_mse_test_baseline'),
+                        'macro_mse_test_probe':         _pick(row, 'macro_mse_test_probe'),
+                        'macro_expvar_test_baseline':   _pick(row, 'macro_expvar_test_baseline'),
+                        'macro_expvar_test_probe':      _pick(row, 'macro_expvar_test_probe'),
                     }
-            
-            # Store celltype results in the expected nested structure for plotting functions
+                else:
+                    # Individual cell-type row
+                    celltype_results[celltype] = {
+                        'mse_train_baseline':   _pick(row, 'mse_train_baseline'),
+                        'mse_test_baseline':    _pick(row, 'mse_test_baseline'),
+                        'mse_test_probe':       _pick(row, 'mse_test_probe'),
+                        'expvar_train_baseline': _pick(row, 'expvar_train_baseline'),
+                        'expvar_test_baseline': _pick(row, 'expvar_test_baseline'),
+                        'expvar_test_probe':    _pick(row, 'expvar_test_probe'),
+                        'n_cells':              int(row.get('n_cells') or 1),
+                        'skipped':              bool(row.get('skipped', False)),
+                    }
+
             if celltype_results:
                 results_dict[f'{group_type}_celltype_celltype_results'] = celltype_results
-                logger.info(f"  Stored {len(celltype_results)} celltypes in celltype_results dict")
+                logger.info("  Stored %d cell types", len(celltype_results))
             else:
-                logger.warning(f"  No celltype_results found!")
-            
-            # Compute weighted and macro aggregated summary statistics from celltype results
-            if celltype_results:
-                # IMPORTANT: Filter out skipped celltypes first (matching old code behavior)
-                valid_celltype_results = {
-                    ct: res for ct, res in celltype_results.items() 
-                    if not res.get('skipped', False)
-                }
-                
-                logger.info(f"  Computing aggregated statistics: {len(celltype_results)} total, {len(valid_celltype_results)} valid (non-skipped)")
-                
-                # DEBUG: Show sample of valid celltype_results values
-                for ct_name, ct_vals in list(valid_celltype_results.items())[:2]:
-                    logger.info(f"    Sample {ct_name}: mse_test_probe={ct_vals.get('mse_test_probe')}, n_cells={ct_vals.get('n_cells')}")
-                
-                if not valid_celltype_results:
-                    logger.warning(f"  All celltypes were skipped! Cannot compute aggregated statistics.")
-                    # Don't create summary if no valid results
-                else:
-                    # Weighted average (weighted by cell count) - filter NaN values
-                    total_cells = sum(res['n_cells'] for res in valid_celltype_results.values())
-                    
-                    # MSE baseline - weighted
-                    mse_test_baseline_values = [(res['mse_test_baseline'], res['n_cells']) 
-                                                for res in valid_celltype_results.values() 
-                                                if pd.notna(res['mse_test_baseline'])]
-                    weighted_mse_test_baseline = (sum(val * n for val, n in mse_test_baseline_values) / 
-                                              sum(n for _, n in mse_test_baseline_values)) if mse_test_baseline_values else np.nan
-                    
-                    # MSE probe - weighted
-                    mse_test_probe_values = [(res['mse_test_probe'], res['n_cells']) 
-                                            for res in valid_celltype_results.values() 
-                                            if pd.notna(res['mse_test_probe'])]
-                    weighted_mse_test_probe = (sum(val * n for val, n in mse_test_probe_values) / 
-                                           sum(n for _, n in mse_test_probe_values)) if mse_test_probe_values else np.nan
-                    
-                    # ExpVar baseline - weighted
-                    expvar_test_baseline_values = [(res['expvar_test_baseline'], res['n_cells']) 
-                                                   for res in valid_celltype_results.values() 
-                                                   if pd.notna(res['expvar_test_baseline'])]
-                    weighted_expvar_test_baseline = (sum(val * n for val, n in expvar_test_baseline_values) / 
-                                                 sum(n for _, n in expvar_test_baseline_values)) if expvar_test_baseline_values else np.nan
-                    
-                    # ExpVar probe - weighted
-                    expvar_test_probe_values = [(res['expvar_test_probe'], res['n_cells']) 
-                                               for res in valid_celltype_results.values() 
-                                               if pd.notna(res['expvar_test_probe'])]
-                    weighted_expvar_test_probe = (sum(val * n for val, n in expvar_test_probe_values) / 
-                                              sum(n for _, n in expvar_test_probe_values)) if expvar_test_probe_values else np.nan
-                    
-                    # Macro average (unweighted - equal weight per celltype) - filter NaN values
-                    macro_mse_test_baseline = np.nanmean([res['mse_test_baseline'] for res in valid_celltype_results.values()])
-                    macro_mse_test_probe = np.nanmean([res['mse_test_probe'] for res in valid_celltype_results.values()])
-                    macro_expvar_test_baseline = np.nanmean([res['expvar_test_baseline'] for res in valid_celltype_results.values()])
-                    macro_expvar_test_probe = np.nanmean([res['expvar_test_probe'] for res in valid_celltype_results.values()])
-                    
-                    logger.info(f"  Computed weighted/macro MSE: {weighted_mse_test_probe:.2f}/{macro_mse_test_probe:.2f}")
-                    logger.info(f"  Computed weighted/macro ExpVar: {weighted_expvar_test_probe:.4f}/{macro_expvar_test_probe:.4f}")
-                    
-                    results_dict[f'{group_type}_celltype_summary'] = {
-                        'weighted_mse_test_baseline': weighted_mse_test_baseline,
-                        'weighted_mse_test_probe': weighted_mse_test_probe,
-                        'weighted_expvar_test_baseline': weighted_expvar_test_baseline,
-                        'weighted_expvar_test_probe': weighted_expvar_test_probe,
-                        'macro_mse_test_baseline': macro_mse_test_baseline,
-                        'macro_mse_test_probe': macro_mse_test_probe,
-                        'macro_expvar_test_baseline': macro_expvar_test_baseline,
-                        'macro_expvar_test_probe': macro_expvar_test_probe
-                    }
+                logger.warning("  No per-cell-type rows found for %s", gene_list_name)
+
+            if summary_results:
+                results_dict[f'{group_type}_celltype_summary'] = summary_results
+                logger.info("  Read pre-computed summary from 'summary' row")
+            else:
+                logger.warning("  No 'summary' row found; aggregated plots will be skipped for %s", gene_list_name)
+
         else:
-            # Global evaluation (no celltype breakdown)
-            # Find the row with analysis_type == 'global'
+            # Global evaluation — no per-cell-type breakdown
             global_rows = gene_list_df[gene_list_df.get('analysis_type', '') == 'global']
-            if len(global_rows) > 0:
-                row = global_rows.iloc[0]
-            else:
-                # Fallback to first row if no 'global' type found
-                row = gene_list_df.iloc[0]
-            
+            row = global_rows.iloc[0] if not global_rows.empty else gene_list_df.iloc[0]
+
             results_dict[f'{group_type}_global'] = {
-                'mse_train_baseline': row.get('mse_train_baseline'),
-                'mse_test_baseline': row.get('mse_test_baseline'),
-                'mse_test_probe': row.get('mse_test_probe'),
-                'expvar_train_baseline': row.get('expvar_train_baseline'),
-                'expvar_test_baseline': row.get('expvar_test_baseline'),
-                'expvar_test_probe': row.get('expvar_test_probe'),
-                'mse_ratio': row.get('mse_ratio'),
-                'expvar_ratio': row.get('expvar_ratio')
+                'mse_train_baseline':   _pick(row, 'mse_train_baseline'),
+                'mse_test_baseline':    _pick(row, 'mse_test_baseline'),
+                'mse_test_probe':       _pick(row, 'mse_test_probe'),
+                'expvar_train_baseline': _pick(row, 'expvar_train_baseline'),
+                'expvar_test_baseline': _pick(row, 'expvar_test_baseline'),
+                'expvar_test_probe':    _pick(row, 'expvar_test_probe'),
             }
-            
-            # For global results, also create a summary structure
-            # that mimics the per-celltype summary format for unified plotting
+            # Mirror as summary so unified downstream functions work the same way
             results_dict[f'{group_type}_global_summary'] = {
-                'weighted_mse_test_baseline': row.get('mse_test_baseline'),
-                'weighted_mse_test_probe': row.get('mse_test_probe'),
-                'weighted_expvar_test_baseline': row.get('expvar_test_baseline'),
-                'weighted_expvar_test_probe': row.get('expvar_test_probe'),
-                'macro_mse_test_baseline': row.get('mse_test_baseline'),  # Same as weighted for global
-                'macro_mse_test_probe': row.get('mse_test_probe'),
-                'macro_expvar_test_baseline': row.get('expvar_test_baseline'),
-                'macro_expvar_test_probe': row.get('expvar_test_probe')
+                'weighted_mse_test_baseline':   _pick(row, 'mse_test_baseline'),
+                'weighted_mse_test_probe':      _pick(row, 'mse_test_probe'),
+                'weighted_expvar_test_baseline': _pick(row, 'expvar_test_baseline'),
+                'weighted_expvar_test_probe':   _pick(row, 'expvar_test_probe'),
+                'macro_mse_test_baseline':      _pick(row, 'mse_test_baseline'),
+                'macro_mse_test_probe':         _pick(row, 'mse_test_probe'),
+                'macro_expvar_test_baseline':   _pick(row, 'expvar_test_baseline'),
+                'macro_expvar_test_probe':      _pick(row, 'expvar_test_probe'),
             }
-        
+
         evaluation_results[gene_list_name] = results_dict
-    
+
     return evaluation_results
 
-
-# ===================================================================
-# LOGGING SETUP
-# ===================================================================
-
-def setup_logging(log_file=None):
-    """Configure logging to both file and console"""
-    handlers = [logging.StreamHandler(sys.stdout)]
-    
-    if log_file:
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        handlers.append(logging.FileHandler(log_file))
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=handlers
-    )
 
 # ===================================================================
 # RESULT LOADING FUNCTIONS
@@ -437,42 +365,42 @@ def load_baseline_results(results_dir, panel_names):
     return results
 
 
-def load_variability_results(results_dir, panel_names):
+def load_variability_results(results_dir, panel_names, subdirs=('nmf', 'mapping')):
     """
     Load variability evaluation results for specified panels.
-    
+
     Parameters:
     -----------
     results_dir : str
         Directory containing result CSV files (either subdirectories or consolidated files)
     panel_names : list
         List of panel names to load results for
-        
+    subdirs : tuple of str, optional (default=('nmf', 'mapping'))
+        Which subdirectory names under results_dir to look for (e.g. add 'pca'/'ica'/
+        'ridge' to load those methods' results too). The subdirectory name is used
+        verbatim as the result dict key. The legacy no-subdir consolidated-file
+        fallback (nmf_representation.csv/mapping_performance.csv) only applies when
+        this is left at its default.
+
     Returns:
     --------
     dict
-        Dictionary with keys: 'nmf', 'mapping', 'celltype_specific'
-        Each containing a filtered DataFrame with only the requested panels
+        Dictionary with one key per entry in ``subdirs`` plus ``'celltype_specific'``
+        (subdirectory-loading path only), each a filtered DataFrame with only the
+        requested panels.
     """
     logger.info("Loading variability evaluation results...")
-    
+
     results = {}
-    
-    # Check if results are in subdirectories or consolidated files
-    subdirs = ['nmf', 'mapping']
-    # Use subdirectory loading if ANY subdirectory exists
+
+    # Use subdirectory loading if ANY requested subdirectory exists
     use_subdirs = any(os.path.isdir(os.path.join(results_dir, sd)) for sd in subdirs)
-    
+
     if use_subdirs:
         logger.info("  Loading from subdirectories (individual CSV files per panel)")
-        
-        # Map subdirectory names to result keys
-        subdir_mapping = {
-            'nmf': 'nmf',
-            'mapping': 'mapping'
-        }
-        
-        for subdir, result_key in subdir_mapping.items():
+
+        for subdir in subdirs:
+            result_key = subdir
             subdir_path = os.path.join(results_dir, subdir)
             if not os.path.exists(subdir_path):
                 logger.warning(f"  Subdirectory not found: {subdir_path}")
@@ -513,10 +441,19 @@ def load_variability_results(results_dir, panel_names):
         # Note: celltype_specific might not be in subdirectories, leave as empty for now
         results['celltype_specific'] = pd.DataFrame()
         
+    elif tuple(subdirs) != ('nmf', 'mapping'):
+        # Non-default subdirs (e.g. pca/ica/ridge) have no legacy consolidated-file
+        # format to fall back to — just report empty results per requested subdir.
+        logger.warning(
+            f"  No {list(subdirs)} subdirectories found under {results_dir}; "
+            "non-default subdirs have no consolidated-file fallback."
+        )
+        for subdir in subdirs:
+            results[subdir] = pd.DataFrame()
     else:
-        # Original logic for consolidated files
+        # Original logic for consolidated files (nmf/mapping default only)
         logger.info("  Loading from consolidated CSV files")
-        
+
         # Load NMF representation results
         nmf_file = os.path.join(results_dir, 'nmf_representation.csv')
         if os.path.exists(nmf_file):
@@ -557,7 +494,7 @@ def load_variability_results(results_dir, panel_names):
 # ===================================================================
 
 def create_baseline_plots(results, output_dir, group_name, color_map=None, 
-                         png_dpi=300, plot_clustering=True, plot_neighborhood=True, 
+                         png_dpi=DEFAULT_PNG_DPI, plot_clustering=True, plot_neighborhood=True, 
                          plot_celltype=True, use_hardcoded_colors=False, external_names=None):
     """
     Create baseline evaluation plots.
@@ -679,23 +616,12 @@ def create_baseline_plots(results, output_dir, group_name, color_map=None,
             marker_map=marker_map,
             group_name=group_name
         )
-        plot_optimal_neighborhood_preservation(
-            results['neighborhood'], 
-            neighborhood_dir, 
+        plot_neighborhood_preservation_celltype_heatmap(
+            results['neighborhood'],
+            neighborhood_dir,
             PNG_DPI=png_dpi
         )
-        
-        # Skip heatmap for Category 9 - not meaningful with multiple datasets having same k values
-        if not (group_name and 'category-9' in group_name.lower()):
-            plot_neighborhood_preservation_heatmap(
-                results['neighborhood'], 
-                neighborhood_dir, 
-                PNG_DPI=png_dpi
-            )
-        else:
-            logger.info("Skipping heatmap for Category 9 (not applicable for this comparison)")
 
-        
         logger.info(f"✓ Neighborhood plots saved to: {neighborhood_dir}")
     
     # Celltype identification plots
@@ -709,18 +635,19 @@ def create_baseline_plots(results, output_dir, group_name, color_map=None,
             celltype_dir, 
             PNG_DPI=png_dpi
         )
-        plot_celltype_accuracy_barchart(
-            results['celltype'], 
-            celltype_dir, 
+        plot_celltype_classification_diagnostics_global(
+            results['celltype'],
+            celltype_dir,
             PNG_DPI=png_dpi
         )
-        
+
         logger.info(f"✓ Celltype plots saved to: {celltype_dir}")
 
 
 def create_variability_plots(results, output_dir, group_name, color_map=None,
-                            png_dpi=300, plot_nmf=True, plot_mapping=True,
-                            plot_celltype_specific=True, use_hardcoded_colors=False, external_names=None):
+                            png_dpi=DEFAULT_PNG_DPI, plot_nmf=True, plot_mapping=True,
+                            plot_celltype_specific=True, use_hardcoded_colors=False, external_names=None,
+                            plot_pca=False, plot_ica=False):
     """
     Create variability evaluation plots.
     
@@ -747,18 +674,22 @@ def create_variability_plots(results, output_dir, group_name, color_map=None,
         If False, uses variability plotting module's comprehensive color scheme (all methods).
     external_names : list, optional
         List of external panel names for proper color assignment (e.g., ['5k', 'mMulti_v1', 'Spapros'])
+    plot_pca : bool, optional (default=False)
+        Whether to create PCA reconstruction plots (results['pca'], same pipeline as NMF).
+    plot_ica : bool, optional (default=False)
+        Whether to create ICA reconstruction plots (results['ica'], same pipeline as NMF).
     """
     logger.info(f"Creating variability plots in: {output_dir}")
-    
+
     # Create output directories
     os.makedirs(output_dir, exist_ok=True)
-    
+
     # Get dataset names for color mapping
     dataset_names = []
-    if 'nmf' in results and not results['nmf'].empty:
-        dataset_names = results['nmf']['gene_list'].unique().tolist()
-    elif 'mapping' in results and not results['mapping'].empty:
-        dataset_names = results['mapping']['gene_list'].unique().tolist()
+    for _key in ('nmf', 'mapping', 'pca', 'ica'):
+        if _key in results and not results[_key].empty:
+            dataset_names = results[_key]['gene_list'].unique().tolist()
+            break
     
     # Get color map based on mode
     if color_map is not None:
@@ -846,8 +777,98 @@ def create_variability_plots(results, output_dir, group_name, color_map=None,
         except Exception as e:
             logger.warning(f"  Could not generate global combined plots: {e}")
 
+        # 4. Gene-subset explained-variance breakdown (all / panel-only / non-panel).
+        #    Always attempted; skips gracefully if the eval run predates the
+        #    --gene_subsets default (no panel/non-panel columns).
+        logger.info("  Creating gene-subset explained-variance breakdown...")
+        try:
+            plot_expvar_gene_subset_breakdown(
+                results['nmf'],
+                nmf_dir,
+                title_suffix=" - NMF",
+                PNG_DPI=png_dpi,
+                external_names=external_names,
+                group_name=group_name,
+            )
+        except Exception as e:
+            logger.warning(f"  Could not generate gene-subset expvar breakdown: {e}")
+
+        # 5. Per-cell-type gene-subset explained-variance breakdown (same guards).
+        logger.info("  Creating per-celltype gene-subset explained-variance breakdown...")
+        try:
+            plot_expvar_gene_subset_breakdown_by_celltype(
+                results['nmf'],
+                nmf_dir,
+                title_suffix=" - NMF",
+                PNG_DPI=png_dpi,
+                external_names=external_names,
+                group_name=group_name,
+            )
+        except Exception as e:
+            logger.warning(f"  Could not generate per-celltype gene-subset expvar breakdown: {e}")
+
         logger.info(f"✓ NMF plots saved to: {nmf_dir}")
-    
+
+    # PCA / ICA reconstruction plots — same pipeline as NMF, just a different
+    # results key / output subfolder / title suffix / methods= value.
+    for _method, _do_plot in (('PCA', plot_pca), ('ICA', plot_ica)):
+        if not (_do_plot and _method in results and not results[_method].empty):
+            continue
+        _display = METHOD_DISPLAY_NAMES.get(_method.lower(), _method.title())
+        logger.info(f"Creating {_display} reconstruction plots...")
+        _method_dir = os.path.join(output_dir, _method)
+        os.makedirs(_method_dir, exist_ok=True)
+
+        _method_dict = convert_variability_df_to_dict(results[_method], group_type=_method)
+
+        logger.info("  Creating aggregated celltype metrics plots...")
+        plot_aggregated_celltype_metrics(
+            _method_dict, _method_dir, title_suffix=f" - {_display}", PNG_DPI=png_dpi,
+            external_names=external_names, group_name=group_name, methods=(_method,)
+        )
+
+        logger.info("  Creating individual celltype evaluation plots...")
+        plot_celltype_evaluation_results(
+            _method_dict, _method_dir, title_suffix=f" - {_display}", PNG_DPI=png_dpi,
+            external_names=external_names, group_name=group_name, plot_celltype=False,
+            methods=(_method,)
+        )
+
+        logger.info("  Creating global combined plots...")
+        try:
+            _global_plot_data = prepare_global_combined_plot_data(results[_method], group_type=_method)
+            if _global_plot_data:
+                for _metric in [f'{_method}_mse', f'{_method}_expvar']:
+                    if _metric in _global_plot_data and _global_plot_data[_metric]:
+                        create_combined_plot_with_info(
+                            classifier_type="Evaluation", gene_count=group_name, metric=_metric,
+                            results=_global_plot_data, output_dir=_method_dir, filter_type=group_name,
+                            gene_sel='combined', PNG_DPI=png_dpi, external_names=external_names,
+                            group_name=group_name
+                        )
+        except Exception as e:
+            logger.warning(f"  Could not generate global combined plots: {e}")
+
+        logger.info("  Creating gene-subset explained-variance breakdown...")
+        try:
+            plot_expvar_gene_subset_breakdown(
+                results[_method], _method_dir, title_suffix=f" - {_display}", PNG_DPI=png_dpi,
+                external_names=external_names, group_name=group_name,
+            )
+        except Exception as e:
+            logger.warning(f"  Could not generate gene-subset expvar breakdown: {e}")
+
+        logger.info("  Creating per-celltype gene-subset explained-variance breakdown...")
+        try:
+            plot_expvar_gene_subset_breakdown_by_celltype(
+                results[_method], _method_dir, title_suffix=f" - {_display}", PNG_DPI=png_dpi,
+                external_names=external_names, group_name=group_name,
+            )
+        except Exception as e:
+            logger.warning(f"  Could not generate per-celltype gene-subset expvar breakdown: {e}")
+
+        logger.info(f"✓ {_display} plots saved to: {_method_dir}")
+
     # Mapping performance plots
     if plot_mapping and 'mapping' in results and not results['mapping'].empty:
         logger.info("Creating mapping performance plots...")
@@ -946,11 +967,10 @@ def create_reconstruction_plots(
             used to extract NMF per-celltype CV results for comparison.
         png_dpi: Output resolution.
     """
-    import os
     from pathlib import Path
 
     tangram_root = Path(tangram_results_dir)
-    out_root = Path(output_dir) / "reconstruction"
+    out_root = Path(output_dir) / "tangram"
     out_root.mkdir(parents=True, exist_ok=True)
 
     for panel_name in panel_names:
@@ -965,26 +985,30 @@ def create_reconstruction_plots(
         # Extract NMF per-celltype results if available
         nmf_ct_results: dict | None = None
         nmf_summary: dict | None = None
+        nmf_global: dict | None = None
         if nmf_results is not None and "nmf" in nmf_results:
             mech_df = nmf_results["nmf"]
-            if not mech_df.empty and "gene_list" in mech_df.columns:
-                panel_df = mech_df[
-                    (mech_df["gene_list"] == panel_name) &
-                    (mech_df.get("analysis_type", "per_celltype") == "per_celltype")
-                ]
-                if not panel_df.empty and "celltype" in panel_df.columns:
+            if not mech_df.empty and "gene_list" in mech_df.columns and "analysis_type" in mech_df.columns:
+                panel_df = mech_df[mech_df["gene_list"] == panel_name]
+                per_ct = panel_df[panel_df["analysis_type"] == "per_celltype"]
+                if "celltype" in per_ct.columns:
+                    # The macro/weighted aggregates live in the per_celltype row
+                    # whose celltype is "summary" (the global row has none).
                     nmf_ct_results = {
                         row["celltype"]: row.to_dict()
-                        for _, row in panel_df.iterrows()
-                        if pd.notna(row.get("celltype"))
+                        for _, row in per_ct.iterrows()
+                        if pd.notna(row.get("celltype")) and row["celltype"] != "summary"
                     }
-                # Summary (macro/weighted) from global row
-                global_row = mech_df[
-                    (mech_df["gene_list"] == panel_name) &
-                    (mech_df.get("analysis_type", "global") == "global")
-                ]
+                    summary_row = per_ct[per_ct["celltype"] == "summary"]
+                    if not summary_row.empty:
+                        nmf_summary = summary_row.iloc[0].to_dict()
+                global_row = panel_df[panel_df["analysis_type"] == "global"]
                 if not global_row.empty:
-                    nmf_summary = global_row.iloc[0].to_dict()
+                    nmf_global = global_row.iloc[0].to_dict()
+            if nmf_ct_results is None:
+                logger.warning("No NMF results found for panel '%s' — plotting Tangram only.", panel_name)
+
+        tangram_global_csv = tangram_csv.parent.parent / "global" / f"{panel_name}.csv"
 
         panel_out = out_root / panel_name
         panel_out.mkdir(parents=True, exist_ok=True)
@@ -1003,9 +1027,56 @@ def create_reconstruction_plots(
             output_path=panel_out / f"{panel_name}_reconstruction_aggregated.png",
             dataset_name=panel_name,
             png_dpi=png_dpi,
+            tangram_global_csv=tangram_global_csv,
+            nmf_global=nmf_global,
         )
 
     logger.info("Reconstruction comparison plots saved to: %s", out_root)
+
+
+def create_ridge_plots(
+    ridge_results_dir: str,
+    panel_names: list[str],
+    output_dir: str,
+    png_dpi: int = DEFAULT_PNG_DPI,
+    external_names: list[str] | None = None,
+    group_name: str | None = None,
+) -> None:
+    """Create Ridge (raw + lognorm) aggregated reconstruction comparison plots.
+
+    Loads Ridge's per-panel results (via ``load_variability_results`` with
+    ``subdirs=('ridge-regression',)``) and calls
+    ``plot_ridge_aggregated_celltype_metrics`` once per space, writing into
+    ``<output_dir>/ridge-regression/``. v1 scope: only the aggregated weighted/macro
+    MSE + ExpVar comparison (see ``_variability_plots.plot_ridge_aggregated_celltype_metrics``).
+
+    Args:
+        ridge_results_dir: Directory containing Ridge's ``ridge-regression/`` results
+            subfolder (i.e. the shared ``Variability-Evaluation/results`` dir, same
+            parent NMF/PCA/ICA use).
+        panel_names: List of panel dataset names to plot.
+        output_dir: Root output directory (a ``ridge-regression`` subfolder is created
+            under it).
+        png_dpi: Output resolution.
+        external_names: Passed through to the plotting function.
+        group_name: Passed through to the plotting function.
+    """
+    logger.info(f"Loading Ridge results from: {ridge_results_dir}")
+    ridge_results = load_variability_results(ridge_results_dir, panel_names, subdirs=('ridge-regression',))
+    ridge_df = ridge_results.get('ridge-regression')
+    if ridge_df is None or ridge_df.empty:
+        logger.warning("No Ridge results found — skipping Ridge plots.")
+        return
+
+    ridge_dir = os.path.join(output_dir, 'ridge-regression')
+    os.makedirs(ridge_dir, exist_ok=True)
+    for space in ('raw', 'lognorm'):
+        plot_ridge_aggregated_celltype_metrics(
+            ridge_df, ridge_dir, space=space,
+            title_suffix=f" ({group_name})" if group_name else "",
+            PNG_DPI=png_dpi, external_names=external_names, group_name=group_name,
+        )
+    logger.info(f"✓ Ridge plots saved to: {ridge_dir}")
 
 
 # ===================================================================
@@ -1020,7 +1091,7 @@ def parse_arguments():
     
     # Required arguments
     parser.add_argument('--evaluation_type', required=True,
-                       choices=['baseline', 'variability', 'both'],
+                       choices=['baseline', 'variability', 'all'],
                        help='Type of evaluation to plot')
     
     parser.add_argument('--panels', required=True,
@@ -1043,8 +1114,8 @@ def parse_arguments():
     parser.add_argument('--group_name', default='custom_comparison',
                        help='Name for this plot group (used in titles)')
     
-    parser.add_argument('--png_dpi', type=int, default=300,
-                       help='DPI for saved plots')
+    parser.add_argument("--png_dpi", type=int, default=DEFAULT_PNG_DPI,
+                       help=f'DPI for saved plots (default: {DEFAULT_PNG_DPI})')
     
     parser.add_argument('--allow_mixed_sizes', action='store_true',
                        help='Allow panels with different gene counts in same plot')
@@ -1068,7 +1139,29 @@ def parse_arguments():
     
     parser.add_argument('--plot_celltype_specific', action='store_true',
                        help='Create per-celltype variability plots')
-    
+
+    parser.add_argument('--plot_pca', action='store_true',
+                       help="Create PCA reconstruction plots (Variability-Evaluation/results/PCA/ -- "
+                            "shares the same Variability-Evaluation/ root as NMF/ICA/Ridge, just a "
+                            "different leaf subdir). Loaded from --variability_results_dir / "
+                            "--results_dir, same as --plot_nmf.")
+
+    parser.add_argument('--plot_ica', action='store_true',
+                       help="Create ICA reconstruction plots (Variability-Evaluation/results/ICA/ -- "
+                            "shares the same Variability-Evaluation/ root as NMF/PCA/Ridge, just a "
+                            "different leaf subdir). Loaded from --variability_results_dir / "
+                            "--results_dir, same as --plot_nmf.")
+
+    parser.add_argument('--plot_ridge', action='store_true',
+                       help='Create Ridge (raw+lognorm) reconstruction plots. Requires --ridge_results_dir.')
+
+    parser.add_argument('--ridge_results_dir',
+                       help="Ridge results directory, e.g. '.../Variability-Evaluation/results' -- Ridge "
+                            "writes into a 'ridge-regression' leaf subdir under the same shared "
+                            "Variability-Evaluation/ root NMF/PCA/ICA use (in production this is "
+                            "typically pointed at the same directory as --variability_results_dir / "
+                            "--results_dir). Required when --plot_ridge is set.")
+
     # External panel configuration
     parser.add_argument('--external_names',
                        help='Comma-separated list of external panel names (e.g., "5k,mMulti_v1,Spapros")')
@@ -1117,27 +1210,27 @@ def main():
         logger.info("Mixed panel sizes allowed - plots will include panels of different sizes")
     
     # Validate arguments
-    if args.evaluation_type == 'both':
+    if args.evaluation_type == 'all':
         if not args.baseline_results_dir or not args.variability_results_dir:
-            logger.error("Both --baseline_results_dir and --variability_results_dir required when evaluation_type='both'")
+            logger.error("Both --baseline_results_dir and --variability_results_dir required when evaluation_type='all'")
             return 1
     else:
         if not args.results_dir:
             logger.error("--results_dir required when evaluation_type is 'baseline' or 'variability'")
             return 1
-    
+
         # Process baseline evaluation
-    if args.evaluation_type in ['baseline', 'both']:
-        results_dir = args.baseline_results_dir if args.evaluation_type == 'both' else args.results_dir
-        
+    if args.evaluation_type in ['baseline', 'all']:
+        results_dir = args.baseline_results_dir if args.evaluation_type == 'all' else args.results_dir
+
         logger.info("")
         logger.info("="*80)
         logger.info("BASELINE EVALUATION PLOTS")
         logger.info("="*80)
-        
+
         baseline_results = load_baseline_results(results_dir, panel_names)
-        
-        baseline_output = os.path.join(args.output_dir, 'Baseline') if args.evaluation_type == 'both' else args.output_dir
+
+        baseline_output = os.path.join(args.output_dir, 'Baseline') if args.evaluation_type == 'all' else args.output_dir
         
         # Use comprehensive color scheme (not hardcoded) to allow all methods
         create_baseline_plots(
@@ -1154,17 +1247,22 @@ def main():
         )
     
     # Process variability evaluation
-    if args.evaluation_type in ['variability', 'both']:
-        results_dir = args.variability_results_dir if args.evaluation_type == 'both' else args.results_dir
+    if args.evaluation_type in ['variability', 'all']:
+        results_dir = args.variability_results_dir if args.evaluation_type == 'all' else args.results_dir
         
         logger.info("")
         logger.info("="*80)
         logger.info("VARIABILITY EVALUATION PLOTS")
         logger.info("="*80)
         
-        variability_results = load_variability_results(results_dir, panel_names)
+        _variability_subdirs = ['nmf', 'mapping']
+        if args.plot_pca:
+            _variability_subdirs.append('PCA')
+        if args.plot_ica:
+            _variability_subdirs.append('ICA')
+        variability_results = load_variability_results(results_dir, panel_names, subdirs=tuple(_variability_subdirs))
         
-        variability_output = os.path.join(args.output_dir, 'Variability') if args.evaluation_type == 'both' else args.output_dir
+        variability_output = os.path.join(args.output_dir, 'Variability') if args.evaluation_type == 'all' else args.output_dir
         
         # Use comprehensive color scheme (not hardcoded) to allow all methods
         create_variability_plots(
@@ -1177,9 +1275,32 @@ def main():
             plot_mapping=args.plot_mapping,
             plot_celltype_specific=args.plot_celltype_specific,
             use_hardcoded_colors=False,  # Use comprehensive colors, not hardcoded
-            external_names=external_names  # Pass for proper color assignment
+            external_names=external_names,  # Pass for proper color assignment
+            plot_pca=args.plot_pca,
+            plot_ica=args.plot_ica,
         )
-    
+
+    # Ridge reconstruction plots — independent of --evaluation_type (own results tree),
+    # same pattern as the Tangram block below.
+    if getattr(args, 'plot_ridge', False):
+        if not args.ridge_results_dir:
+            logger.error("--ridge_results_dir is required when --plot_ridge is set")
+            return 1
+        logger.info("")
+        logger.info("="*80)
+        logger.info("RIDGE VARIABILITY PLOTS")
+        logger.info("="*80)
+        ridge_output = os.path.join(args.output_dir, 'Variability') \
+            if args.evaluation_type == 'all' else args.output_dir
+        create_ridge_plots(
+            ridge_results_dir=args.ridge_results_dir,
+            panel_names=panel_names,
+            output_dir=ridge_output,
+            png_dpi=args.png_dpi,
+            external_names=external_names,
+            group_name=args.group_name,
+        )
+
     # Reconstruction comparison plots (Tangram vs NMF)
     if getattr(args, 'tangram_results_dir', None):
         logger.info("")
@@ -1188,11 +1309,11 @@ def main():
         logger.info("="*80)
         # Load NMF results for comparison if variability results are available
         nmf_for_comparison = None
-        if args.evaluation_type in ['variability', 'both']:
-            results_dir_var = args.variability_results_dir if args.evaluation_type == 'both' else args.results_dir
+        if args.evaluation_type in ['variability', 'all']:
+            results_dir_var = args.variability_results_dir if args.evaluation_type == 'all' else args.results_dir
             nmf_for_comparison = load_variability_results(results_dir_var, panel_names)
         reconstruction_output = os.path.join(args.output_dir, 'Reconstruction') \
-            if args.evaluation_type == 'both' else args.output_dir
+            if args.evaluation_type == 'all' else args.output_dir
         create_reconstruction_plots(
             tangram_results_dir=args.tangram_results_dir,
             panel_names=panel_names,

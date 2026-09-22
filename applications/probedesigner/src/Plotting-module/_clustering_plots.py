@@ -7,48 +7,38 @@ the evaluation pipeline.
 Includes:
 - UMAP visualization colored by clusters and cell types
 - Neighborhood preservation scores across k values
-- Clustering quality metrics (ARI, NMI) 
+- Clustering quality metrics (ARI, NMI)
 - Cell-type classification metrics (F1 scores, confusion matrices)
-- Feature importance heatmaps and decision tree visualizations
 """
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import re
-from typing import Any, Callable, Optional
 
-import gc
-import matplotlib.cm as cm
-import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scanpy as sc
 import seaborn as sns
-from anndata import AnnData
+
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
 
 from _constants import (
-    COL_ACCURACY,
-    COL_ARI,
     COL_CELLTYPE,
-    COL_CLUSTERING_QUALITY_ARI,
-    COL_CLUSTERING_QUALITY_NMI,
     COL_DATASET,
-    COL_DIM_REDUCTION,
-    COL_DISPLAY_NAME,
     COL_F1_SCORE,
-    COL_FEATURE_IMPORTANCE,
-    COL_GENE,
     COL_K,
-    COL_METRIC,
-    COL_N_CLUSTERS,
-    COL_NMI,
-    COL_OPTIMAL_K,
     COL_PRESERVATION_SCORE,
     COL_REPRESENTATION,
-    COL_SCORE,
     DEFAULT_PNG_DPI,
 )
 
@@ -86,23 +76,18 @@ __all__ = [
     "extract_factor_number_from_dataset_name",
     "extract_strategy_from_dataset_name",
     "extract_display_name_from_dataset",
-    "extract_detailed_display_name_for_heatmap",
     "resolve_marker_strategy",
-    "generate_category_9_label",
     "generate_panel_size_colors_and_strategy_markers",
     "generate_method_specific_colors_and_markers",
-    "generate_method_specific_colors",
     "plot_umap_for_representation",
     "plot_neighborhood_preservation_by_k",
-    "plot_optimal_neighborhood_preservation",
-    "plot_neighborhood_preservation_heatmap",
+    "plot_neighborhood_preservation_celltype_heatmap",
     "plot_clustering_quality_ari",
     "plot_clustering_quality_nmi",
     "plot_celltype_f1_heatmap",
-    "plot_celltype_accuracy_barchart",
-    "plot_feature_importance_heatmap",
+    "plot_celltype_classification_diagnostics_global",
+    "plot_celltype_class_sizes",
     "plot_confusion_matrix",
-    "plot_decision_tree_visualization",
     "create_feature_plots",
 ]
 
@@ -111,8 +96,8 @@ def extract_factor_number_from_dataset_name(dataset_name):
     Extract the number of NMF factors from a dataset name.
     
     Examples:
-        'Scanpy-Filter_All-Genes_dt_nmf_DT0.25_Dimred0.75_per_celltype_method_a_2factors_100' → 2
-        'Xenium-Filter_HVG-Subset_nmf_per_celltype_method_b_15factors_200' → 15
+        'Scanpy-Filter_All-Genes_RecoVar_RF_0.25_Dimred_0.75_2factors_100' → 2
+        'Xenium-Filter_HVG-Subset_nmf_15factors_200' → 15
         'Scanpy-Filter_All-Genes_Random_100' → None
         
     Parameters:
@@ -150,22 +135,22 @@ def extract_strategy_from_dataset_name(dataset_name):
         
     Examples:
         'Scanpy-Filter_All-Genes_deg_only_100_5k-addon' → ('deg_only', None)
-        'Scanpy-Filter_All-Genes_dt_pca_DT0.5_Dimred0.5_global_method_a_100' → ('dt_pca_DT0.5_Dimred0.5_global_method_a', None)
-        'Scanpy-Filter_All-Genes_dt_nmf_DT0.25_Dimred0.75_per_celltype_method_a_2factors_100' → ('dt_nmf_DT0.25_Dimred0.75_per_celltype_method_a', None)
+        'Scanpy-Filter_All-Genes_RecoVar_PCA_RF_0.5_Dimred_0.5_100' → ('RecoVar_PCA_RF_0.5_Dimred_0.5', None)
+        'Scanpy-Filter_All-Genes_RecoVar_RF_0.25_Dimred_0.75_2factors_100' → ('RecoVar_RF_0.25_Dimred_0.75', None)
         'Scanpy-Filter_All-Genes_Random_100' → ('Random', None)
         '/path/to/Scanpy-Filter_All-Genes_deg_only_100_5k-addon_DEG-based-filling.h5ad' → ('deg_only', 'DEG-based-filling')
-        
+
     Parameters:
     -----------
     dataset_name : str
         Full dataset name/path with optional gap-filling variant suffix
-        
+
     Returns:
     --------
     tuple : (base_strategy, gap_filling_variant)
-        base_strategy: The core strategy identifier (e.g., 'deg_only', 'dt_pca_DT0.5_Dimred0.5_global_method_a')
+        base_strategy: The core strategy identifier (e.g., 'deg_only', 'RecoVar_RF_0.25_Dimred_0.75')
                       Factor numbers are removed from the strategy name.
-        gap_filling_variant: One of 'DEG-based-filling', 'global-gene-filling', 
+        gap_filling_variant: One of 'DEG-based-filling', 'global-gene-filling',
                             'cell-type-specific-filling', or None
     """
     import re
@@ -254,13 +239,13 @@ def extract_strategy_from_dataset_name(dataset_name):
     
     # Check if name does NOT match any known pipeline patterns
     pipeline_patterns = [
-        'dt_pca_DT', 'dt_nmf_DT',  # Hybrid strategies
-        'pca_global_', 'pca_per_celltype_',  # PCA-only
-        'nmf_global_', 'nmf_per_celltype_',  # NMF-only
-        'deg_only', 'dt_simple', 'dt_deg',  # Simple strategies
+        'RecoVar_RF_', 'RecoVar_PCA_RF_',  # Hybrid RF + dimred strategies
+        'RecoVar',  # Bare RecoVar / RecoVar_PCA
+        'dimred_only', '_pca_', '_nmf_',  # Dimred-only
+        'deg_only', 'rf_simple', 'rf_deg',  # Simple strategies
         'Random', 'HVG', 'random', 'hvg'  # Baselines
     ]
-    
+
     is_pipeline_pattern = any(pattern in name for pattern in pipeline_patterns)
     is_addon_suffix = name.endswith('-addon')
     
@@ -271,37 +256,43 @@ def extract_strategy_from_dataset_name(dataset_name):
         # Return the full name to preserve all context
         return name, gap_filling_variant
     
-    # Look for known strategy patterns
-    # 1. Simple strategies: deg_only, dt_simple, dt_deg, hvg, random (these contain underscores, so check as strings first)
-    simple_strategies = ['deg_only', 'dt_simple', 'dt_deg', 'hvg', 'random']
+    # 1. Combination strategies: RF share + dimred share (RecoVar / RecoVar_PCA hybrids).
+    # Checked before the simple-strategy string match below so the '_RecoVar_' substring
+    # inside a hybrid name is not mistaken for the bare 'RecoVar' strategy.
+    combo_pattern = r'RecoVar(_PCA)?_RF_([\d.]+)_Dimred_([\d.]+)'
+    combo_match = re.search(combo_pattern, name)
+    if combo_match:
+        pca_flag, rf_ratio, dimred_ratio = combo_match.groups()
+        prefix = 'RecoVar_PCA' if pca_flag else 'RecoVar'
+        return f"{prefix}_RF_{rf_ratio}_Dimred_{dimred_ratio}", gap_filling_variant
+
+    # 2. Simple strategies: deg_only, rf_simple, rf_deg, RecoVar(_PCA), hvg, random
+    # (these contain underscores, so check as strings). RecoVar_PCA before RecoVar.
+    # Also match a LEADING token (name.startswith(f'{strategy}_')) -- some naming
+    # conventions (e.g. Analysis-scripts/orchestrators/run_recovar_audit3_validation.sbatch's
+    # "RecoVar_raw_rf0.5_nmf0.5_LCA_500genes_seed42") put the strategy first with no
+    # underscore before it, so the underscore-bounded check alone would never match.
+    simple_strategies = ['deg_only', 'rf_simple', 'rf_deg',
+                         'RecoVar_PCA', 'RecoVar', 'hvg', 'random']
     for strategy in simple_strategies:
-        if f'_{strategy}_' in name:
+        if f'_{strategy}_' in name or name.startswith(f'{strategy}_'):
             return strategy, gap_filling_variant
-    
-    # 2. Baselines: Random, HVG (check both uppercase and lowercase)
+
+    # 3. Baselines: Random, HVG (check both uppercase and lowercase)
     if 'Random' in parts or 'random' in parts:
         return 'Random', gap_filling_variant
     if 'HVG' in parts or 'hvg' in parts:
         return 'HVG', gap_filling_variant
-    
-    # 3. Dimensionality reduction only: pca/nmf + global/per_celltype + method_a/b
-    # Pattern: pca_global_method_a, nmf_per_celltype_method_b
-    dimred_pattern = r'(pca|nmf)_(global|per_celltype)_method_([ab])'
+
+    # 4. Dimensionality-reduction-only panels. RecoVar emits
+    # 'dimred_only_{nmf,pca}_per_celltype'; older Modules_v2 names were
+    # '{nmf,pca}_{global,per_celltype}' with an optional trailing _method_a/_method_b.
+    # Only the dimred token (nmf / pca) is meaningful now.
+    dimred_pattern = r'_(?:dimred_only_)?(pca|nmf)_(?:global|per_celltype)(?:_method_[ab])?'
     dimred_match = re.search(dimred_pattern, name)
     if dimred_match:
-        dimred_type, analysis_type, method = dimred_match.groups()
-        strategy = f"{dimred_type}_{analysis_type}_method_{method}"
-        return strategy, gap_filling_variant
-    
-    # 4. Combination strategies: dt_pca/dt_nmf + ratios + global/per_celltype + method_a/b
-    # Pattern: dt_pca_DT0.5_Dimred0.5_global_method_a
-    combo_pattern = r'dt_(pca|nmf)_DT([\d.]+)_Dimred([\d.]+)_(global|per_celltype)_method_([ab])'
-    combo_match = re.search(combo_pattern, name)
-    if combo_match:
-        dimred_type, dt_ratio, dimred_ratio, analysis_type, method = combo_match.groups()
-        strategy = f"dt_{dimred_type}_DT{dt_ratio}_Dimred{dimred_ratio}_{analysis_type}_method_{method}"
-        return strategy, gap_filling_variant
-    
+        return dimred_match.group(1), gap_filling_variant
+
     # Fallback: return the dataset name itself if no pattern matches
     return name, gap_filling_variant
 
@@ -315,19 +306,19 @@ def extract_display_name_from_dataset(dataset_name, factor_range_mode=False, inc
     without filter/baseline/size/addon information, but INCLUDES the filling method suffix.
     
     Examples:
-        'Scanpy-Filter_All-Genes_dt_deg_100_5k-addon' → 'dt_deg'
+        'Scanpy-Filter_All-Genes_rf_deg_100_5k-addon' → 'rf_deg'
         'Scanpy-Filter_All-Genes_Random_100' → 'Random'
-        'Scanpy-Filter_All-Genes_dt_pca_DT0.5_Dimred0.5_global_method_a_100' → 'dt_pca_50%'
-        'Scanpy-Filter_All-Genes_dt_pca_DT0.5_Dimred0.5_per_celltype_method_b_200_DEG-based-filling' → 'dt_pca_50% (DEG-fill)'
-        'Scanpy-Filter_All-Genes_dt_nmf_DT0.5_Dimred0.5_per_celltype_method_b_200_cell-type-specific-filling' → 'dt_nmf_50% (CT-fill)'
+        'Scanpy-Filter_All-Genes_RecoVar_PCA_RF_0.5_Dimred_0.5_100' → 'RecoVar_PCA 50%'
+        'Scanpy-Filter_All-Genes_RecoVar_PCA_RF_0.5_Dimred_0.5_200_DEG-based-filling' → 'RecoVar_PCA 50% (DEG-fill)'
+        'Scanpy-Filter_All-Genes_RecoVar_RF_0.5_Dimred_0.5_200_cell-type-specific-filling' → 'RecoVar 50% (CT-fill)'
         'mMulti_v1' → 'mMulti_v1'
-        
+
     Factor-range mode (factor_range_mode=True):
-        'Scanpy-Filter_All-Genes_dt_nmf_DT0.25_Dimred0.75_per_celltype_method_a_2factors_100' → '2-factors'
-        'Xenium-Filter_HVG-Subset_nmf_per_celltype_method_b_15factors_200' → '15-factors'
-    
+        'Scanpy-Filter_All-Genes_RecoVar_RF_0.25_Dimred_0.75_2factors_100' → '2-factors'
+        'Xenium-Filter_HVG-Subset_dimred_only_nmf_per_celltype_15factors_200' → '15-factors'
+
     Panel-size mode (include_size=True):
-        'Scanpy-Filter_All-Genes_dt_nmf_DT0.75_Dimred0.25_per_celltype_method_a_100_CT-fill' → 'dt_nmf_75%_CT_abs (100)'
+        'Scanpy-Filter_All-Genes_RecoVar_RF_0.75_Dimred_0.25_100_CT-fill' → 'RecoVar 25% (100)'
         'Xenium-Filter_Spapros_200' → 'Spapros (200)'
         
     Parameters:
@@ -369,17 +360,11 @@ def extract_display_name_from_dataset(dataset_name, factor_range_mode=False, inc
         'global-gene-filling': 'Global-fill'
     }
     
-    # Define method type labels
-    method_labels = {
-        'a': 'abs',  # absolute gene weight
-        'b': 'norm'  # normalized gene weight
-    }
-    
     # For external panels and baselines, return as-is (no filling suffix expected)
     # Known simple external panels (these return simplified names from extract_strategy_from_dataset_name)
     simple_external_panels = ['5k', 'mMulti_v1', 'mMulti', 'Spapros', 'spapros', 'NSForest', 'scMER']
     baselines = ['Random', 'HVG']
-    simple_strategies = ['deg_only', 'dt_simple', 'dt_deg']
+    simple_strategies = ['deg_only', 'rf_simple', 'rf_deg', 'nmf', 'pca']
     
     # Check exact match for simple panels/baselines/strategies
     if base_strategy in simple_external_panels or base_strategy in baselines or base_strategy in simple_strategies:
@@ -391,52 +376,28 @@ def extract_display_name_from_dataset(dataset_name, factor_range_mode=False, inc
     # These panels don't match any pipeline patterns but have multiple components
     # Examples: "Scanpy-Filter_HVG_NSForest_200", "No-Filter_All-Genes_ExternalTool_100"
     pipeline_patterns = [
-        'dt_pca_DT', 'dt_nmf_DT',  # Hybrid strategies
-        'pca_global_', 'pca_per_celltype_',  # PCA-only
-        'nmf_global_', 'nmf_per_celltype_',  # NMF-only
+        'RecoVar_RF_', 'RecoVar_PCA_RF_',  # Hybrid RF + dimred strategies
     ]
-    
+
     is_pipeline_pattern = any(pattern in base_strategy for pattern in pipeline_patterns)
     has_multiple_parts = len(base_strategy.split('_')) >= 3
-    
+
     # If it's not a pipeline pattern and has multiple parts, it's likely a complex external panel
     if not is_pipeline_pattern and has_multiple_parts:
         # Return full name for complex external panels to preserve all context
         return base_strategy + panel_size_str
-    
-    # For dimred-only strategies, simplify the name and include method type
-    # Pattern: pca_global_method_a → pca_global_abs
-    dimred_pattern = r'(pca|nmf)_(global|per_celltype)_method_([ab])'
-    dimred_match = re.search(dimred_pattern, base_strategy)
-    if dimred_match:
-        dimred_type, analysis_type, method = dimred_match.groups()
-        method_label = method_labels.get(method, method)
-        
-        # Use "CT" as abbreviation for per-celltype to keep labels shorter
-        selection_label = 'global' if analysis_type == 'global' else 'CT'
-        display_name = f"{dimred_type}_{selection_label}_{method_label}"
-        
-        # Add filling suffix if present
-        if gap_filling_variant:
-            filling_text = filling_abbrev.get(gap_filling_variant, gap_filling_variant)
-            display_name = f"{display_name} ({filling_text})"
-        return display_name + panel_size_str
-    
-    # For hybrid strategies, extract the percentage and include method type
-    # Pattern: dt_pca_DT0.5_Dimred0.5_global_method_a → dt_pca_50%_abs
-    hybrid_pattern = r'dt_(pca|nmf)_DT([\d.]+)_Dimred([\d.]+)_(global|per_celltype)_method_([ab])'
+
+    # For hybrid strategies, extract the dimred percentage.
+    # Pattern: RecoVar_RF_0.25_Dimred_0.75 → 'RecoVar 75%'
+    #          RecoVar_PCA_RF_0.5_Dimred_0.5 → 'RecoVar_PCA 50%'
+    hybrid_pattern = r'RecoVar(_PCA)?_RF_([\d.]+)_Dimred_([\d.]+)'
     hybrid_match = re.search(hybrid_pattern, base_strategy)
     if hybrid_match:
-        dimred_type, dt_ratio, dimred_ratio, analysis_type, method = hybrid_match.groups()
-        dimred_ratio_float = float(dimred_ratio)
-        percentage = int(dimred_ratio_float * 100)
-        method_label = method_labels.get(method, method)
-        
-        # Create more explicit label format: "dt_nmf_25%_global_abs" or "dt_nmf_25%_CT_abs"
-        # Use "CT" as abbreviation for per-celltype to keep labels shorter
-        selection_label = 'global' if analysis_type == 'global' else 'CT'
-        display_name = f"dt_{dimred_type}_{percentage}%_{selection_label}_{method_label}"
-        
+        pca_flag, rf_ratio, dimred_ratio = hybrid_match.groups()
+        percentage = int(float(dimred_ratio) * 100)
+        prefix = 'RecoVar_PCA' if pca_flag else 'RecoVar'
+        display_name = f"{prefix} {percentage}%"
+
         # Add filling suffix if present
         if gap_filling_variant:
             filling_text = filling_abbrev.get(gap_filling_variant, gap_filling_variant)
@@ -448,119 +409,6 @@ def extract_display_name_from_dataset(dataset_name, factor_range_mode=False, inc
         filling_text = filling_abbrev.get(gap_filling_variant, gap_filling_variant)
         return f"{base_strategy} ({filling_text})" + panel_size_str
     return base_strategy + panel_size_str
-
-
-def extract_detailed_display_name_for_heatmap(dataset_name, group_name=None):
-    """
-    Extract a detailed display name for heatmap axis labels that includes both
-    strategy and gap-filling method, optionally removing ratio info if it's in the group name.
-    
-    This is more verbose than extract_display_name_from_dataset() to help distinguish
-    between similar strategies with different filling methods in heatmaps where markers can't be used.
-    
-    Examples:
-        'Scanpy-Filter_All-Genes_dt_nmf_DT0.75_Dimred0.25_per_celltype_method_a_100_DEG-based-filling_mMulti-addon'
-        with group_name='25-NMF-75-DEG' → 'dt_nmf_per_celltype_a_DEG-fill'
-        
-        'Xenium-Filter_HVG-Subset_dt_nmf_DT0.75_Dimred0.25_per_celltype_method_a_100_cell-type-specific-filling_mMulti-addon'
-        → 'dt_nmf_per_celltype_a_CT-fill'
-    
-    Parameters:
-    -----------
-    dataset_name : str
-        Full dataset name
-    group_name : str, optional
-        Plot group name (e.g., '25-NMF-75-DEG') to detect if ratio should be excluded
-        
-    Returns:
-    --------
-    str
-        Detailed display name for heatmap labels
-    """
-    import re
-    
-    # Extract the base strategy and filling variant
-    base_strategy, gap_filling_variant = extract_strategy_from_dataset_name(dataset_name)
-    
-    # Define abbreviations for filling methods
-    filling_abbrev = {
-        'DEG-based-filling': 'DEG-fill',
-        'cell-type-specific-filling': 'CT-fill',
-        'global-gene-filling': 'Global-fill'
-    }
-    
-    # Define method type labels
-    method_labels = {
-        'a': 'abs',  # absolute gene weight
-        'b': 'norm'  # normalized gene weight
-    }
-    
-    # For external panels and simple baselines, return as-is
-    # Known simple external panels (these return simplified names from extract_strategy_from_dataset_name)
-    simple_external_panels = ['5k', 'mMulti_v1', 'mMulti', 'Spapros', 'spapros', 'NSForest', 'scMER']
-    baselines = ['Random', 'HVG']
-    simple_strategies = ['deg_only', 'dt_simple', 'dt_deg']
-    
-    # Check exact match for simple panels/baselines/strategies
-    if base_strategy in simple_external_panels or base_strategy in baselines or base_strategy in simple_strategies:
-        # For external panels, return just the panel name for clean display
-        # This shows "NSForest" or "scMER" instead of the full filename
-        return base_strategy
-    
-    # Check if this is a complex external panel (full name returned from extract_strategy_from_dataset_name)
-    # These panels don't match any pipeline patterns but have multiple components
-    # Examples: "Scanpy-Filter_HVG_NSForest_200", "No-Filter_All-Genes_ExternalTool_100"
-    pipeline_patterns = [
-        'dt_pca_DT', 'dt_nmf_DT',  # Hybrid strategies
-        'pca_global_', 'pca_per_celltype_',  # PCA-only
-        'nmf_global_', 'nmf_per_celltype_',  # NMF-only
-    ]
-    
-    is_pipeline_pattern = any(pattern in base_strategy for pattern in pipeline_patterns)
-    has_multiple_parts = len(base_strategy.split('_')) >= 3
-    
-    # If it's not a pipeline pattern and has multiple parts, it's likely a complex external panel
-    if not is_pipeline_pattern and has_multiple_parts:
-        # Return full name for complex external panels to preserve all context
-        return base_strategy
-        return base_strategy
-    
-    # For dimred-only strategies: pca_global_method_a → pca_global_abs
-    dimred_pattern = r'(pca|nmf)_(global|per_celltype)_method_([ab])'
-    dimred_match = re.search(dimred_pattern, base_strategy)
-    if dimred_match:
-        dimred_type, analysis_type, method = dimred_match.groups()
-        method_label = method_labels.get(method, method)
-        display_name = f"{dimred_type}_{analysis_type}_{method_label}"
-        if gap_filling_variant:
-            filling_text = filling_abbrev.get(gap_filling_variant, gap_filling_variant)
-            display_name = f"{display_name}_{filling_text}"
-        return display_name
-    
-    # For hybrid strategies: dt_pca_DT0.75_Dimred0.25_global_method_a
-    # For heatmaps, omit the ratio to keep labels concise (ratio info is usually in plot group name)
-    hybrid_pattern = r'dt_(pca|nmf)_DT([\d.]+)_Dimred([\d.]+)_(global|per_celltype)_method_([ab])'
-    hybrid_match = re.search(hybrid_pattern, base_strategy)
-    if hybrid_match:
-        dimred_type, dt_ratio, dimred_ratio, analysis_type, method = hybrid_match.groups()
-        method_label = method_labels.get(method, method)
-        
-        # Always omit ratio for heatmap labels to keep them concise
-        # The ratio information is typically in the plot group name anyway
-        display_name = f"dt_{dimred_type}_{analysis_type}_{method_label}"
-        
-        # Add filling suffix
-        if gap_filling_variant:
-            filling_text = filling_abbrev.get(gap_filling_variant, gap_filling_variant)
-            display_name = f"{display_name}_{filling_text}"
-        
-        return display_name
-    
-    # Fallback
-    if gap_filling_variant:
-        filling_text = filling_abbrev.get(gap_filling_variant, gap_filling_variant)
-        return f"{base_strategy}_{filling_text}"
-    return base_strategy
 
 
 def resolve_marker_strategy(dataset_names):
@@ -591,11 +439,11 @@ def resolve_marker_strategy(dataset_names):
     for name in dataset_names:
         base_strategy, gap_filling_variant = extract_strategy_from_dataset_name(name)
         
-        # Only analyze hybrid strategies (dt_nmf, dt_pca)
-        if base_strategy.startswith('dt_pca_') or base_strategy.startswith('dt_nmf_'):
+        # Only analyze hybrid strategies (RecoVar / RecoVar_PCA)
+        if base_strategy.startswith('RecoVar_RF_') or base_strategy.startswith('RecoVar_PCA_RF_'):
             # Extract ratio
             import re
-            pattern = r'Dimred([\d.]+)'
+            pattern = r'Dimred_([\d.]+)'
             match = re.search(pattern, base_strategy)
             if match:
                 ratio = float(match.group(1))
@@ -629,60 +477,6 @@ def resolve_marker_strategy(dataset_names):
         return 'ratio'
 
 
-def generate_category_9_label(dataset_name):
-    """
-    Generate Category 9 specific label that includes filter setting + strategy.
-    
-    Format: {Filter}_{Strategy}
-    - Filter: Scanpy-All-Genes, Scanpy-HVG, Xenium-All-Genes, Xenium-HVG
-    - Strategy: dt_nmf_75%, dt_pca_75%
-    
-    Examples:
-        'Scanpy-Filter_All-Genes_dt_nmf_DT0.25_Dimred0.75_...' → 'Scanpy-All-Genes_dt_nmf_75%'
-        'Xenium-Filter_HVG-Subset_dt_pca_DT0.25_Dimred0.75_...' → 'Xenium-HVG_dt_pca_75%'
-    
-    Parameters:
-    -----------
-    dataset_name : str
-        Full dataset name
-        
-    Returns:
-    --------
-    str
-        Category 9 formatted label
-    """
-    import re
-    
-    # Determine filter prefix
-    filter_label = None
-    if dataset_name.startswith('Scanpy-Filter_All-Genes'):
-        filter_label = 'Scanpy-All-Genes'
-    elif dataset_name.startswith('Scanpy-Filter_HVG-Subset'):
-        filter_label = 'Scanpy-HVG'
-    elif dataset_name.startswith('Xenium-Filter_All-Genes'):
-        filter_label = 'Xenium-All-Genes'
-    elif dataset_name.startswith('Xenium-Filter_HVG-Subset'):
-        filter_label = 'Xenium-HVG'
-    
-    # Extract dimred type and ratio
-    dimred_type = None
-    dimred_ratio = None
-    
-    # Pattern: dt_{dimred}_DT{dt_ratio}_Dimred{dimred_ratio}_
-    pattern = r'dt_(pca|nmf)_DT([\d.]+)_Dimred([\d.]+)'
-    match = re.search(pattern, dataset_name)
-    if match:
-        dimred_type = match.group(1)
-        dimred_ratio = float(match.group(3))
-        percentage = int(dimred_ratio * 100)
-        
-        if filter_label:
-            return f"{filter_label}_dt_{dimred_type}_{percentage}%"
-    
-    # Fallback
-    return dataset_name
-
-
 def generate_panel_size_colors_and_strategy_markers(dataset_names, external_names=None):
     """
     Generate colors based on panel size and markers based on strategy.
@@ -694,12 +488,12 @@ def generate_panel_size_colors_and_strategy_markers(dataset_names, external_name
     - 500 genes: Dark green (#2E7D32)
     
     Marker assignment by strategy:
-    - dt_nmf: circle (o) - regardless of filling strategy
-    - dt_pca: circle (o) - regardless of filling strategy
+    - RecoVar: circle (o) - regardless of filling strategy
+    - RecoVar_PCA: circle (o) - regardless of filling strategy
     - nmf: diamond (D)
     - pca: diamond (D)
-    - dt_simple: triangle up (^)
-    - dt_deg: triangle down (v)
+    - rf_simple: triangle up (^)
+    - rf_deg: triangle down (v)
     - deg_only: pentagon (p)
     - hvg: hexagon (h)
     - random: plus (+)
@@ -733,12 +527,12 @@ def generate_panel_size_colors_and_strategy_markers(dataset_names, external_name
     
     # Define strategy markers
     strategy_markers = {
-        'dt_nmf': 'o',      # Circle
-        'dt_pca': 'o',      # Circle
+        'RecoVar': 'o',      # Circle
+        'RecoVar_PCA': 'o',  # Circle
         'nmf': 'D',         # Diamond
         'pca': 'D',         # Diamond
-        'dt_simple': '^',   # Triangle up
-        'dt_deg': 'v',      # Triangle down
+        'rf_simple': '^',   # Triangle up
+        'rf_deg': 'v',      # Triangle down
         'deg_only': 'p',    # Pentagon
         'hvg': 'h',         # Hexagon
         'random': '+',      # Plus
@@ -797,11 +591,11 @@ def generate_panel_size_colors_and_strategy_markers(dataset_names, external_name
                 break
         
         if not is_external:
-            # For hybrid strategies (dt_nmf, dt_pca), extract the base type
-            if 'dt_nmf' in base_strategy:
-                marker_map[name] = strategy_markers['dt_nmf']
-            elif 'dt_pca' in base_strategy:
-                marker_map[name] = strategy_markers['dt_pca']
+            # For hybrid strategies (RecoVar, RecoVar_PCA), extract the base type
+            if base_strategy.startswith('RecoVar_PCA'):
+                marker_map[name] = strategy_markers['RecoVar_PCA']
+            elif base_strategy.startswith('RecoVar'):
+                marker_map[name] = strategy_markers['RecoVar']
             elif 'nmf' in base_strategy:
                 marker_map[name] = strategy_markers['nmf']
             elif 'pca' in base_strategy:
@@ -823,22 +617,18 @@ def generate_method_specific_colors_and_markers(dataset_names, external_names=No
     Settings like filter method, baseline gene pool, panel size, and addon panels do NOT affect color.
     
     Marker assignment follows intelligent logic:
-    - For hybrid strategies (dt_nmf/dt_pca): Analyzes which dimension varies in the plot
+    - For hybrid strategies (RecoVar/RecoVar_PCA): Analyzes which dimension varies in the plot
     - If multiple gap-filling strategies → use gap-filling markers (square, diamond, triangle)
     - If multiple ratio combinations → use ratio markers (circle=25%, square=50%, triangle=75%)
     - If both vary → raises error (incompatible grouping)
-    
+
     Strategy-based color families:
-    - Baseline methods: Gray (Random), Yellow (HVG), Orange family (deg_only, dt_simple, dt_deg)
-    - PCA methods: Cyan/Teal family
-    - NMF methods: Purple/Pink family
-    - Combination methods: Blue family (method_a), Red family (method_b)
+    - Baseline methods: Gray (Random), Yellow (HVG), Orange family (deg_only, rf_simple, rf_deg)
+    - RecoVar (RF + NMF) hybrid: Purple family, shade by dimred share
+    - RecoVar_PCA (RF + PCA) hybrid: Lime-green family, shade by dimred share
+    - Dimred-only: Pink (nmf), Green (pca)
     - External panels: Green family (Spapros, mMulti, 5k)
-    
-    Special handling for Category 9:
-    - Uses filter+dimred-specific colors (Scanpy-All vs HVG, Xenium-All vs HVG)
-    - PCA gets lighter shade, NMF gets darker shade of base color
-    
+
     Parameters:
     -----------
     dataset_names : list
@@ -847,8 +637,8 @@ def generate_method_specific_colors_and_markers(dataset_names, external_names=No
         List of external panel names (e.g., ['Spapros', 'mMulti_v1', '5k'])
         These will be assigned custom colors from a gradient
     group_name : str, optional
-        Plot group name (e.g., 'category-9'). Used to apply special color schemes.
-    
+        Plot group name (retained for signature compatibility; no longer used).
+
     Returns:
     --------
     tuple
@@ -930,8 +720,8 @@ def generate_method_specific_colors_and_markers(dataset_names, external_names=No
         
         # Simple strategies
         'deg_only': "#fa9c4a",       # Orange
-        'dt_simple': "#d56a0d",      # Dark orange
-        'dt_deg': "#875223",         # Brown
+        'rf_simple': "#d56a0d",      # Dark orange
+        'rf_deg': "#875223",         # Brown
     }
 
     # Define benchmark markers - all use circles for easy identification
@@ -941,8 +731,8 @@ def generate_method_specific_colors_and_markers(dataset_names, external_names=No
         'HVG': 'o',              # Circle
         'hvg': 'o',              # Circle (lowercase variant)
         'deg_only': 'o',         # Circle
-        'dt_simple': 'o',        # Circle
-        'dt_deg': 'o',           # Circle
+        'rf_simple': 'o',        # Circle
+        'rf_deg': 'o',           # Circle
     }
 
     
@@ -970,24 +760,6 @@ def generate_method_specific_colors_and_markers(dataset_names, external_names=No
         '5k': 'o',               # Circle
     }
 
-    # Category 9 specific colors: Filter combination + dimred type
-    # Format: {(filter_prefix, dimred_type): color}
-    # Blue family: Scanpy-Filter_All-Genes
-    # Red family: Scanpy-Filter_HVG-Subset  
-    # Green family: Xenium-Filter_All-Genes
-    # Orange family: Xenium-Filter_HVG-Subset
-    category_9_colors = {
-        ('Scanpy-Filter_All-Genes', 'pca'): '#6eb5ff',  # Light blue
-        ('Scanpy-Filter_All-Genes', 'nmf'): '#0066cc',  # Dark blue
-        ('Scanpy-Filter_HVG-Subset', 'pca'): '#ff9999',  # Light red
-        ('Scanpy-Filter_HVG-Subset', 'nmf'): '#cc0000',  # Dark red
-        ('Xenium-Filter_All-Genes', 'pca'): "#6be16b",  # Light green
-        ('Xenium-Filter_All-Genes', 'nmf'): "#0a8a0a",  # Dark green
-        ('Xenium-Filter_HVG-Subset', 'pca'): '#ffcc99',  # Light orange
-        ('Xenium-Filter_HVG-Subset', 'nmf'): '#ff6600',  # Dark orange
-    }
-
-    
     # Generate gradient colors for additional external panels
     # Purple to teal gradient for external methods
     external_gradient = [
@@ -1058,102 +830,37 @@ def generate_method_specific_colors_and_markers(dataset_names, external_names=No
                             logging.info(f"  Assigned marker '{size_marker_map[size]}' to Spapros panel size {size}")
                             break
     
-    # Systematic color scheme: Color family = Model type, Shade = Selection strategy + Method
+    # Systematic color scheme: Color family = Model type, Shade = dimred share.
     # Color families by model type:
-    # - Blue family: dt_nmf (hybrid decision tree + NMF)
-    # - Purple family: nmf-only 
-    # - Cyan family: pca-only
-    # - Orange family: dt_deg and deg-only
-    # - Gray family: baseline methods
-    
-    # Within each family:
-    # - Lighter shades: global selection
-    # - Darker shades: per-celltype (CT) selection
-    # - Further distinction: method_a (abs) slightly lighter than method_b (norm)
-    
-    # dt_nmf color map: HIGHLY DISTINCT COLORS
-    # Use completely different color families for each selection×method combination
-    # Global vs Per-celltype: Different color families
-    # Method A vs Method B: Drastically different hues
-    # 25% vs 50% vs 75%: Different saturation/brightness within same family
-    dt_nmf_colors = {
-        # Global selection - METHOD A (absolute weights): BRIGHT BLUE family
-        'global_a_10': '#80C0FF',  # Very light sky blue - global, abs, 10% NMF
-        'global_a_25': '#4DA6FF',  # Bright sky blue - global, abs, 25% NMF
-        'global_a_50': '#0080FF',  # Vivid blue - global, abs, 50% NMF
-        'global_a_75': '#0052CC',  # Strong blue - global, abs, 75% NMF
-        'global_a_90': '#003D99',  # Very deep blue - global, abs, 90% NMF
-        
-        # Global selection - METHOD B (normalized weights): ORANGE-RED family
-        'global_b_10': '#FFBB99',  # Very light orange - global, norm, 10% NMF
-        'global_b_25': '#FF9966',  # Light orange - global, norm, 25% NMF
-        'global_b_50': '#FF6633',  # Bright orange - global, norm, 50% NMF
-        'global_b_75': '#FF3300',  # Red-orange - global, norm, 75% NMF
-        'global_b_90': '#CC1A00',  # Very deep red-orange - global, norm, 90% NMF
-        
-        # Per-celltype selection - METHOD A (absolute weights): PURPLE family
-        'per_celltype_a_10': '#DDAAFF',  # Very light purple - CT, abs, 10% NMF
-        'per_celltype_a_25': '#BB88FF',  # Light purple - CT, abs, 25% NMF
-        'per_celltype_a_50': '#9933FF',  # Vivid purple - CT, abs, 50% NMF
-        'per_celltype_a_75': '#7700CC',  # Deep purple - CT, abs, 75% NMF
-        'per_celltype_a_90': '#550099',  # Very deep purple - CT, abs, 90% NMF
-        
-        # Per-celltype selection - METHOD B (normalized weights): BURGUNDY-BROWN family
-        'per_celltype_b_10': '#EE88BB',  # Very light rosy brown - CT, norm, 10% NMF
-        'per_celltype_b_25': '#CC6699',  # Rosy brown - CT, norm, 25% NMF
-        'per_celltype_b_50': '#993366',  # Wine red - CT, norm, 50% NMF
-        'per_celltype_b_75': '#661133',  # Dark burgundy - CT, norm, 75% NMF
-        'per_celltype_b_90': '#440022',  # Very dark burgundy - CT, norm, 90% NMF
+    # - Purple family: RecoVar (hybrid RF + NMF)
+    # - Lime-green family: RecoVar_PCA (hybrid RF + PCA)
+    # - Pink/Magenta: nmf-only        - Green: pca-only
+    # - Orange family: rf_deg and deg-only        - Gray family: baseline methods
+    # Within a hybrid family the shade tracks the dimred (NMF/PCA) share: lighter = smaller
+    # share, darker = larger share.
+
+    # RecoVar hybrid (RF + NMF) color map, keyed by dimred (NMF) share percentage.
+    RecoVar_colors = {
+        10: '#DDAAFF',  # Very light purple - 10% NMF
+        25: '#BB88FF',  # Light purple - 25% NMF
+        50: '#9933FF',  # Vivid purple - 50% NMF
+        75: '#7700CC',  # Deep purple - 75% NMF
+        90: '#550099',  # Very deep purple - 90% NMF
     }
-    
-    # dt_pca color map: HIGHLY DISTINCT COLORS (different from dt_nmf)
-    # Use completely different color families than dt_nmf
-    dt_pca_colors = {
-        # Global selection - METHOD A (absolute weights): CYAN-TURQUOISE family
-        'global_a_10': '#99FFDD',  # Very light turquoise - global, abs, 10% PCA
-        'global_a_25': '#66FFCC',  # Light turquoise - global, abs, 25% PCA
-        'global_a_50': '#00FFAA',  # Bright cyan-green - global, abs, 50% PCA
-        'global_a_75': '#00CC88',  # Deep turquoise - global, abs, 75% PCA
-        'global_a_90': '#009966',  # Very deep turquoise - global, abs, 90% PCA
-        
-        # Global selection - METHOD B (normalized weights): YELLOW-AMBER family
-        'global_b_10': '#FFEE99',  # Very light yellow - global, norm, 10% PCA
-        'global_b_25': '#FFD966',  # Light yellow - global, norm, 25% PCA
-        'global_b_50': '#FFBB33',  # Golden yellow - global, norm, 50% PCA
-        'global_b_75': '#FF9900',  # Amber - global, norm, 75% PCA
-        'global_b_90': '#CC7700',  # Very deep amber - global, norm, 90% PCA
-        
-        # Per-celltype selection - METHOD A (absolute weights): LIME-GREEN family
-        'per_celltype_a_10': '#CCFF88',  # Very light lime - CT, abs, 10% PCA
-        'per_celltype_a_25': '#AAFF55',  # Light lime - CT, abs, 25% PCA
-        'per_celltype_a_50': '#77DD22',  # Vivid lime - CT, abs, 50% PCA
-        'per_celltype_a_75': '#55AA00',  # Deep lime green - CT, abs, 75% PCA
-        'per_celltype_a_90': '#338800',  # Very deep lime green - CT, abs, 90% PCA
-        
-        # Per-celltype selection - METHOD B (normalized weights): TEAL-FOREST family
-        'per_celltype_b_10': '#88CCAA',  # Very light teal - CT, norm, 10% PCA
-        'per_celltype_b_25': '#66AA88',  # Light teal - CT, norm, 25% PCA
-        'per_celltype_b_50': '#338866',  # Teal green - CT, norm, 50% PCA
-        'per_celltype_b_75': '#226655',  # Dark forest teal - CT, norm, 75% PCA
-        'per_celltype_b_90': '#114433',  # Very dark forest teal - CT, norm, 90% PCA
+
+    # RecoVar_PCA hybrid (RF + PCA) color map, keyed by dimred (PCA) share percentage.
+    RecoVar_PCA_colors = {
+        10: '#CCFF88',  # Very light lime - 10% PCA
+        25: '#AAFF55',  # Light lime - 25% PCA
+        50: '#77DD22',  # Vivid lime - 50% PCA
+        75: '#55AA00',  # Deep lime green - 75% PCA
+        90: '#338800',  # Very deep lime green - 90% PCA
     }
-    
-    # nmf-only and pca-only color map: DISTINCT from hybrid strategies
-    # NMF-only: Pink/Magenta family (clearly different from blue dt_nmf)
-    # PCA-only: Green family (clearly different from cyan dt_pca)
-    # METHOD_A (abs): Lighter, more saturated colors
-    # METHOD_B (norm): Much darker colors
+
+    # Dimred-only color map: DISTINCT from hybrid strategies. One colour per dimred type.
     dimred_only_colors = {
-        # NMF-only: Pink/Magenta family - CLEARLY DIFFERENT from dt_nmf blues!
-        'nmf_global_a': '#ff99ff',    # Light magenta - global, abs
-        'nmf_global_b': '#cc3399',    # Dark magenta - global, norm (much darker!)
-        'nmf_per_celltype_a': '#cc0066',  # Dark pink - CT, abs
-        'nmf_per_celltype_b': '#800040',  # Very dark magenta - CT, norm (much darker!)
-        # PCA-only: Green family - CLEARLY DIFFERENT from dt_pca cyans!
-        'pca_global_a': '#99ff99',    # Light green - global, abs
-        'pca_global_b': '#339933',    # Dark green - global, norm (much darker!)
-        'pca_per_celltype_a': '#006600',  # Dark forest green - CT, abs
-        'pca_per_celltype_b': '#003300',  # Very dark forest green - CT, norm (much darker!)
+        'nmf': '#cc0066',  # Dark pink
+        'pca': '#006600',  # Dark forest green
     }
 
     # Gap-filling strategy markers
@@ -1164,12 +871,12 @@ def generate_method_specific_colors_and_markers(dataset_names, external_names=No
         None: 'o',                                   # Circle (no filling)
     }
     
-    # Ratio-specific markers for hybrid strategies (dt_pca, dt_nmf)
-    # Based on dimred_ratio (NMF or PCA component percentage)
+    # Ratio-specific markers for hybrid strategies (RecoVar, RecoVar_PCA)
+    # Based on dimred_ratio (NMF or PCA component share)
     ratio_markers = {
-        0.25: 'o',      # Circle - 25% dimred (75% DT)
-        0.50: 's',      # Square - 50% dimred (50% DT)
-        0.75: '^',      # Triangle - 75% dimred (25% DT)
+        0.25: 'o',      # Circle - 25% dimred (75% RF)
+        0.50: 's',      # Square - 50% dimred (50% RF)
+        0.75: '^',      # Triangle - 75% dimred (25% RF)
     }
     
     # Determine marker strategy based on what varies in this plot
@@ -1234,42 +941,7 @@ def generate_method_specific_colors_and_markers(dataset_names, external_names=No
         if is_external:
             logging.info(f"  Continuing (is_external=True, color assigned)")
             continue
-        
-        # Check for Category 9 special color scheme
-        # Category 9 compares dt_nmf vs dt_pca across filter settings
-        is_category_9 = group_name and 'category-9' in group_name.lower()
-        if is_category_9:
-            logging.info(f"  Detected Category 9 plot group: {group_name}")
-            # Extract filter prefix and dimred type from dataset name
-            # Expected format: "Scanpy-Filter_All-Genes_dt_nmf_..." or "Xenium-Filter_HVG-Subset_dt_pca_..."
-            filter_prefix = None
-            dimred_type = None
-            
-            # Determine filter prefix
-            if name.startswith('Scanpy-Filter_All-Genes'):
-                filter_prefix = 'Scanpy-Filter_All-Genes'
-            elif name.startswith('Scanpy-Filter_HVG-Subset'):
-                filter_prefix = 'Scanpy-Filter_HVG-Subset'
-            elif name.startswith('Xenium-Filter_All-Genes'):
-                filter_prefix = 'Xenium-Filter_All-Genes'
-            elif name.startswith('Xenium-Filter_HVG-Subset'):
-                filter_prefix = 'Xenium-Filter_HVG-Subset'
-            
-            # Determine dimred type from base_strategy
-            if 'dt_nmf' in base_strategy or base_strategy.startswith('nmf_'):
-                dimred_type = 'nmf'
-            elif 'dt_pca' in base_strategy or base_strategy.startswith('pca_'):
-                dimred_type = 'pca'
-            
-            # Apply Category 9 colors if both filter and dimred type were identified
-            if filter_prefix and dimred_type:
-                category_9_key = (filter_prefix, dimred_type)
-                if category_9_key in category_9_colors:
-                    color_map[name] = category_9_colors[category_9_key]
-                    logging.info(f"  ✓ Applied Category 9 color: {filter_prefix} + {dimred_type} -> {category_9_colors[category_9_key]}")
-                    # Still assign markers based on the hybrid strategy logic below
-                    # Don't continue here, let marker assignment happen naturally
-        
+
         # Check for simple benchmark strategies first
         if base_strategy in benchmark_colors:
             color_map[name] = benchmark_colors[base_strategy]
@@ -1279,78 +951,34 @@ def generate_method_specific_colors_and_markers(dataset_names, external_names=No
             else:
                 marker_map[name] = benchmark_markers.get(base_strategy, 'o')
             continue
-        
-        # Check for hybrid strategies (dt_pca_* or dt_nmf_*)
-        if base_strategy.startswith('dt_pca_') or base_strategy.startswith('dt_nmf_'):
-            # Extract components from the strategy name
-            # Pattern: dt_{dimred}_DT{dt_ratio}_Dimred{dimred_ratio}_{analysis_type}_method_{letter}
-            parts = base_strategy.split('_')
-            
-            # Determine dimensionality reduction type (pca or nmf)
-            dimred_type = 'nmf' if base_strategy.startswith('dt_nmf_') else 'pca'
-            
-            # Extract ratios
-            dt_ratio = None
+
+        # Check for hybrid strategies (RecoVar_* or RecoVar_PCA_*)
+        if base_strategy.startswith('RecoVar_RF_') or base_strategy.startswith('RecoVar_PCA_RF_'):
+            # Pattern: RecoVar(_PCA)?_RF_{rf_ratio}_Dimred_{dimred_ratio}
+            dimred_type = 'pca' if base_strategy.startswith('RecoVar_PCA_RF_') else 'nmf'
+
             dimred_ratio = None
-            for i, part in enumerate(parts):
-                if part.startswith('DT'):
-                    try:
-                        dt_ratio = float(part.replace('DT', ''))
-                    except:
-                        pass
-                elif part.startswith('Dimred'):
-                    try:
-                        dimred_ratio = float(part.replace('Dimred', ''))
-                    except:
-                        pass
-            
-            # Convert dimred_ratio to percentage (e.g., 0.25 -> '25', 0.5 -> '50', 0.75 -> '75')
-            if dimred_ratio is not None:
-                percentage_key = str(int(dimred_ratio * 100))
+            m = re.search(r'Dimred_([\d.]+)', base_strategy)
+            if m:
+                try:
+                    dimred_ratio = float(m.group(1))
+                except ValueError:
+                    pass
+
+            # Colour keyed by dimred share percentage only.
+            percentage_key = int(round(dimred_ratio * 100)) if dimred_ratio is not None else 50
+            color_dict = RecoVar_colors if dimred_type == 'nmf' else RecoVar_PCA_colors
+            if percentage_key in color_dict:
+                color_map[name] = color_dict[percentage_key]
             else:
-                percentage_key = '50'  # Default
-            
-            # Determine selection strategy (global or per_celltype)
-            if 'global' in base_strategy:
-                selection = 'global'
-            elif 'per_celltype' in base_strategy:
-                selection = 'per_celltype'
-            else:
-                selection = 'global'  # Default
-            
-            # Determine method (a or b)
-            method_letter = 'a' if 'method_a' in base_strategy else 'b'
-            
-            # Only assign color if not already assigned by Category 9 logic
-            if name not in color_map:
-                # Build color key: {selection}_{method}_{percentage}
-                color_key = f"{selection}_{method_letter}_{percentage_key}"
-                
-                # Select appropriate color dictionary
-                color_dict = dt_nmf_colors if dimred_type == 'nmf' else dt_pca_colors
-                
-                # Get color based on key
-                if color_key in color_dict:
-                    color_map[name] = color_dict[color_key]
-                else:
-                    # Fallback to a basic color based on dimred type
-                    color_map[name] = '#3399ff' if dimred_type == 'nmf' else '#33d0d0'
-                    logging.warning(f"No color defined for {dimred_type} with key {color_key}")
-            else:
-                logging.info(f"  Color already assigned (Category 9): {color_map[name]}")
-            
+                color_map[name] = '#9933FF' if dimred_type == 'nmf' else '#77DD22'
+                logging.warning(f"No color defined for {dimred_type} hybrid at {percentage_key}% share")
+
             # Assign marker based on resolved strategy
-            # For Category 9, use dimred-specific markers (circle for NMF, square for PCA)
-            if is_category_9 and dimred_type:
-                marker_map[name] = 'o' if dimred_type == 'nmf' else 's'  # 'o' = circle, 's' = square
-                logging.info(f"  Using Category 9 dimred marker for '{name}' ({dimred_type}): {marker_map[name]}")
-            # Use the marker_strategy determined at the beginning based on what varies in this plot
-            elif marker_strategy == 'gap_filling':
-                # Use gap-filling markers
+            if marker_strategy == 'gap_filling':
                 marker_map[name] = gap_filling_markers.get(gap_filling_variant, 'o')
                 logging.info(f"  Using gap-filling marker for '{name}': {marker_map[name]}")
             elif marker_strategy == 'ratio':
-                # Use ratio markers
                 if dimred_ratio in ratio_markers:
                     marker_map[name] = ratio_markers[dimred_ratio]
                     logging.info(f"  Using ratio marker for '{name}' (ratio={dimred_ratio}): {marker_map[name]}")
@@ -1359,42 +987,15 @@ def generate_method_specific_colors_and_markers(dataset_names, external_names=No
                     logging.warning(f"  No ratio marker defined for ratio={dimred_ratio}, using circle")
             else:
                 # marker_strategy == 'none' or fallback
-                # Default to ratio markers when only one of each (backward compatibility)
                 if dimred_ratio in ratio_markers:
                     marker_map[name] = ratio_markers[dimred_ratio]
                 else:
                     marker_map[name] = gap_filling_markers.get(gap_filling_variant, 'o')
             continue
-        
-        # Check for dimred-only strategies (nmf_* or pca_*, but not dt_nmf or dt_pca)
-        # Pattern: {dimred}_{analysis_type}_method_{letter}
-        # Example: nmf_global_method_a, pca_per_celltype_method_b
-        if (base_strategy.startswith('nmf_') or base_strategy.startswith('pca_')) and not base_strategy.startswith('dt_'):
-            # Determine dimensionality reduction type
-            dimred_type = 'nmf' if base_strategy.startswith('nmf_') else 'pca'
-            
-            # Determine selection strategy (global or per_celltype)
-            if 'global' in base_strategy:
-                selection = 'global'
-            elif 'per_celltype' in base_strategy:
-                selection = 'per_celltype'
-            else:
-                selection = 'global'  # Default
-            
-            # Determine method (a or b)
-            method_letter = 'a' if 'method_a' in base_strategy else 'b'
-            
-            # Build color key: {dimred}_{selection}_{method}
-            color_key = f"{dimred_type}_{selection}_{method_letter}"
-            
-            # Get color from dimred_only_colors
-            if color_key in dimred_only_colors:
-                color_map[name] = dimred_only_colors[color_key]
-            else:
-                # Fallback
-                color_map[name] = '#9d4e9d' if dimred_type == 'nmf' else '#4e9d9d'
-                logging.warning(f"No color defined for dimred-only with key {color_key}")
-            
+
+        # Check for dimred-only strategies (base_strategy is exactly 'nmf' or 'pca')
+        if base_strategy in dimred_only_colors:
+            color_map[name] = dimred_only_colors[base_strategy]
             # Assign marker based on gap-filling variant
             marker_map[name] = gap_filling_markers.get(gap_filling_variant, 'o')
             continue
@@ -1424,27 +1025,6 @@ def generate_method_specific_colors_and_markers(dataset_names, external_names=No
     return color_map, marker_map
 
 
-def generate_method_specific_colors(dataset_names, external_names=None, group_name=None):
-    """
-    Backward compatibility wrapper - returns only colors.
-    
-    Parameters:
-    -----------
-    dataset_names : list
-        List of dataset names
-    external_names : list, optional
-        List of external panel names
-    group_name : str, optional
-        Plot group name for special color schemes (e.g., Category 9)
-    
-    Returns:
-    --------
-    dict
-        Dictionary mapping dataset names to color codes
-    """
-    color_map, _ = generate_method_specific_colors_and_markers(dataset_names, external_names, group_name)
-    return color_map
-
 ##############################################################################
 # UMAP representation
 ##############################################################################
@@ -1468,78 +1048,95 @@ def plot_umap_for_representation(adata, rep_name, dataset_name, output_dir,
         Directory to save plots
     dimensionality_reduction : str
         Which dimensionality reduction was used: "pca", "nmf", or "both"
-    DEFAULT_PNG_DPI : int
+    PNG_DPI : int
         Resolution for saved figures
     celltype_col : str, optional
         Column name for cell type annotations
-        
+
     Returns:
     --------
-    str
-        Path to saved figure, or None if plotting failed
+    list[str]
+        Paths to the saved figures (one per colouring: Leiden clusters and, when
+        ``celltype_col`` is present, cell-type annotations are saved as SEPARATE
+        files). Empty list if plotting failed.
     """
     logging.info(f"Generating UMAP for {rep_name.upper()} representation")
-    
+
     # Determine neighbor key
     if dimensionality_reduction == "both":
         neighbors_key = f"neighbors_{rep_name}"
     else:
         neighbors_key = None  # Use default
-    
+
     # Compute UMAP for this representation
     try:
         sc.tl.umap(adata, neighbors_key=neighbors_key)
-        
+
         # Store UMAP with representation-specific key if using "both" mode
         if dimensionality_reduction == "both":
             adata.obsm[f'X_umap_{rep_name}'] = adata.obsm['X_umap'].copy()
-        
-        # Create figure with two subplots: clusters and cell types
-        fig, axes = plt.subplots(1, 2 if celltype_col else 1, 
-                                figsize=(16 if celltype_col else 8, 6))
-        
-        if celltype_col:
-            # Plot 1: Color by default Leiden clusters
-            sc.pl.umap(adata, color='leiden', ax=axes[0], show=False, 
-                      title=f'Leiden Clusters ({rep_name.upper()})')
-            
-            # Plot 2: Color by cell types
-            sc.pl.umap(adata, color=celltype_col, ax=axes[1], show=False, 
-                      title=f'Cell Types ({rep_name.upper()})')
-        else:
-            # Only plot clusters if no celltype column
-            if isinstance(axes, np.ndarray):
-                ax = axes[0]
-            else:
-                ax = axes
-            sc.pl.umap(adata, color='leiden', ax=ax, show=False, 
-                      title=f'Leiden Clusters ({rep_name.upper()})')
-        
-        plt.tight_layout()
-        
-        # Save the figure
-        if output_dir and os.path.exists(output_dir):
-            umap_dir = os.path.join(output_dir, 'umap_plots')
-            os.makedirs(umap_dir, exist_ok=True)
-            
-            # Create sanitized filename
-            safe_name = dataset_name.replace('/', '_').replace(' ', '_') if dataset_name else 'dataset'
-            filename = f'umap_{safe_name}_{rep_name}.png'
-            filepath = os.path.join(umap_dir, filename)
-            
-            plt.savefig(filepath, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+
+        if not (output_dir and os.path.exists(output_dir)):
+            return []
+        umap_dir = os.path.join(output_dir, 'umap_plots')
+        os.makedirs(umap_dir, exist_ok=True)
+        safe_name = dataset_name.replace('/', '_').replace(' ', '_') if dataset_name else 'dataset'
+
+        # One separate figure per colouring.
+        colourings = []
+        if 'leiden' in adata.obs:
+            colourings.append(('leiden', f'Leiden Clusters ({rep_name.upper()})', 'leiden'))
+        if celltype_col and celltype_col in adata.obs:
+            colourings.append((celltype_col, f'Cell Types ({rep_name.upper()})', celltype_col))
+        elif celltype_col:
+            logging.warning(f"celltype_col '{celltype_col}' not in adata.obs — skipping cell-type UMAP")
+
+        saved = []
+        for color_key, title, suffix in colourings:
+            n_cat = 0
+            try:
+                n_cat = int(adata.obs[color_key].astype("category").cat.categories.size)
+            except Exception:
+                pass
+            # Keep the scatter panel a fixed square; the legend gets its own space
+            # to the right so a long cell-type list can't crush the embedding.
+            fig, ax = plt.subplots(figsize=(8, 8))
+            legend_fs = max(6, 11 - 0.28 * max(0, n_cat - 8))
+            sc.pl.umap(
+                adata, color=color_key, ax=ax, show=False, title=title,
+                legend_loc="right margin", legend_fontsize=legend_fs, frameon=True,
+            )
+            # scanpy sets equal aspect on embeddings -> an elongated UMAP becomes a
+            # thin strip. Let it fill its box instead.
+            ax.set_aspect("auto")
+            # Rebuild the legend as a single outside column (scanpy's multi-column
+            # 'right margin' block is what eats the width).
+            leg = ax.get_legend()
+            if leg is not None:
+                handles = list(leg.legend_handles if hasattr(leg, "legend_handles")
+                               else leg.legendHandles)
+                labels = [t.get_text() for t in leg.get_texts()]
+                leg.remove()
+                ncol = 1 if n_cat <= 30 else 2
+                ax.legend(
+                    handles, labels, loc="center left", bbox_to_anchor=(1.02, 0.5),
+                    frameon=False, fontsize=legend_fs, ncol=ncol, markerscale=1.4,
+                    handletextpad=0.4, columnspacing=0.8, borderaxespad=0.0,
+                )
+            fig.tight_layout()
+            safe_suffix = str(suffix).replace('/', '_').replace(' ', '_')
+            filepath = os.path.join(umap_dir, f'umap_{safe_name}_{rep_name}_{safe_suffix}.png')
+            fig.savefig(filepath, dpi=PNG_DPI, bbox_inches='tight')
+            plt.close(fig)
             logging.info(f"Saved UMAP plot to: {filepath}")
-            plt.close()
-            return filepath
-        else:
-            plt.close()
-            return None
-            
+            saved.append(filepath)
+        return saved
+
     except Exception as e:
         logging.error(f"Could not generate UMAP for {rep_name}: {e}")
         import traceback
         traceback.print_exc()
-        return None
+        return []
 
 
 ##############################################################################
@@ -1558,7 +1155,7 @@ def plot_neighborhood_preservation_by_k(results_df, output_dir, PNG_DPI=DEFAULT_
         Results from evaluate_neighborhood_preservation()
     output_dir : str
         Directory to save plot
-    DEFAULT_PNG_DPI : int
+    PNG_DPI : int
         Resolution for saved figure
     color_map : dict, optional
         Dictionary mapping dataset names to colors
@@ -1573,11 +1170,26 @@ def plot_neighborhood_preservation_by_k(results_df, output_dir, PNG_DPI=DEFAULT_
         List of paths to saved figures
     """
     # Filter numeric k values for line plot
-    numeric_results = results_df[results_df[COL_K] != 'optimal']
-    
+    numeric_results = results_df[results_df[COL_K] != 'optimal'].copy()
+
+    # Keep only the dataset-level (global) rows. The neighborhood CSV also carries
+    # per-cell-type rows (celltype populated) with the same (dataset, k) keys;
+    # without this filter each dataset's line is strung through all ~N points per
+    # k (global + one per cell type) as a single zig-zag polyline.
+    if COL_CELLTYPE in numeric_results.columns:
+        _ct = numeric_results[COL_CELLTYPE]
+        numeric_results = numeric_results[
+            _ct.isna() | _ct.astype(str).str.lower().isin(['', 'nan', 'none', 'global'])
+        ].copy()
+
     if numeric_results.empty:
         logging.warning("No numeric k values found for plotting")
         return []
+
+    # Draw each line in ascending-k order regardless of CSV row order.
+    numeric_results = numeric_results.sort_values(
+        COL_K, key=lambda s: pd.to_numeric(s, errors='coerce')
+    )
     
     # Generate default color and marker maps if not provided
     if color_map is None or marker_map is None:
@@ -1620,18 +1232,15 @@ def plot_neighborhood_preservation_by_k(results_df, output_dir, PNG_DPI=DEFAULT_
                     color = color_map.get(dataset, '#333333')
                     marker = marker_map.get(dataset, 'o')
                     line_style = _dataset_line_style(dataset)
-                    # Extract display name for legend - use Category 9 format if applicable
+                    # Extract display name for legend
                     import re
                     factor_range_mode = bool(re.search(r'_\d+factors_', dataset))
-                    if group_name and 'category-9' in group_name.lower():
-                        display_name = generate_category_9_label(dataset)
-                    else:
-                        # Include panel size in label if using panel-size-based coloring
-                        display_name = extract_display_name_from_dataset(
-                            dataset, 
-                            factor_range_mode=factor_range_mode,
-                            include_size=uses_size_coloring
-                        )
+                    # Include panel size in label if using panel-size-based coloring
+                    display_name = extract_display_name_from_dataset(
+                        dataset,
+                        factor_range_mode=factor_range_mode,
+                        include_size=uses_size_coloring
+                    )
                     plt.plot(
                         dataset_results['k'].astype(int), 
                         dataset_results['preservation_score'],
@@ -1653,7 +1262,7 @@ def plot_neighborhood_preservation_by_k(results_df, output_dir, PNG_DPI=DEFAULT_
             
             # Save figure with representation suffix
             fig_path = os.path.join(output_dir, f'neighborhood_preservation_by_k_{rep}.png')
-            plt.savefig(fig_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+            plt.savefig(fig_path, dpi=PNG_DPI, bbox_inches='tight')
             plt.close()
             
             logging.info(f"Saved neighborhood preservation plot ({rep.upper()}) to: {fig_path}")
@@ -1694,7 +1303,7 @@ def plot_neighborhood_preservation_by_k(results_df, output_dir, PNG_DPI=DEFAULT_
         
         # Save figure
         fig_path = os.path.join(output_dir, 'neighborhood_preservation_by_k.png')
-        plt.savefig(fig_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+        plt.savefig(fig_path, dpi=PNG_DPI, bbox_inches='tight')
         plt.close()
         
         logging.info(f"Saved neighborhood preservation line plot to: {fig_path}")
@@ -1703,289 +1312,95 @@ def plot_neighborhood_preservation_by_k(results_df, output_dir, PNG_DPI=DEFAULT_
     return saved_paths
 
 
-def plot_optimal_neighborhood_preservation(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI):
-    """
-    Create bar chart of optimal preservation scores per dataset.
-    Creates separate plots for PCA and NMF when both are present.
-    
-    Parameters:
-    -----------
-    results_df : DataFrame
-        Results from evaluate_neighborhood_preservation()
-    output_dir : str
-        Directory to save plot
-    DEFAULT_PNG_DPI : int
-        Resolution for saved figure
-        
-    Returns:
-    --------
-    list
-        List of paths to saved figures
-    """
-    # Create heatmap of optimal preservation scores
-    summary_results = results_df[results_df[COL_K] == 'optimal']
-    
-    if summary_results.empty:
-        logging.warning("No optimal k values found for plotting")
-        return []
-    
-    # Check if we have multiple representations
-    has_multiple_reps = 'representation' in summary_results.columns and summary_results['representation'].nunique() > 1
-    
-    saved_paths = []
-    
-    if has_multiple_reps:
-        # Create separate plots for each representation
-        representations = sorted(summary_results['representation'].unique())
-        # Filter out 'both' - we only want to plot pca and nmf separately
-        representations = [r for r in representations if r in ['pca', 'nmf']]
-        
-        for rep in representations:
-            rep_results = summary_results[summary_results['representation'] == rep].copy()
-            
-            # Sort datasets by preservation score
-            rep_results = rep_results.sort_values('preservation_score', ascending=False)
-            
-            # Create mapping of dataset names to display names
-            rep_results['display_name'] = rep_results['dataset'].apply(extract_display_name_from_dataset)
-            
-            plt.figure(figsize=(12, 8))
-            
-            # Create bar chart for optimal preservation scores using display names
-            bars = plt.bar(
-                rep_results['display_name'],
-                rep_results['preservation_score'],
-                color='skyblue'
-            )
-            
-            # Add optimal k labels on top of bars
-            for i, (_, row) in enumerate(rep_results.iterrows()):
-                plt.text(
-                    i, 
-                    row['preservation_score'] + 0.01, 
-                    f"k={row['optimal_k']}", 
-                    ha='center',
-                    va='bottom',
-                    fontweight='bold'
-                )
-                
-                # Add score value
-                plt.text(
-                    i, 
-                    row['preservation_score'] / 2, 
-                    f"{row['preservation_score']:.3f}", 
-                    ha='center',
-                    va='center',
-                    color='black'
-                )
-            
-            plt.xlabel('Geneset', fontsize=14)
-            plt.ylabel('Optimal Neighborhood Preservation Score', fontsize=14)
-            plt.title(f'Optimal Neighborhood Preservation by Geneset ({rep.upper()})', fontsize=16)
-            plt.xticks(rotation=45, ha='right')
-            plt.tight_layout()
-            plt.ylim(0, 1.05)
-            
-            # Save figure
-            bar_path = os.path.join(output_dir, f'optimal_neighborhood_preservation_{rep}.png')
-            plt.savefig(bar_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
-            plt.close()
-            
-            logging.info(f"Saved optimal neighborhood preservation bar chart ({rep.upper()}) to: {bar_path}")
-            saved_paths.append(bar_path)
-            
-    else:
-        # Single representation - single plot
-        # Sort datasets by preservation score
-        summary_results = summary_results.sort_values('preservation_score', ascending=False)
-        
-        # Create mapping of dataset names to display names
-        summary_results['display_name'] = summary_results['dataset'].apply(extract_display_name_from_dataset)
-        
-        plt.figure(figsize=(12, 8))
-        
-        # Create bar chart for optimal preservation scores using display names
-        bars = plt.bar(
-            summary_results['display_name'],
-            summary_results['preservation_score'],
-            color='skyblue'
-        )
-        
-        # Add optimal k labels on top of bars
-        for i, (_, row) in enumerate(summary_results.iterrows()):
-            plt.text(
-                i, 
-                row['preservation_score'] + 0.01, 
-                f"k={row['optimal_k']}", 
-                ha='center',
-                va='bottom',
-                fontweight='bold'
-            )
-            
-            # Add score value
-            plt.text(
-                i, 
-                row['preservation_score'] / 2, 
-                f"{row['preservation_score']:.3f}", 
-                ha='center',
-                va='center',
-                color='black'
-            )
-        
-        plt.xlabel('Geneset', fontsize=14)
-        plt.ylabel('Optimal Neighborhood Preservation Score', fontsize=14)
-        single_rep = summary_results['representation'].iloc[0].upper() if 'representation' in summary_results.columns else 'PCA'
-        plt.title(f'Optimal Neighborhood Preservation by Geneset ({single_rep})', fontsize=16)
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-        plt.ylim(0, 1.05)
-        
-        # Save figure
-        bar_path = os.path.join(output_dir, 'optimal_neighborhood_preservation.png')
-        plt.savefig(bar_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
-        plt.close()
-        
-        logging.info(f"Saved optimal neighborhood preservation bar chart to: {bar_path}")
-        saved_paths.append(bar_path)
-    
-    return saved_paths
+def plot_neighborhood_preservation_celltype_heatmap(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI):
+    """Heatmap of per-cell-type kNN Jaccard preservation (cell types x k).
 
+    ``evaluate_neighborhood_preservation`` writes, alongside the dataset-level
+    rows, one row per (cell type, k) holding that cell type's mean kNN Jaccard
+    between the probe-set and full-transcriptome embeddings. Those rows feed no
+    other plot. This produces one heatmap per (geneset, representation): rows =
+    cell types (sorted by mean Jaccard, descending), columns = k, colour =
+    preservation score.
 
-def plot_neighborhood_preservation_heatmap(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI):
-    """
-    Create heatmap of preservation scores across all k values and datasets.
-    Creates separate heatmaps for PCA and NMF when both are present.
-    
-    Parameters:
-    -----------
+    Parameters
+    ----------
     results_df : DataFrame
-        Results from evaluate_neighborhood_preservation()
+        Results from ``evaluate_neighborhood_preservation`` (needs a populated
+        ``celltype`` column).
     output_dir : str
-        Directory to save plot
-    DEFAULT_PNG_DPI : int
-        Resolution for saved figure
-        
-    Returns:
-    --------
+        Directory to save the heatmap(s).
+    PNG_DPI : int
+        Resolution for saved figures.
+
+    Returns
+    -------
     list
-        List of paths to saved figures
+        Paths of the saved figures (empty if no per-cell-type rows are present).
     """
-    # Filter numeric k values
-    numeric_results = results_df[results_df[COL_K] != 'optimal'].copy()
-    
-    if numeric_results.empty:
-        logging.warning("No numeric k values found for heatmap")
+    if COL_CELLTYPE not in results_df.columns:
+        logging.info("No 'celltype' column in neighborhood results -- skipping per-cell-type heatmap")
         return []
-    
-    # Check if we have multiple representations
-    has_multiple_reps = 'representation' in numeric_results.columns and numeric_results['representation'].nunique() > 1
-    
+
+    df = results_df[results_df[COL_K] != 'optimal'].copy()
+    _ct = df[COL_CELLTYPE]
+    df = df[_ct.notna() & ~_ct.astype(str).str.lower().isin(['', 'nan', 'none', 'global'])].copy()
+    if df.empty:
+        logging.info("No per-cell-type neighborhood rows found -- skipping per-cell-type heatmap")
+        return []
+
+    df['_k_int'] = pd.to_numeric(df[COL_K], errors='coerce')
+    df = df.dropna(subset=['_k_int'])
+    if df.empty:
+        logging.warning("No numeric k values in per-cell-type neighborhood rows")
+        return []
+
+    reps = sorted(df[COL_REPRESENTATION].unique()) if COL_REPRESENTATION in df.columns else [None]
+    reps = [r for r in reps if r in ('pca', 'nmf')] or [None]
+    datasets = list(df[COL_DATASET].unique()) if COL_DATASET in df.columns else [None]
+    multi_ds = len(datasets) > 1
+
     saved_paths = []
-    
-    if has_multiple_reps:
-        # Create separate heatmaps for each representation
-        representations = sorted(numeric_results['representation'].unique())
-        # Filter out 'both' - we only want to plot pca and nmf separately
-        representations = [r for r in representations if r in ['pca', 'nmf']]
-        
-        for rep in representations:
-            rep_results = numeric_results[numeric_results['representation'] == rep].copy()
-            
-            # Create mapping of dataset names to display names
-            # For heatmaps, we need unique row labels, so use full dataset name if panel sizes differ
-            import re
-            
-            # Check if we have multiple panel sizes
-            panel_sizes = set()
-            for dataset in rep_results['dataset'].unique():
-                size_match = re.search(r'_(\d+)(?:_|$)', dataset)
-                if size_match:
-                    panel_sizes.add(int(size_match.group(1)))
-            
-            # If multiple sizes, include size in display name to avoid duplicates
-            include_size_in_heatmap = len(panel_sizes) > 1
-            
-            dataset_display_names = {
-                dataset: extract_display_name_from_dataset(
-                    dataset, 
-                    factor_range_mode=bool(re.search(r'_\d+factors_', dataset)),
-                    include_size=include_size_in_heatmap
-                ) 
-                for dataset in rep_results['dataset'].unique()
-            }
-            rep_results['display_name'] = rep_results['dataset'].map(dataset_display_names)
-            
-            # Create heatmap comparing all datasets using display names
-            pivot_df = rep_results.pivot(
-                index='display_name', 
-                columns='k', 
-                values='preservation_score'
+    for rep in reps:
+        rep_df = df if rep is None else df[df[COL_REPRESENTATION] == rep]
+        rep_tag = f"_{rep}" if rep is not None else ""
+        for ds in datasets:
+            sub = rep_df if ds is None else rep_df[rep_df[COL_DATASET] == ds]
+            if sub.empty:
+                continue
+
+            pivot = sub.pivot_table(
+                index=COL_CELLTYPE, columns='_k_int',
+                values=COL_PRESERVATION_SCORE, aggfunc='mean',
             )
-            
-            plt.figure(figsize=(14, 10))
-            sns.heatmap(pivot_df, annot=True, cmap='viridis', fmt='.3f')
-            plt.title(f'Neighborhood Preservation Scores Across k Values ({rep.upper()})', fontsize=16)
-            plt.xlabel('k', fontsize=14)
-            plt.ylabel('Geneset', fontsize=14)
+            pivot = pivot.reindex(sorted(pivot.columns), axis=1)
+            pivot = pivot.loc[pivot.mean(axis=1).sort_values(ascending=False).index]
+            pivot.columns = [int(c) for c in pivot.columns]
+
+            n_ct = pivot.shape[0]
+            plt.figure(figsize=(10, max(6, n_ct * 0.42)))
+            sns.heatmap(pivot, annot=True, cmap='viridis', fmt='.2f',
+                        cbar_kws={'label': 'kNN Jaccard'})
+            rep_title = rep.upper() if rep else 'PCA'
+            ds_title = ""
+            if ds is not None and multi_ds:
+                ds_title = f" — {extract_display_name_from_dataset(ds)}"
+            plt.title(f'Per-cell-type kNN Jaccard across k ({rep_title}){ds_title}', fontsize=15)
+            plt.xlabel('Number of Neighbors (k)', fontsize=13)
+            plt.ylabel('Cell type', fontsize=13)
             plt.tight_layout()
-            
-            # Save heatmap
-            heatmap_path = os.path.join(output_dir, f'neighborhood_preservation_heatmap_{rep}.png')
-            plt.savefig(heatmap_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+
+            ds_tag = ""
+            if ds is not None and multi_ds:
+                _safe = str(extract_display_name_from_dataset(ds)).replace('/', '_').replace(' ', '_')
+                ds_tag = f"_{_safe}"
+            out_path = os.path.join(
+                output_dir, f'neighborhood_jaccard_by_celltype{ds_tag}{rep_tag}.png'
+            )
+            plt.savefig(out_path, dpi=PNG_DPI, bbox_inches='tight')
             plt.close()
-            
-            logging.info(f"Saved neighborhood preservation heatmap ({rep.upper()}) to: {heatmap_path}")
-            saved_paths.append(heatmap_path)
-            
-    else:
-        # Single representation - single heatmap
-        # Create mapping of dataset names to display names
-        import re
-        
-        # Check if we have multiple panel sizes
-        panel_sizes = set()
-        for dataset in numeric_results['dataset'].unique():
-            size_match = re.search(r'_(\d+)(?:_|$)', dataset)
-            if size_match:
-                panel_sizes.add(int(size_match.group(1)))
-        
-        # If multiple sizes, include size in display name to avoid duplicates
-        include_size_in_heatmap = len(panel_sizes) > 1
-        
-        dataset_display_names = {
-            dataset: extract_display_name_from_dataset(
-                dataset, 
-                factor_range_mode=bool(re.search(r'_\d+factors_', dataset)),
-                include_size=include_size_in_heatmap
-            ) 
-            for dataset in numeric_results['dataset'].unique()
-        }
-        numeric_results_copy = numeric_results.copy()
-        numeric_results_copy['display_name'] = numeric_results_copy['dataset'].map(dataset_display_names)
-        
-        # Create heatmap comparing all datasets using display names
-        pivot_df = numeric_results_copy.pivot(
-            index='display_name', 
-            columns='k', 
-            values='preservation_score'
-        )
-        
-        plt.figure(figsize=(14, 10))
-        sns.heatmap(pivot_df, annot=True, cmap='viridis', fmt='.3f')
-        single_rep = numeric_results['representation'].iloc[0].upper() if 'representation' in numeric_results.columns else 'PCA'
-        plt.title(f'Neighborhood Preservation Scores Across k Values ({single_rep})', fontsize=16)
-        plt.xlabel('k', fontsize=14)
-        plt.ylabel('Geneset', fontsize=14)
-        plt.tight_layout()
-        
-        # Save heatmap
-        heatmap_path = os.path.join(output_dir, 'neighborhood_preservation_heatmap.png')
-        plt.savefig(heatmap_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
-        plt.close()
-        
-        logging.info(f"Saved neighborhood preservation heatmap to: {heatmap_path}")
-        saved_paths.append(heatmap_path)
-    
+            logging.info(f"Saved per-cell-type neighborhood Jaccard heatmap to: {out_path}")
+            saved_paths.append(out_path)
+
     return saved_paths
 
 
@@ -2010,7 +1425,7 @@ def plot_clustering_quality_ari(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
         ['dataset', 'n_clusters', 'ARI', 'representation'] (legacy format)
     output_dir : str
         Directory to save plot
-    DEFAULT_PNG_DPI : int, optional
+    PNG_DPI : int, optional
         Resolution for saved figure
     color_map : dict, optional
         Dictionary mapping dataset names to colors
@@ -2064,32 +1479,6 @@ def plot_clustering_quality_ari(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
     # Get unique datasets
     dataset_names = list(ari_df['dataset'].unique())
     
-    # Group datasets by method type based on extracted strategy
-    # This properly handles new naming conventions
-    method_groups = {'benchmark': [], 'method_a': [], 'method_b': []}
-    
-    for d in dataset_names:
-        strategy, _ = extract_strategy_from_dataset_name(d)
-        
-        # Benchmark strategies: simple baselines, dimred-only, external panels
-        if any(b in strategy for b in ['Random', 'HVG', 'Spapros', 'spapros', '5k', 'mMulti', 
-                                       'deg_only', 'dt_simple', 'dt_deg',
-                                       'pca_global_method_a', 'pca_global_method_b',
-                                       'nmf_global_method_a', 'nmf_global_method_b',
-                                       'pca_per_celltype_method_a', 'pca_per_celltype_method_b',
-                                       'nmf_per_celltype_method_a', 'nmf_per_celltype_method_b',
-                                       'dimred_only']):
-            method_groups['benchmark'].append(d)
-        # Method A: combination strategies with method_a
-        elif 'method_a' in strategy and ('dt_pca' in strategy or 'dt_nmf' in strategy):
-            method_groups['method_a'].append(d)
-        # Method B: combination strategies with method_b
-        elif 'method_b' in strategy and ('dt_pca' in strategy or 'dt_nmf' in strategy):
-            method_groups['method_b'].append(d)
-        else:
-            # Default to benchmark for unknown patterns
-            method_groups['benchmark'].append(d)
-    
     # Check if we have dim_reduction column with multiple dimensionality reduction methods
     has_dim_reduction = 'dim_reduction' in ari_df.columns
     if has_dim_reduction:
@@ -2124,25 +1513,20 @@ def plot_clustering_quality_ari(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
         if include_size:
             logging.info(f"Multiple panel sizes detected: {sorted(panel_sizes)} - including size in labels")
         
-        # Plot benchmark methods
-        for dataset in method_groups['benchmark']:
+        # Plot every dataset
+        for dataset in dataset_names:
             dataset_results = df_to_plot[df_to_plot['dataset'] == dataset]
             # Filter out NaN values
             numeric_clusters = dataset_results[dataset_results['n_clusters'].notna()]
-            
+
             if not numeric_clusters.empty:
                 color = color_map.get(dataset, '#333333')
                 marker = marker_map.get(dataset, 'o')
                 # Extract display name for legend
-                # Check for factor-range mode by looking at dataset names
                 factor_range_mode = bool(re.search(r'_\d+factors_', dataset))
-                # Use Category 9 format if applicable, factor-range format if detected, otherwise standard
-                if group_name and 'category-9' in group_name.lower():
-                    display_name = generate_category_9_label(dataset)
-                else:
-                    display_name = extract_display_name_from_dataset(dataset, factor_range_mode=factor_range_mode, include_size=include_size)
+                display_name = extract_display_name_from_dataset(dataset, factor_range_mode=factor_range_mode, include_size=include_size)
                 plt.plot(
-                    numeric_clusters['n_clusters'], 
+                    numeric_clusters['n_clusters'],
                     numeric_clusters['score'],
                     marker=marker,
                     linestyle='-',
@@ -2151,61 +1535,7 @@ def plot_clustering_quality_ari(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
                     linewidth=2,
                     markersize=6
                 )
-        
-        # Plot Method A datasets
-        for dataset in method_groups['method_a']:
-            dataset_results = df_to_plot[df_to_plot['dataset'] == dataset]
-            numeric_clusters = dataset_results[dataset_results['n_clusters'].notna()]
-            
-            if not numeric_clusters.empty:
-                color = color_map.get(dataset, '#333333')
-                marker = marker_map.get(dataset, 'o')
-                # Extract display name for legend
-                import re
-                factor_range_mode = bool(re.search(r'_\d+factors_', dataset))
-                # Use Category 9 format if applicable, factor-range format if detected, otherwise standard
-                if group_name and 'category-9' in group_name.lower():
-                    display_name = generate_category_9_label(dataset)
-                else:
-                    display_name = extract_display_name_from_dataset(dataset, factor_range_mode=factor_range_mode, include_size=include_size)
-                plt.plot(
-                    numeric_clusters['n_clusters'], 
-                    numeric_clusters['score'],
-                    marker=marker,
-                    linestyle='-',
-                    label=display_name,  # Use display name instead of full dataset name
-                    color=color,
-                    linewidth=2,
-                    markersize=6
-                )
-        
-        # Plot Method B datasets
-        for dataset in method_groups['method_b']:
-            dataset_results = df_to_plot[df_to_plot['dataset'] == dataset]
-            numeric_clusters = dataset_results[dataset_results['n_clusters'].notna()]
-            
-            if not numeric_clusters.empty:
-                color = color_map.get(dataset, '#333333')
-                marker = marker_map.get(dataset, 'o')
-                # Extract display name for legend
-                import re
-                factor_range_mode = bool(re.search(r'_\d+factors_', dataset))
-                # Use Category 9 format if applicable, factor-range format if detected, otherwise standard
-                if group_name and 'category-9' in group_name.lower():
-                    display_name = generate_category_9_label(dataset)
-                else:
-                    display_name = extract_display_name_from_dataset(dataset, factor_range_mode=factor_range_mode, include_size=include_size)
-                plt.plot(
-                    numeric_clusters['n_clusters'], 
-                    numeric_clusters['score'],
-                    marker=marker,
-                    linestyle='-',
-                    label=display_name,  # Use display name instead of full dataset name
-                    color=color,
-                    linewidth=2,
-                    markersize=6
-                )
-        
+
         plt.xlabel('Number of Clusters', fontsize=14)
         plt.ylabel('Adjusted Rand Index (ARI)', fontsize=14)
         plt.xticks(rotation=45, ha='right')  # Rotate x-axis labels for better readability
@@ -2236,7 +1566,7 @@ def plot_clustering_quality_ari(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
         filename = '_'.join(filename_parts) + '.png'
         
         fig_path = os.path.join(output_dir, filename)
-        plt.savefig(fig_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+        plt.savefig(fig_path, dpi=PNG_DPI, bbox_inches='tight')
         plt.close()
         gc.collect()
         
@@ -2263,7 +1593,7 @@ def plot_clustering_quality_nmi(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
         ['dataset', 'n_clusters', 'NMI', 'representation'] (legacy format)
     output_dir : str
         Directory to save plot
-    DEFAULT_PNG_DPI : int, optional
+    PNG_DPI : int, optional
         Resolution for saved figure
     color_map : dict, optional
         Dictionary mapping dataset names to colors
@@ -2319,32 +1649,6 @@ def plot_clustering_quality_nmi(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
     # Get unique datasets
     dataset_names = list(nmi_df['dataset'].unique())
     
-    # Group datasets by method type based on extracted strategy
-    # This properly handles new naming conventions
-    method_groups = {'benchmark': [], 'method_a': [], 'method_b': []}
-    
-    for d in dataset_names:
-        strategy, _ = extract_strategy_from_dataset_name(d)
-        
-        # Benchmark strategies: simple baselines, dimred-only, external panels
-        if any(b in strategy for b in ['Random', 'HVG', 'Spapros', 'spapros', '5k', 'mMulti', 
-                                       'deg_only', 'dt_simple', 'dt_deg',
-                                       'pca_global_method_a', 'pca_global_method_b',
-                                       'nmf_global_method_a', 'nmf_global_method_b',
-                                       'pca_per_celltype_method_a', 'pca_per_celltype_method_b',
-                                       'nmf_per_celltype_method_a', 'nmf_per_celltype_method_b',
-                                       'dimred_only']):
-            method_groups['benchmark'].append(d)
-        # Method A: combination strategies with method_a
-        elif 'method_a' in strategy and ('dt_pca' in strategy or 'dt_nmf' in strategy):
-            method_groups['method_a'].append(d)
-        # Method B: combination strategies with method_b
-        elif 'method_b' in strategy and ('dt_pca' in strategy or 'dt_nmf' in strategy):
-            method_groups['method_b'].append(d)
-        else:
-            # Default to benchmark for unknown patterns
-            method_groups['benchmark'].append(d)
-    
     # Check if we have dim_reduction column with multiple dimensionality reduction methods
     has_dim_reduction = 'dim_reduction' in nmi_df.columns
     if has_dim_reduction:
@@ -2379,24 +1683,20 @@ def plot_clustering_quality_nmi(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
         if include_size:
             logging.info(f"Multiple panel sizes detected: {sorted(panel_sizes)} - including size in labels")
         
-        # Plot benchmark methods
-        for dataset in method_groups['benchmark']:
+        # Plot every dataset
+        for dataset in dataset_names:
             dataset_results = df_to_plot[df_to_plot['dataset'] == dataset]
             numeric_clusters = dataset_results[dataset_results['n_clusters'].notna()]
-            
+
             if not numeric_clusters.empty:
                 color = color_map.get(dataset, '#333333')
                 marker = marker_map.get(dataset, 'o')
                 line_style = _dataset_line_style(dataset)
                 # Extract display name for legend
                 factor_range_mode = bool(re.search(r'_\d+factors_', dataset))
-                # Use Category 9 format if applicable, factor-range format if detected, otherwise standard
-                if group_name and 'category-9' in group_name.lower():
-                    display_name = generate_category_9_label(dataset)
-                else:
-                    display_name = extract_display_name_from_dataset(dataset, factor_range_mode=factor_range_mode, include_size=include_size)
+                display_name = extract_display_name_from_dataset(dataset, factor_range_mode=factor_range_mode, include_size=include_size)
                 plt.plot(
-                    numeric_clusters['n_clusters'], 
+                    numeric_clusters['n_clusters'],
                     numeric_clusters['score'],
                     marker=marker,
                     linestyle=line_style,
@@ -2407,67 +1707,7 @@ def plot_clustering_quality_nmi(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
                     markeredgecolor='white',
                     markeredgewidth=1.0,
                 )
-        
-        # Plot Method A datasets
-        for dataset in method_groups['method_a']:
-            dataset_results = df_to_plot[df_to_plot['dataset'] == dataset]
-            numeric_clusters = dataset_results[dataset_results['n_clusters'].notna()]
-            
-            if not numeric_clusters.empty:
-                color = color_map.get(dataset, '#1f77b4')
-                marker = marker_map.get(dataset, 'o')
-                line_style = _dataset_line_style(dataset)
-                # Extract display name for legend
-                import re
-                factor_range_mode = bool(re.search(r'_\d+factors_', dataset))
-                # Use Category 9 format if applicable, factor-range format if detected, otherwise standard
-                if group_name and 'category-9' in group_name.lower():
-                    display_name = generate_category_9_label(dataset)
-                else:
-                    display_name = extract_display_name_from_dataset(dataset, factor_range_mode=factor_range_mode, include_size=include_size)
-                plt.plot(
-                    numeric_clusters['n_clusters'], 
-                    numeric_clusters['score'],
-                    marker=marker,
-                    linestyle=line_style,
-                    label=display_name,  # Use display name instead of full dataset name
-                    color=color,
-                    linewidth=2.4,
-                    markersize=8,
-                    markeredgecolor='white',
-                    markeredgewidth=1.0,
-                )
-                
-        # Plot Method B datasets
-        for dataset in method_groups['method_b']:
-            dataset_results = df_to_plot[df_to_plot['dataset'] == dataset]
-            numeric_clusters = dataset_results[dataset_results['n_clusters'].notna()]
-            
-            if not numeric_clusters.empty:
-                color = color_map.get(dataset, '#d62728')
-                marker = marker_map.get(dataset, 'o')
-                line_style = _dataset_line_style(dataset)
-                # Extract display name for legend
-                import re
-                factor_range_mode = bool(re.search(r'_\d+factors_', dataset))
-                # Use Category 9 format if applicable, factor-range format if detected, otherwise standard
-                if group_name and 'category-9' in group_name.lower():
-                    display_name = generate_category_9_label(dataset)
-                else:
-                    display_name = extract_display_name_from_dataset(dataset, factor_range_mode=factor_range_mode, include_size=include_size)
-                plt.plot(
-                    numeric_clusters['n_clusters'], 
-                    numeric_clusters['score'],
-                    marker=marker,
-                    linestyle=line_style,
-                    label=display_name,  # Use display name instead of full dataset name
-                    color=color,
-                    linewidth=2.4,
-                    markersize=8,
-                    markeredgecolor='white',
-                    markeredgewidth=1.0,
-                )
-        
+
         plt.xlabel('Number of Clusters', fontsize=14)
         plt.ylabel('Normalized Mutual Information (NMI)', fontsize=14)
         plt.xticks(rotation=45, ha='right')  # Rotate x-axis labels for better readability
@@ -2498,7 +1738,7 @@ def plot_clustering_quality_nmi(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI,
         filename = '_'.join(filename_parts) + '.png'
         
         fig_path = os.path.join(output_dir, filename)
-        plt.savefig(fig_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+        plt.savefig(fig_path, dpi=PNG_DPI, bbox_inches='tight')
         plt.close()
         gc.collect()
         
@@ -2524,7 +1764,7 @@ def plot_celltype_f1_heatmap(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI):
         ['dataset', 'celltype', 'precision', 'recall', 'f1-score', 'support', 'accuracy']
     output_dir : str
         Directory to save plot
-    DEFAULT_PNG_DPI : int
+    PNG_DPI : int
         Resolution for saved figure
         
     Returns:
@@ -2616,12 +1856,8 @@ def plot_celltype_f1_heatmap(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI):
     
     # Save the heatmap
     heatmap_path = os.path.join(output_dir, 'celltype_f1score_heatmap.png')
-    plt.savefig(heatmap_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
-    
-    # Also save as PDF
-    pdf_path = os.path.join(output_dir, 'celltype_f1score_heatmap.pdf')
-    plt.savefig(pdf_path, bbox_inches='tight')
-    
+    plt.savefig(heatmap_path, dpi=PNG_DPI, bbox_inches='tight')
+
     # Save the pivot table as CSV
     csv_output_path = os.path.join(output_dir, 'celltype_f1score_matrix.csv')
     heatmap_data.to_csv(csv_output_path)
@@ -2635,31 +1871,42 @@ def plot_celltype_f1_heatmap(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI):
     return heatmap_path
 
 
-def plot_celltype_accuracy_barchart(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI):
+# Palette matched to Benchmark_seed-analysis/aggregated/.../seedvar_clustering_*_ari.svg
+_CELLTYPE_DIAG_MACRO_COLOR = '#42a5f5'     # blue      (ref plot's "RecoVar" series)
+_CELLTYPE_DIAG_WEIGHTED_COLOR = '#00838f'  # teal      (ref plot's "Spapros" series)
+_CELLTYPE_DIAG_ACCURACY_COLOR = '#1565c0'  # dark blue (ref plot's "NSForest" series)
+_CELLTYPE_DIAG_REFLINE_COLOR = '#ad1457'   # magenta   (ref plot's "geneBasis" series)
+
+
+def plot_celltype_classification_diagnostics_global(results_df, output_dir, PNG_DPI=DEFAULT_PNG_DPI):
     """
-    Create bar chart of classification accuracy by geneset.
-    
+    Combined global (dataset-level, non-per-celltype) classification diagnostics:
+    three side-by-side bar-chart panels -- Macro F1, Weighted F1, and Accuracy, one
+    bar per geneset each -- as a single figure. Replaces the separate
+    ``plot_celltype_accuracy_barchart()`` / ``plot_celltype_macro_weighted_f1_barchart()``.
+
     Parameters:
     -----------
     results_df : DataFrame
-        Results from evaluate_celltype_identification()
+        Results from evaluate_celltype_identification(); dataset-level rows carry
+        ``accuracy``, ``macro_f1``, ``weighted_f1``.
     output_dir : str
         Directory to save plot
-    DEFAULT_PNG_DPI : int
+    PNG_DPI : int
         Resolution for saved figure
-        
+
     Returns:
     --------
     str
-        Path to saved figure
+        Path to saved figure, or None if no dataset-level rows are found.
     """
     # Get dataset-level results (summary rows without celltype)
     dataset_results = results_df[results_df[COL_CELLTYPE].isna()].copy()
-    
-    if dataset_results.empty:
-        logging.warning("No dataset-level results found for bar chart")
+
+    if dataset_results.empty or 'weighted_f1' not in dataset_results.columns:
+        logging.warning("No dataset-level celltype-classification results found for diagnostics plot")
         return None
-    
+
     # Check if we have multiple panel sizes - if so, include size in display names
     import re
     panel_sizes = set()
@@ -2667,231 +1914,174 @@ def plot_celltype_accuracy_barchart(results_df, output_dir, PNG_DPI=DEFAULT_PNG_
         size_match = re.search(r'_(\d+)(?:_|$)', dataset)
         if size_match:
             panel_sizes.add(int(size_match.group(1)))
-    
+
     include_size = len(panel_sizes) > 1
     if include_size:
         logging.info(f"Multiple panel sizes detected: {sorted(panel_sizes)} - including size in labels")
-    
-    # Create mapping of original dataset names to display names
+
     dataset_results['display_name'] = dataset_results['dataset'].apply(
         lambda x: extract_display_name_from_dataset(x, include_size=include_size)
     )
-    
-    # Sort datasets by accuracy
-    dataset_results_sorted = dataset_results.sort_values('accuracy', ascending=False)
-    
-    # Plot accuracy by geneset
-    plt.figure(figsize=(12, 8))
-    scatter = plt.bar(
-        dataset_results_sorted['display_name'],
-        dataset_results_sorted['accuracy'],
-        color='skyblue'
-    )
-    
-    # Add value labels on top of bars
-    for i, v in enumerate(dataset_results_sorted['accuracy']):
-        plt.text(i, v + 0.01, f'{v:.3f}', ha='center')
-    
-    plt.xlabel('Geneset')
-    plt.ylabel('Classification Accuracy')
-    plt.title('Celltype Identification Accuracy by Geneset')
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-    plt.ylim(0, 1.05)  # Set y-axis limit to include the value labels
-    
-    # Add a reference line for the maximum accuracy
-    if not dataset_results.empty:
-        plt.axhline(
-            y=dataset_results_sorted['accuracy'].max(),
-            linestyle='--',
-            color='red',
-            alpha=0.5,
-            label=f'Max Accuracy: {dataset_results_sorted["accuracy"].max():.3f}'
-        )
-        plt.legend()
-    
-    # Save the bar chart
-    bar_path = os.path.join(output_dir, 'celltype_identification_accuracy_barchart.png')
-    plt.savefig(bar_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
-    plt.close()
-    
-    logging.info(f"Saved celltype accuracy bar chart to: {bar_path}")
+    # Single shared ordering (by macro_f1) so all three panels' bars line up per geneset.
+    dataset_results_sorted = dataset_results.sort_values('macro_f1', ascending=False)
+
+    x = np.arange(len(dataset_results_sorted))
+    n = len(dataset_results_sorted)
+    fig, axes = plt.subplots(1, 3, figsize=(max(10, n * 1.2) * 3, 8))
+
+    panel_specs = [
+        (axes[0], 'macro_f1', 'Macro F1', 'F1 Score', _CELLTYPE_DIAG_MACRO_COLOR, False),
+        (axes[1], 'weighted_f1', 'Weighted F1', 'F1 Score', _CELLTYPE_DIAG_WEIGHTED_COLOR, False),
+        (axes[2], 'accuracy', 'Accuracy', 'Classification Accuracy', _CELLTYPE_DIAG_ACCURACY_COLOR, True),
+    ]
+    for ax, col, title, ylabel, color, show_max_line in panel_specs:
+        values = dataset_results_sorted[col]
+        bars = ax.bar(x, values, color=color)
+        for bar, v in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01, f'{v:.3f}', ha='center')
+
+        if show_max_line:
+            max_val = values.max()
+            ax.axhline(
+                y=max_val, linestyle='--', color=_CELLTYPE_DIAG_REFLINE_COLOR, alpha=0.7,
+                label=f'Max Accuracy: {max_val:.3f}'
+            )
+            ax.legend()
+
+        ax.set_xlabel('Geneset')
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.set_xticks(x)
+        ax.set_xticklabels(dataset_results_sorted['display_name'], rotation=45, ha='right')
+        ax.set_ylim(0, 1.05)
+
+    fig.suptitle('Celltype Classification Diagnostics by Geneset', fontsize=13, fontweight='bold')
+    fig.tight_layout()
+
+    bar_path = os.path.join(output_dir, 'celltype_classification_diagnostics_global.png')
+    fig.savefig(bar_path, dpi=PNG_DPI, bbox_inches='tight')
+    plt.close(fig)
+
+    logging.info(f"Saved combined celltype classification diagnostics to: {bar_path}")
     return bar_path
 
-def plot_feature_importance_heatmap(feature_importance_df, dataset_name, output_dir, PNG_DPI=DEFAULT_PNG_DPI):
+
+def plot_confusion_matrix(y_test, y_pred, class_names, dataset_name, accuracy, macro_f1,
+                          output_dir, PNG_DPI=DEFAULT_PNG_DPI, normalize=None):
     """
-    Create heatmap of feature importances from decision tree classifier.
-    
+    Create a confusion-matrix heatmap for celltype classification results.
+
     Parameters:
     -----------
-    feature_importance_df : DataFrame
-        DataFrame with columns ['gene', 'importance'], sorted by importance
-    dataset_name : str
-        Name of the dataset for title
-    output_dir : str
-        Directory to save plot (should be feature_importances subdirectory)
-    DEFAULT_PNG_DPI : int
-        Resolution for saved figure
-        
-    Returns:
-    --------
-    str
-        Path to saved figure
-    """
-    # Reshape data for heatmap: each gene gets one row
-    n_genes = len(feature_importance_df)
-    
-    # Create figure with appropriate height based on number of genes
-    fig_height = max(8, n_genes * 0.25)  # At least 8 inches, scale with gene count
-    fig_width = 10
-    
-    plt.figure(figsize=(fig_width, fig_height))
-    
-    # Create a DataFrame suitable for heatmap (genes × importance)
-    # We'll create a single column heatmap
-    heatmap_data = feature_importance_df.set_index('gene')[['importance']]
-    
-    # Create heatmap
-    ax = sns.heatmap(
-        heatmap_data,
-        cmap='YlOrRd',
-        linewidths=0.5,
-        cbar_kws={'label': 'Feature Importance'},
-        vmin=0,
-        vmax=feature_importance_df['importance'].max(),
-        annot=True,  # Show importance values
-        fmt='.4f',   # Format to 4 decimal places
-        xticklabels=['Importance'],
-        yticklabels=feature_importance_df['gene'].tolist()
-    )
-    
-    plt.title(f'Feature Importance for Cell Type Classification\n{dataset_name}', 
-              fontsize=14, pad=20)
-    plt.xlabel('')
-    plt.ylabel('Gene', fontsize=12, labelpad=10)
-    
-    # Adjust y-axis font size based on number of genes
-    if n_genes > 100:
-        plt.yticks(fontsize=5)
-    elif n_genes > 50:
-        plt.yticks(fontsize=7)
-    else:
-        plt.yticks(fontsize=9)
-    
-    plt.tight_layout()
-    
-    # Save the heatmap
-    feat_plot_path = os.path.join(output_dir, f'{dataset_name}_feature_importance_heatmap.png')
-    plt.savefig(feat_plot_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
-    plt.close()
-    
-    logging.info(f"Saved feature importance heatmap to: {feat_plot_path}")
-    return feat_plot_path
-
-
-def plot_confusion_matrix(y_test, y_pred, class_names, dataset_name, accuracy, macro_f1, output_dir, PNG_DPI=DEFAULT_PNG_DPI):
-    """
-    Create confusion matrix heatmap for celltype classification results.
-    
-    Parameters:
-    -----------
-    y_test : array-like
-        True celltype labels
-    y_pred : array-like
-        Predicted celltype labels
+    y_test, y_pred : array-like
+        True and predicted celltype labels.
     class_names : list
-        List of class names (celltypes) in order
+        Class names (celltypes), in the order to display.
     dataset_name : str
-        Name of the dataset for title
-    accuracy : float
-        Overall classification accuracy
-    macro_f1 : float
-        Macro F1-score
+        Name of the dataset (shortened to its method name via
+        ``extract_display_name_from_dataset`` for the title; settings/seed/size stay
+        in the output folder path, not the filename).
+    accuracy, macro_f1 : float
+        Overall accuracy and macro F1 (shown in the title).
     output_dir : str
-        Directory to save plot
-    DEFAULT_PNG_DPI : int
-        Resolution for saved figure
-        
+        Directory to save the plot.
+    PNG_DPI : int
+        Resolution for the saved figure.
+    normalize : {None, 'true'}, optional
+        None  -> raw counts, integer annotations, file ``confusion_matrix.png``.
+        'true' -> each row divided by its sum (recall / row-stochastic), 2-decimal
+                  annotations, file ``confusion_matrix_normalized.png``.
+                  Best for spotting *which* type a class is confused with, since
+                  raw counts are dominated by the large classes.
+
     Returns:
     --------
     str
-        Path to saved figure
+        Path to the saved figure.
     """
     from sklearn.metrics import confusion_matrix
-    
-    # Calculate per-class metrics
+
     cm = confusion_matrix(y_test, y_pred, labels=class_names)
-    cm_df = pd.DataFrame(cm, 
-                        index=class_names, 
-                        columns=class_names)
-    
-    # Create confusion matrix plot
-    plt.figure(figsize=(12, 10))
-    sns.heatmap(cm_df, annot=True, fmt='d', cmap='Blues')
-    plt.title(f'Confusion Matrix - {dataset_name}\nAccuracy: {accuracy:.4f} | Macro F1: {macro_f1:.4f}')
+    if normalize == 'true':
+        with np.errstate(all='ignore'):
+            cm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+        cm = np.nan_to_num(cm)
+        fmt, cbar_lbl, suffix = '.2f', 'fraction of true class', '_normalized'
+    else:
+        fmt, cbar_lbl, suffix = 'd', 'cells', ''
+    cm_df = pd.DataFrame(cm, index=class_names, columns=class_names)
+
+    n = len(class_names)
+    plt.figure(figsize=(max(10, 0.7 * n + 3), max(8, 0.6 * n + 2)))
+    sns.heatmap(cm_df, annot=True, fmt=fmt, cmap='Blues',
+                cbar_kws={'label': cbar_lbl},
+                vmin=0, vmax=(1.0 if normalize == 'true' else None))
+    method_name = extract_display_name_from_dataset(dataset_name)
+    plt.title(f'Confusion Matrix{" (row-normalised)" if normalize == "true" else ""} - {method_name}\n'
+              f'Accuracy: {accuracy:.4f} | Macro F1: {macro_f1:.4f}')
     plt.ylabel('True Celltype')
     plt.xlabel('Predicted Celltype')
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
     plt.tight_layout()
-    
-    # Save confusion matrix figure
-    cm_path = os.path.join(output_dir, f'{dataset_name}_confusion_matrix.png')
-    plt.savefig(cm_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+
+    # Settings/strategy info stays in the output folder path, not the filename.
+    cm_path = os.path.join(output_dir, f'confusion_matrix{suffix}.png')
+    plt.savefig(cm_path, dpi=PNG_DPI, bbox_inches='tight')
     plt.close()
-    
     logging.info(f"Saved confusion matrix to: {cm_path}")
     return cm_path
 
 
-def plot_decision_tree_visualization(dt_classifier, feature_names, class_names, dataset_name, output_dir, PNG_DPI=DEFAULT_PNG_DPI, max_depth=3):
+def plot_celltype_class_sizes(class_counts, output_dir, dataset_name=None,
+                              PNG_DPI=DEFAULT_PNG_DPI, log_scale=False):
     """
-    Create decision tree visualization (truncated to specified depth for readability).
-    
+    Horizontal bar chart of the number of cells per class in a cell-type
+    annotation column.
+
     Parameters:
     -----------
-    dt_classifier : DecisionTreeClassifier
-        Trained decision tree classifier
-    feature_names : list
-        List of feature names (genes)
-    class_names : list
-        List of class names (celltypes)
-    dataset_name : str
-        Name of the dataset for title
+    class_counts : pandas.Series or dict
+        celltype -> n_cells.
     output_dir : str
-        Directory to save plot
-    DEFAULT_PNG_DPI : int
-        Resolution for saved figure
-    max_depth : int, optional (default: 3)
-        Maximum depth to display (for readability)
-        
+        Directory to save the plot (+ a matching ``.csv``).
+    dataset_name : str, optional
+        Shown in the title and prefixed to the filenames.
+    PNG_DPI : int
+        Resolution for the saved figure.
+    log_scale : bool
+        Log-scale the count axis (useful for very skewed class sizes).
+
     Returns:
     --------
-    str or None
-        Path to saved figure, or None if plotting failed
+    str
+        Path to the saved figure.
     """
-    from sklearn.tree import plot_tree
-    
-    plt.figure(figsize=(20, 12))
-    try:
-        plot_tree(dt_classifier, 
-                max_depth=max_depth, 
-                feature_names=feature_names,
-                class_names=class_names,
-                filled=True, 
-                rounded=True)
-        plt.title(f'Decision Tree Visualization - {dataset_name} (Truncated to depth {max_depth})')
-        
-        # Save decision tree figure
-        dt_path = os.path.join(output_dir, f'{dataset_name}_decision_tree.png')
-        plt.savefig(dt_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
-        plt.close()
-        
-        logging.info(f"Saved decision tree visualization to: {dt_path}")
-        return dt_path
-        
-    except Exception as e:
-        logging.error(f"Error plotting decision tree: {e}")
-        plt.close()
-        return None
+    s = pd.Series(class_counts).sort_values(ascending=True)
+    total = int(s.sum())
+    prefix = f'{dataset_name}_' if dataset_name else ''
+
+    fig, ax = plt.subplots(figsize=(10, max(4, 0.45 * len(s) + 1.5)))
+    bars = ax.barh(s.index.astype(str), s.values, color='#4C72B0', edgecolor='black', linewidth=0.5)
+    for b, v in zip(bars, s.values):
+        ax.text(b.get_width(), b.get_y() + b.get_height() / 2,
+                f' {int(v):,} ({v / total * 100:.1f}%)', va='center', fontsize=9)
+    if log_scale:
+        ax.set_xscale('log')
+    ax.set_xlabel('number of cells' + (' (log scale)' if log_scale else ''))
+    ax.set_ylabel('cell type')
+    ax.set_title(f'Cells per class{" - " + dataset_name if dataset_name else ""}  (n = {total:,})')
+    ax.margins(x=0.15)
+    fig.tight_layout()
+
+    png = os.path.join(output_dir, f'{prefix}celltype_class_sizes.png')
+    fig.savefig(png, dpi=PNG_DPI, bbox_inches='tight')
+    plt.close(fig)
+    s.sort_values(ascending=False).rename('n_cells').to_csv(
+        os.path.join(output_dir, f'{prefix}celltype_class_sizes.csv'))
+    logging.info(f"Saved cells-per-class bar chart to: {png}")
+    return png
+
 
 ##############################################################################
 # SIMPLY PLOT UMAP WITH GENE EXPRESSION OF EACH PROBE
@@ -2911,7 +2101,7 @@ def create_feature_plots(ref_data, gene_lists, output_dir, logger, PNG_DPI=DEFAU
         Base directory to save the feature plots
     logger : logging.Logger
         Logger instance
-    DEFAULT_PNG_DPI : int
+    PNG_DPI : int
         Resolution for saved PNG images (default: 300)
     """
     # Create directory for feature plots
@@ -2988,7 +2178,7 @@ def create_feature_plots(ref_data, gene_lists, output_dir, logger, PNG_DPI=DEFAU
                 plt.tight_layout()
                 
                 gene_path = os.path.join(geneset_dir, f"{name}_{gene}_featureplot.png")
-                plt.savefig(gene_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+                plt.savefig(gene_path, dpi=PNG_DPI, bbox_inches='tight')
                 plt.close()
                 
                 # Log progress periodically

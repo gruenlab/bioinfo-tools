@@ -2,7 +2,7 @@
 
 This module provides utilities to:
 - Load gene lists from selection pipeline output directories.
-- Preprocess probe-panel subsets: normalize, compute PCA/NMF,
+- Preprocess probe-panel subsets: normalize, compute PCA,
   build Leiden clusters and KNN graphs.
 - Preprocess the full-transcriptome reference dataset using the same
   pipeline for fair comparison.
@@ -21,11 +21,9 @@ import logging
 import os
 import sys
 import glob
-import gc
 import re
 from pathlib import Path
 from scipy.sparse import issparse
-from sklearn.decomposition import NMF
 
 import scanpy as sc
 import pandas as pd
@@ -43,30 +41,18 @@ __all__ = [
     "load_all_gene_lists",
     "process_data_for_panel_evaluation",
     "preprocess_reference_dataset",
+    "filter_reference_blacklist",
 ]
 
 # ===================================================================
-# UTILITY IMPORTS WITH GRACEFUL FALLBACK
+# UTILITY IMPORTS
 # ===================================================================
 
-try:
-    from _validation import is_anndata_raw, is_anndata_raw_layer
-except ImportError:
-    try:
-        _util_dir = Path(__file__).parent.parent / "Utility-module"
-        if _util_dir.exists() and str(_util_dir) not in sys.path:
-            sys.path.insert(0, str(_util_dir))
-        from _validation import is_anndata_raw, is_anndata_raw_layer
-    except ImportError:
-        logger.warning("Could not import validation utilities; using stubs. Pipeline will inject these at runtime.")
-
-        def is_anndata_raw(adata: object) -> bool:
-            """Stub: assume raw — conservative default when validation module is unavailable."""
-            return True
-
-        def is_anndata_raw_layer(adata: object, layer: str) -> bool:
-            """Stub: assume raw."""
-            return True
+# Canonical raw-count check — hard import (one _validation.py in the cut).
+_util_dir = Path(__file__).parent.parent / "Utility-module"
+if str(_util_dir) not in sys.path:
+    sys.path.insert(0, str(_util_dir))
+from _validation import is_anndata_raw, is_anndata_raw_layer
 
 try:
     from _utils import convert_ensembl_to_gene_symbols
@@ -80,6 +66,15 @@ except ImportError:
         def convert_ensembl_to_gene_symbols(adata: object, inplace: bool = True) -> None:
             """Stub: no-op."""
             pass
+
+try:
+    _selection_dir = Path(__file__).parent.parent / "Selection-module"
+    if _selection_dir.exists() and str(_selection_dir) not in sys.path:
+        sys.path.insert(0, str(_selection_dir))
+    from _filtering import apply_blacklist_filter
+except ImportError:
+    logger.warning("Could not import apply_blacklist_filter from Selection-module; reference blacklist filtering will be unavailable.")
+    apply_blacklist_filter = None
 
 
 # ===================================================================
@@ -269,7 +264,8 @@ def load_gene_list_from_csv(filepath: str) -> list[str]:
     1. Single column with genes (may or may not have header)
     2. Multi-column with a 'gene' column (e.g., NS-Forest format)
     3. First column contains genes (standard format)
-    4. ranked_gene_list.csv with 'final_selection' column (filters to True values)
+    4. A single-strategy panel-information CSV with an 'in_panel' (or legacy
+       'final_selection'/'selected_final') column (filters to True values)
 
     Args:
         filepath: Path to CSV file.
@@ -285,15 +281,22 @@ def load_gene_list_from_csv(filepath: str) -> list[str]:
     try:
         df = pd.read_csv(filepath)
 
-        # Check if this is a ranked_gene_list.csv with final_selection column
-        if 'final_selection' in df.columns and 'gene' in df.columns:
-            logger.info(f"Found ranked_gene_list.csv format with final_selection column in {os.path.basename(filepath)}")
-            # Filter to only genes where final_selection == True
-            df_selected = df[df['final_selection'] == True]
-            genes = df_selected['gene'].tolist()
-            logger.info(f"Filtered to {len(genes)} genes with final_selection=True (from {len(df)} total genes)")
-            genes = [g for g in genes if pd.notna(g)]
-            return genes
+        # Check if this is a panel-information/ranked-gene-list CSV with a panel-membership column
+        if 'gene' in df.columns:
+            for panel_col in ('final_selection', 'in_panel', 'selected_final'):
+                if panel_col in df.columns:
+                    logger.info(
+                        f"Found panel-information format with '{panel_col}' column in "
+                        f"{os.path.basename(filepath)}"
+                    )
+                    df_selected = df[df[panel_col].fillna(False).astype(bool)]
+                    genes = df_selected['gene'].tolist()
+                    logger.info(
+                        f"Filtered to {len(genes)} genes with {panel_col}=True "
+                        f"(from {len(df)} total genes)"
+                    )
+                    genes = [g for g in genes if pd.notna(g)]
+                    return genes
 
         # Original logic for other formats (selected_genes.csv, simple lists, etc.)
         common_headers = ['gene', 'genes', 'gene_name', 'gene_id', 'symbol',
@@ -330,9 +333,9 @@ def extract_genelist_name_from_path(csv_file: str) -> str:
     """
     Extract a standardized gene list name from a file path.
 
-    Handles both old and new directory structures:
-    - OLD: .../Filter/Baseline/Strategy/Size-genes/results/selected_genes.csv
-    - NEW: .../Filter/Baseline/Strategy/N_factors/Size-genes/results/selected_genes.csv
+    Handles both directory-layout variants:
+    - .../Filter/Baseline/Strategy/Size-genes/results/selected_genes.csv
+    - .../Filter/Baseline/Strategy/N_factors/Size-genes/results/selected_genes.csv
 
     Args:
         csv_file: Path to a gene list CSV file.
@@ -341,9 +344,9 @@ def extract_genelist_name_from_path(csv_file: str) -> str:
         Standardized name for the gene list.
 
     Example:
-        >>> name = extract_genelist_name_from_path('/path/Scanpy-Filter/All-Genes/dt_deg/100-genes/results/selected_genes.csv')
+        >>> name = extract_genelist_name_from_path('/path/Scanpy-Filter/All-Genes/rf_deg/100-genes/results/selected_genes.csv')
         >>> name
-        'Scanpy-Filter_All-Genes_dt_deg_100'
+        'Scanpy-Filter_All-Genes_rf_deg_100'
     """
     path_parts = csv_file.split(os.sep)
 
@@ -394,7 +397,9 @@ def extract_genelist_name_from_path(csv_file: str) -> str:
         return os.path.splitext(os.path.basename(csv_file))[0]
 
 
-def load_all_gene_lists(gene_lists_dir: str, adata: object) -> dict[str, list[str]]:
+def load_all_gene_lists(
+    gene_lists_dir: str, adata: object, return_paths: bool = False
+) -> dict[str, list[str]] | tuple[dict[str, list[str]], dict[str, str]]:
     """
     Load all gene lists from the Selection pipeline output directory.
 
@@ -409,7 +414,7 @@ def load_all_gene_lists(gene_lists_dir: str, adata: object) -> dict[str, list[st
         │   │   │   │       ├── selected_genes_DEG-based-filling.csv
         │   │   │   │       └── ...
 
-    Fill-up strategies (when dt_dimred doesn't reach target panel size):
+    Fill-up strategies (when dimred selection doesn't reach target panel size):
     - DEG-based-filling: Fill up with top DEGs
     - cell-type-specific-filling: Fill up with per-celltype dimred genes
     - global-gene-filling: Fill up with global dimred genes
@@ -420,28 +425,41 @@ def load_all_gene_lists(gene_lists_dir: str, adata: object) -> dict[str, list[st
     Args:
         gene_lists_dir: Base directory containing Selected-panels output.
         adata: Reference dataset (to check gene availability).
+        return_paths: When True, also return a ``{gene_list_name: source_csv_path}``
+            mapping (same keys as the gene-list dict), so callers can locate each
+            panel's originating ``ranked_gene_list.csv`` (e.g. for the
+            ``informative_celltypes`` column). Default False keeps the historical
+            single-dict return.
 
     Returns:
-        Dictionary mapping gene list names to gene lists.
-        Format: {filter}_{subset}_{strategy}_{size}[_{filling_suffix}]
+        Dictionary mapping gene list names to gene lists
+        (format ``{filter}_{subset}_{strategy}_{size}[_{filling_suffix}]``), or a
+        ``(gene_lists, path_map)`` tuple when ``return_paths=True``.
 
     Example:
         >>> lists = load_all_gene_lists('/path/to/Selected-panels', adata)
-        >>> 'Scanpy-Filter_All-Genes_dt_deg_100' in lists
+        >>> 'Scanpy-Filter_All-Genes_rf_deg_100' in lists
         True
     """
     gene_lists = {}
+    path_map: dict[str, str] = {}
     available_genes = set(adata.var_names)
 
     if not os.path.exists(gene_lists_dir):
         logger.error(f"Gene lists directory not found: {gene_lists_dir}")
-        return gene_lists
+        return (gene_lists, path_map) if return_paths else gene_lists
 
     logger.info(f"Scanning directory structure: {gene_lists_dir}")
 
-    # Priority 1: ranked_gene_list.csv (authoritative source with final_selection column)
+    # Priority 1: ranked_gene_list.csv / *_panel_information.csv (authoritative source with an
+    # in_panel/final_selection column). *_panel_information.csv covers the renamed
+    # single-strategy outputs (rf_deg_panel_information.csv, nmf_panel_information.csv, ...).
     csv_pattern_ranked_old = os.path.join(gene_lists_dir, "*", "*-genes", "ranked_gene_list.csv")
     csv_pattern_ranked_new = os.path.join(gene_lists_dir, "*", "*_factors", "*-genes", "ranked_gene_list.csv")
+    csv_pattern_panelinfo_old = os.path.join(gene_lists_dir, "*", "*-genes", "*_panel_information.csv")
+    csv_pattern_panelinfo_new = os.path.join(
+        gene_lists_dir, "*", "*_factors", "*-genes", "*_panel_information.csv"
+    )
 
     # Priority 2: selected_genes*.csv (legacy format, fallback when ranked_gene_list.csv doesn't exist)
     csv_pattern_standard_old = os.path.join(gene_lists_dir, "*", "*-genes", "selected_genes*.csv")
@@ -454,7 +472,10 @@ def load_all_gene_lists(gene_lists_dir: str, adata: object) -> dict[str, list[st
     csv_pattern_random_new = os.path.join(gene_lists_dir, "*", "*_factors", "*-genes", "selected_random_*.csv")
 
     # Collect all files by type
-    ranked_files = glob.glob(csv_pattern_ranked_old) + glob.glob(csv_pattern_ranked_new)
+    ranked_files = (
+        glob.glob(csv_pattern_ranked_old) + glob.glob(csv_pattern_ranked_new)
+        + glob.glob(csv_pattern_panelinfo_old) + glob.glob(csv_pattern_panelinfo_new)
+    )
     standard_files = glob.glob(csv_pattern_standard_old) + glob.glob(csv_pattern_standard_new)
     hvg_files = glob.glob(csv_pattern_hvg_old) + glob.glob(csv_pattern_hvg_new)
     random_files = glob.glob(csv_pattern_random_old) + glob.glob(csv_pattern_random_new)
@@ -472,7 +493,7 @@ def load_all_gene_lists(gene_lists_dir: str, adata: object) -> dict[str, list[st
 
     logger.info(
         f"Found {len(csv_files)} gene list files: "
-        f"{len(ranked_files)} ranked_gene_list.csv, "
+        f"{len(ranked_files)} ranked_gene_list.csv/*_panel_information.csv, "
         f"{len(standard_files_filtered)} selected_genes.csv (no ranked equivalent), "
         f"{len(hvg_files)} HVG, "
         f"{len(random_files)} random"
@@ -517,9 +538,9 @@ def load_all_gene_lists(gene_lists_dir: str, adata: object) -> dict[str, list[st
             filename = os.path.basename(csv_file)
             filling_suffix = ""
 
-            if filename == "ranked_gene_list.csv":
+            if filename == "ranked_gene_list.csv" or filename.endswith("_panel_information.csv"):
                 # This is the authoritative panel file, no special handling needed
-                logger.info(f"Detected ranked_gene_list.csv (authoritative panel)")
+                logger.info(f"Detected {filename} (authoritative panel)")
 
             elif filename.startswith("selected_hvg_"):
                 size_match = re.search(r'selected_hvg_(\d+)genes\.csv', filename)
@@ -565,6 +586,7 @@ def load_all_gene_lists(gene_lists_dir: str, adata: object) -> dict[str, list[st
 
             if len(genes_filtered) > 0:
                 gene_lists[full_name] = genes_filtered
+                path_map[full_name] = csv_file
                 logger.info(f"Loaded {full_name}: {len(genes_filtered)} genes from {csv_file}")
             else:
                 logger.error(f"No valid genes found for {full_name}")
@@ -578,6 +600,7 @@ def load_all_gene_lists(gene_lists_dir: str, adata: object) -> dict[str, list[st
         # Support a simple flat layout where CSV files sit directly inside
         # gene_lists_dir (e.g. when called from the Streamlit app runner).
         flat_csv_files = glob.glob(os.path.join(gene_lists_dir, "ranked_gene_list.csv"))
+        flat_csv_files += glob.glob(os.path.join(gene_lists_dir, "*_panel_information.csv"))
         flat_csv_files += glob.glob(os.path.join(gene_lists_dir, "selected_genes*.csv"))
         flat_csv_files += glob.glob(os.path.join(gene_lists_dir, "selected_hvg_*.csv"))
         flat_csv_files += glob.glob(os.path.join(gene_lists_dir, "selected_random_*.csv"))
@@ -599,6 +622,7 @@ def load_all_gene_lists(gene_lists_dir: str, adata: object) -> dict[str, list[st
                     logger.warning(f"{full_name}: {missing}/{len(genes)} genes not found in dataset")
                 if genes_filtered:
                     gene_lists[full_name] = genes_filtered
+                    path_map[full_name] = csv_file
                     logger.info(f"Loaded (flat) {full_name}: {len(genes_filtered)} genes")
                 else:
                     logger.error(f"No valid genes found for flat file: {csv_file}")
@@ -613,7 +637,7 @@ def load_all_gene_lists(gene_lists_dir: str, adata: object) -> dict[str, list[st
         logger.info(f"Successfully loaded {len(gene_lists)} gene lists")
         logger.info(f"Gene list names: {sorted(gene_lists.keys())}")
 
-    return gene_lists
+    return (gene_lists, path_map) if return_paths else gene_lists
 
 
 # ===================================================================
@@ -627,7 +651,6 @@ def process_data_for_panel_evaluation(
     layer: str = "counts",
     hvg: bool = False,
     subset: bool = False,
-    scale: bool = False,
     dataset_name: str | None = None,
     dimensionality_reduction: str = "pca",
     filter_genes: bool = True,
@@ -646,21 +669,17 @@ def process_data_for_panel_evaluation(
         layer: Layer to use for normalization and HVG selection (default: "counts").
         hvg: Whether to perform highly variable gene selection (default: False).
         subset: Whether to subset to highly variable genes (default: False).
-        scale: Whether to scale the data before dimensionality reduction (default: False).
         dataset_name: Name of the dataset for logging purposes (optional).
-        dimensionality_reduction: Which method to use: "pca", "nmf", or "both" (default: "pca").
+        dimensionality_reduction: Ignored; panel preprocessing computes only PCA.
         filter_genes: Whether to filter lowly expressed genes (default: True).
             Set to True for reference preprocessing, False for panel evaluation.
-        nmf_counts_input: Count matrix to use as NMF input. ``"raw"`` (default):
-            raw integer counts from ``adata.raw`` or ``adata.layers['counts']``
-            (validated with ``is_anndata_raw_layer``). ``"lognorm"``: log-normalised
-            counts from ``adata.X``.
+        nmf_counts_input: Ignored; kept only so callers that also drive the NMF
+            evaluation can pass a single value through.
 
     Returns:
         Processed AnnData object with embeddings, clusterings, and neighbor graphs.
 
     Raises:
-        ValueError: If ``nmf_counts_input`` is unknown or requested raw counts are missing.
         Exception: If critical processing steps fail.
 
     Example:
@@ -725,6 +744,16 @@ def process_data_for_panel_evaluation(
             logger.info(f"No counts layer available. Transfer .X to counts layer")
             adata.layers['counts'] = adata.X.copy()
 
+    var_set = set(adata.var_names)
+    missing = [g for g in probeset if g not in var_set]
+    if missing:
+        logger.info(
+            f"NOTE: {len(missing)} gene(s) from the probe panel are not present in the "
+            f"single-cell dataset and will be excluded from evaluation: {missing}. "
+            f"These genes exist in the 10x Xenium panel but were not captured in the "
+            f"scRNA-seq reference (gene name aliases or tissue-specific absence)."
+        )
+        probeset = [g for g in probeset if g in var_set]
     adata = adata[:, probeset].copy()
     # Ensure object is fully in-memory to prevent errno 11 (file locking) issues
     # This is crucial for large files where backing mode may retain file handles
@@ -750,7 +779,13 @@ def process_data_for_panel_evaluation(
         logger.info("Note: Some genes/cells may have low expression but are important for rare cell types")
         logger.info(f"Proceeding with: {adata.n_obs} cells × {adata.n_vars} genes")
 
-    adata.raw = adata
+    # Only store .raw when there is no counts layer to serve as the raw-count
+    # reference.  When layers['counts'] already contains verified raw counts
+    # (the normal case for HCA/ST data), .raw would just duplicate the
+    # subsetted lognorm matrix and waste memory, especially for the full-
+    # transcriptome reference (~167K cells × 28K genes ≈ 18 GB in float64).
+    if 'counts' not in adata.layers:
+        adata.raw = adata
 
     if not is_log:
         print("Performing normalization and log transformation")
@@ -766,33 +801,34 @@ def process_data_for_panel_evaluation(
                             layer=layer,
                             subset=subset)
 
-    if issparse(adata.X):
-        adata.X = adata.X.toarray()
-
-    if scale:
-        print("Scaling data")
-        if np.isinf(adata.X).any():
-            print(f"WARNING: {np.isinf(adata.X).sum()} infinite values detected and replaced")
-            adata.X = np.nan_to_num(adata.X, nan=0.0, posinf=0.0, neginf=0.0)
-
-        sc.pp.scale(adata, max_value=10)
-
-        if np.isnan(adata.X).any():
-            print(f"WARNING: {np.isnan(adata.X).sum()} NaN values detected after scaling")
-            print("Replacing NaN values with zeros")
-            adata.X = np.nan_to_num(adata.X, nan=0.0)
+    # Keep adata.X sparse here — sc.tl.pca handles sparse input via ARPACK.
+    # Densifying the full-transcriptome reference (167K × 28K genes) wastes ~18 GB.
+    # The NaN check below is made sparse-aware so we never need to materialise the
+    # full dense matrix just to validate the data.
 
     if dimensionality_reduction in ["pca", "both"]:
         print("Running PCA")
-        if np.isnan(adata.X).any():
+        # Sparse-aware NaN check: inspect only the stored non-zero values (.data)
+        # so we never have to densify adata.X just for validation.
+        _x_has_nan = (
+            np.isnan(adata.X.data).any() if issparse(adata.X) else np.isnan(adata.X).any()
+        )
+        if _x_has_nan:
             print("ERROR: Cannot run PCA - data contains NaN values")
-            adata.X = np.nan_to_num(adata.X, nan=0.0)
+            if issparse(adata.X):
+                adata.X = adata.X.copy()
+                adata.X.data[:] = np.nan_to_num(adata.X.data, nan=0.0)
+            else:
+                adata.X = np.nan_to_num(adata.X, nan=0.0)
 
         try:
             sc.tl.pca(adata)
         except Exception as e:
             print(f"PCA ERROR: {e}")
             print("Attempting to fix data and retry PCA...")
+            # Densify only in this rare fallback path so the retry has a clean array.
+            if issparse(adata.X):
+                adata.X = adata.X.toarray()
             adata.X = np.nan_to_num(adata.X, nan=0.0, posinf=0.0, neginf=0.0)
             try:
                 sc.tl.pca(adata, n_comps=min(30, adata.X.shape[1]-1))
@@ -802,85 +838,8 @@ def process_data_for_panel_evaluation(
                 adata.obsm['X_pca'] = np.zeros((adata.shape[0], n_comps))
                 print("WARNING: Using zeros for PCA results!")
 
-    if dimensionality_reduction in ["nmf", "both"]:
-        print("Running NMF")
-
-        if nmf_counts_input == "raw":
-            if hasattr(adata, 'raw') and adata.raw is not None:
-                if not is_anndata_raw(adata.raw):
-                    raise ValueError(
-                        "nmf_counts_input='raw': adata.raw.X does not contain raw integer counts."
-                    )
-                X_nmf_input = adata.raw.X.copy() if hasattr(adata.raw.X, 'copy') else np.array(adata.raw.X)
-                data_source = "raw"
-                print("Using adata.raw.X for NMF (verified as raw counts)")
-            elif 'counts' in adata.layers:
-                if not is_anndata_raw_layer(adata, 'counts'):
-                    raise ValueError(
-                        "nmf_counts_input='raw': adata.layers['counts'] does not contain raw integer counts"
-                    )
-                X_nmf_input = adata.layers['counts'].copy()
-                data_source = "counts_layer"
-                print("Using layers['counts'] for NMF (verified as raw counts)")
-            else:
-                raise ValueError(
-                    "nmf_counts_input='raw': no raw counts found in adata.raw or adata.layers['counts']"
-                )
-        elif nmf_counts_input == "lognorm":
-            # Only guard when the data arrived already log-normalised (is_log=True).
-            # When is_log=False, normalize_total+log1p ran above and X is guaranteed
-            # to be log-normalised — no need to re-check (and the stub always returns
-            # True, which would cause a false positive in that case).
-            if is_log and is_anndata_raw(adata):
-                raise ValueError(
-                    "nmf_counts_input='lognorm': adata.X appears to contain raw integer counts, "
-                    "not log-normalized data. Normalize adata.X before evaluation."
-                )
-            X_nmf_input = adata.X.copy() if hasattr(adata.X, 'copy') else np.array(adata.X)
-            data_source = "X_lognorm"
-            print("Using adata.X (log-normalized, verified) for NMF")
-        else:
-            raise ValueError(
-                f"Unknown nmf_counts_input='{nmf_counts_input}'. Choose 'raw' or 'lognorm'."
-            )
-
-        if issparse(X_nmf_input):
-            X_nmf_input = X_nmf_input.toarray()
-
-        if np.isnan(X_nmf_input).any() or np.isinf(X_nmf_input).any():
-            print("ERROR: Cannot run NMF - data contains NaN or inf values")
-            X_nmf_input = np.nan_to_num(X_nmf_input, nan=0.0, posinf=0.0, neginf=0.0)
-            if (X_nmf_input < 0).any():
-                print("ERROR: Data contains negative values")
-
-        try:
-            n_comps = 50
-            print(f"Running NMF with {n_comps} components on {X_nmf_input.shape[0]} cells x {X_nmf_input.shape[1]} genes")
-            nmf_model = NMF(n_components=n_comps, init='nndsvda', random_state=42, max_iter=1000)
-            adata.obsm['X_nmf'] = nmf_model.fit_transform(X_nmf_input)
-            adata.varm['nmf_components'] = nmf_model.components_.T
-            adata.uns['nmf_data_source'] = data_source
-            print(f"NMF completed with {n_comps} components")
-            print(f"NMF reconstruction error: {nmf_model.reconstruction_err_:.4f}")
-        except Exception as e:
-            print(f"NMF ERROR: {e}")
-            print("Creating empty NMF results to prevent downstream errors")
-            n_comps = 5
-            adata.obsm['X_nmf'] = np.zeros((adata.shape[0], n_comps))
-            adata.uns['nmf_data_source'] = "failed"
-            print("WARNING: Using zeros for NMF results!")
-
-
-    if dimensionality_reduction == "pca":
-        use_reps = ['X_pca']
-        rep_names = ['pca']
-    elif dimensionality_reduction == "nmf":
-        use_reps = ['X_nmf']
-        rep_names = ['nmf']
-    else:
-        use_reps = ['X_pca', 'X_nmf']
-        rep_names = ['pca', 'nmf']
-        print("Note: Both PCA and NMF computed. Running neighbors computation for both representations.")
+    use_reps = ['X_pca']
+    rep_names = ['pca']
 
     neighbor_params = [5, 10, 15, 20, 30, 50]
 
@@ -889,43 +848,19 @@ def process_data_for_panel_evaluation(
 
         for n_neighs in neighbor_params:
             print(f"Computing neighbors with n_neighbors={n_neighs} using {rep_name}")
-
-            if dimensionality_reduction == "both":
-                key_added = f"neighbors_{rep_name}_k{n_neighs}"
-            else:
-                key_added = f"neighbors_k{n_neighs}"
-
+            key_added = f"neighbors_k{n_neighs}"
             sc.pp.neighbors(adata, n_neighbors=n_neighs, key_added=key_added, use_rep=use_rep)
-            sc.tl.umap(adata, neighbors_key=key_added)
+            # Per-k neighbour graphs feed neighbourhood-preservation. No per-k UMAP is
+            # computed here — only the graphs are consumed downstream.
 
-            if dimensionality_reduction == "both":
-                adata.obsm[f"X_umap_{rep_name}_k{n_neighs}"] = adata.obsm["X_umap"].copy()
-            else:
-                adata.obsm[f"X_umap_k{n_neighs}"] = adata.obsm["X_umap"].copy()
+        sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep=use_rep)
+        sc.tl.umap(adata)
 
-        if dimensionality_reduction == "both":
-            neighbors_key = f"neighbors_{rep_name}"
-        else:
-            neighbors_key = "neighbors"
-
-        sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep=use_rep, key_added=neighbors_key if dimensionality_reduction == "both" else None)
-        sc.tl.umap(adata, neighbors_key=neighbors_key if dimensionality_reduction == "both" else None)
-
-        if dimensionality_reduction == "both":
-            adata.obsm[f"X_umap_{rep_name}"] = adata.obsm["X_umap"].copy()
-
-    if dimensionality_reduction == "both":
-        clustering_neighbors_keys = ['neighbors_pca', 'neighbors_nmf']
-        clustering_rep_names = ['pca', 'nmf']
-    else:
-        clustering_neighbors_keys = [None]
-        clustering_rep_names = [dimensionality_reduction]
+    clustering_neighbors_keys = [None]
+    clustering_rep_names = ['pca']
 
     for neighbors_key, rep_name in zip(clustering_neighbors_keys, clustering_rep_names):
-        if dimensionality_reduction == "both":
-            print(f"\n=== Running Leiden clustering for {rep_name.upper()} representation ===")
-        else:
-            print(f"\n=== Running Leiden clustering ===")
+        print(f"\n=== Running Leiden clustering ===")
 
         target_clusters = list(range(7, 61))
         test_resolutions = [0.1, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
@@ -934,10 +869,7 @@ def process_data_for_panel_evaluation(
         print("Finding resolutions for target cluster numbers...")
 
         for res in test_resolutions:
-            if dimensionality_reduction == "both":
-                leiden_key = f"leiden_{rep_name}_res{res}"
-            else:
-                leiden_key = f"leiden_res{res}"
+            leiden_key = f"leiden_res{res}"
 
             sc.tl.leiden(adata, resolution=res, key_added=leiden_key, neighbors_key=neighbors_key,
                         flavor="igraph", n_iterations=2, directed=False)
@@ -949,13 +881,7 @@ def process_data_for_panel_evaluation(
             if target in resolution_to_clusters.values():
                 res = [r for r, n in resolution_to_clusters.items() if n == target][0]
                 print(f"Using existing resolution {res:.2f} for {target} clusters")
-                if dimensionality_reduction == "both":
-                    leiden_key = f"leiden_{target}_clusters_{rep_name}"
-                    source_key = f"leiden_{rep_name}_res{res}"
-                else:
-                    leiden_key = f"leiden_{target}_clusters"
-                    source_key = f"leiden_res{res}"
-                adata.obs[leiden_key] = adata.obs[source_key]
+                adata.obs[f"leiden_{target}_clusters"] = adata.obs[f"leiden_res{res}"]
                 continue
 
             lower_res = None
@@ -985,10 +911,7 @@ def process_data_for_panel_evaluation(
             max_attempts = 10
 
             while attempts < max_attempts:
-                if dimensionality_reduction == "both":
-                    leiden_key = f"leiden_{rep_name}_res{new_res}"
-                else:
-                    leiden_key = f"leiden_res{new_res}"
+                leiden_key = f"leiden_res{new_res}"
 
                 sc.tl.leiden(adata, resolution=new_res, key_added=leiden_key, neighbors_key=neighbors_key,
                            flavor="igraph", n_iterations=2, directed=False)
@@ -997,10 +920,7 @@ def process_data_for_panel_evaluation(
                 print(f"Resolution {new_res:.3f} gives {n_clusters} clusters (target: {target})")
 
                 if n_clusters == target:
-                    if dimensionality_reduction == "both":
-                        adata.obs[f"leiden_{target}_clusters_{rep_name}"] = adata.obs[leiden_key]
-                    else:
-                        adata.obs[f"leiden_{target}_clusters"] = adata.obs[leiden_key]
+                    adata.obs[f"leiden_{target}_clusters"] = adata.obs[leiden_key]
                     break
 
                 if n_clusters < target:
@@ -1024,32 +944,68 @@ def process_data_for_panel_evaluation(
                 print(f"Could not find exact resolution for {target} clusters after {max_attempts} attempts")
                 closest_res = min(resolution_to_clusters.items(), key=lambda x: abs(x[1] - target))
                 print(f"Using resolution {closest_res[0]:.3f} which gives {closest_res[1]} clusters")
-                if dimensionality_reduction == "both":
-                    source_key = f"leiden_{rep_name}_res{closest_res[0]}"
-                    target_key = f"leiden_{target}_clusters_{rep_name}"
-                else:
-                    source_key = f"leiden_res{closest_res[0]}"
-                    target_key = f"leiden_{target}_clusters"
-                adata.obs[target_key] = adata.obs[source_key]
+                # NOTE: the column keeps the `{target}` name even though it holds a
+                # different cluster count. Downstream (compute_clustering_similarity)
+                # pairs reference/panel columns on the *realized* count, not this name,
+                # so the mismatch does not corrupt ARI/NMI.
+                adata.obs[f"leiden_{target}_clusters"] = adata.obs[f"leiden_res{closest_res[0]}"]
 
-    if dimensionality_reduction == "both":
-        default_neighbors_key = "neighbors_pca"
-    else:
-        default_neighbors_key = None
-
-    sc.tl.leiden(adata, flavor="igraph", n_iterations=2, neighbors_key=default_neighbors_key)
+    sc.tl.leiden(adata, flavor="igraph", n_iterations=2)
 
     print("Computing neighborhood similarity across different neighbor parameters...")
 
     return adata
 
 
+def filter_reference_blacklist(
+    adata: object,
+    blacklist_patterns: list[str] | None = None,
+    use_default_blacklist: bool = False,
+) -> object:
+    """Remove genes matching Selection-module's blacklist patterns from the reference.
+
+    Delegates to :func:`_filtering.apply_blacklist_filter` (Selection-module) so the
+    reference dataset can be filtered with the exact same rule (case-insensitive gene
+    name prefix match) used when the panel itself was selected, letting fair
+    comparisons be made against a panel that was barred from ever including those
+    genes (e.g. a ribosomal-gene blacklist).
+
+    Args:
+        adata: Reference AnnData (full transcriptome), not yet preprocessed.
+        blacklist_patterns: Extra prefix patterns to remove, beyond the default
+            (e.g. custom patterns used during selection).
+        use_default_blacklist: Also remove genes matching Selection-module's
+            ``DEFAULT_BLACKLIST_PATTERNS`` (``mt-``, ``hsp``, ``rps``, ``rpl``).
+
+    Returns:
+        The filtered AnnData (unchanged object if no patterns are requested).
+    """
+    if not blacklist_patterns and not use_default_blacklist:
+        return adata
+    if apply_blacklist_filter is None:
+        raise ImportError(
+            "apply_blacklist_filter could not be imported from Selection-module; "
+            "cannot apply --reference_blacklist_patterns / --reference_disable_default_blacklist."
+        )
+    filtered_genes, removed_genes, _ = apply_blacklist_filter(
+        gene_list=adata.var_names.tolist(),
+        blacklist_patterns=blacklist_patterns or None,
+        use_default_blacklist=use_default_blacklist,
+    )
+    if removed_genes:
+        logger.info(
+            "Reference blacklist filter removed %d genes (e.g. %s)",
+            len(removed_genes), removed_genes[:10],
+        )
+        adata = adata[:, filtered_genes].copy()
+    return adata
+
+
 def preprocess_reference_dataset(
     adata: object,
     output_file: str,
-    dimensionality_reduction: str = "both",
+    dimensionality_reduction: str = "pca",
     n_neighbors: int = 15,
-    n_nmf_components: int = 5
 ) -> None:
     """
     Preprocess the full-transcriptome reference dataset for evaluation.
@@ -1060,9 +1016,8 @@ def preprocess_reference_dataset(
     Args:
         adata: AnnData object with raw data (full transcriptome).
         output_file: Path to save preprocessed reference h5ad file.
-        dimensionality_reduction: Type of reduction: "pca", "nmf", or "both" (default: "both").
+        dimensionality_reduction: Ignored; reference preprocessing computes only PCA.
         n_neighbors: Number of neighbors for UMAP (default: 15).
-        n_nmf_components: Number of NMF components (default: 5).
 
     Returns:
         None (saves to output_file).
@@ -1074,7 +1029,7 @@ def preprocess_reference_dataset(
     Example:
         >>> preprocess_reference_dataset(
         ...     adata, '/path/to/reference.h5ad',
-        ...     dimensionality_reduction='both', n_neighbors=15
+        ...     n_neighbors=15
         ... )
     """
     logger.info("Making observation names unique")
@@ -1114,37 +1069,12 @@ def preprocess_reference_dataset(
         layer="counts",
         hvg=False,
         subset=False,
-        scale=False,
         dataset_name="full_transcriptome",
         dimensionality_reduction=dimensionality_reduction,
         filter_genes=True,
     )
 
-    if dimensionality_reduction in ["nmf", "both"]:
-        if 'X_nmf' not in adata_processed.obsm:
-            logger.info(f"Computing NMF with {n_nmf_components} components...")
-            from sklearn.decomposition import NMF as sklearn_NMF
-
-            X = adata_processed.X
-            if hasattr(X, 'toarray'):
-                X = X.toarray()
-
-            X = np.abs(X)
-
-            nmf = sklearn_NMF(
-                n_components=n_nmf_components,
-                init='nndsvda',
-                max_iter=1000,
-                random_state=42
-            )
-            W = nmf.fit_transform(X)
-
-            adata_processed.obsm['X_nmf'] = W
-            adata_processed.varm['nmf_components'] = nmf.components_.T
-            logger.info(f"NMF complete: {W.shape}")
-
     has_pca = 'X_pca' in adata_processed.obsm
-    has_nmf = 'X_nmf' in adata_processed.obsm
     leiden_cols = [c for c in adata_processed.obs.columns if c.startswith('leiden_')]
     neighbor_keys = [k for k in adata_processed.uns.keys() if k.startswith('neighbors_')]
 
@@ -1152,14 +1082,11 @@ def preprocess_reference_dataset(
     logger.info("PREPROCESSING VERIFICATION")
     logger.info("="*60)
     logger.info(f"PCA: {'✓' if has_pca else '✗'}")
-    logger.info(f"NMF: {'✓' if has_nmf else '✗'}")
     logger.info(f"Leiden clusterings: {len(leiden_cols)}")
     logger.info(f"Neighbor graphs: {len(neighbor_keys)}")
 
     if has_pca:
         logger.info(f"  PCA shape: {adata_processed.obsm['X_pca'].shape}")
-    if has_nmf:
-        logger.info(f"  NMF shape: {adata_processed.obsm['X_nmf'].shape}")
 
     logger.info(f"\nSaving preprocessed reference to: {output_file}")
 

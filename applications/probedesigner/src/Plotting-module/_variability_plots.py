@@ -14,27 +14,61 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any, Callable, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from matplotlib.lines import Line2D
 
 from _clustering_plots import extract_factor_number_from_dataset_name
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 from _constants import (
     COL_EXPVAR_TEST_PROBE,
     COL_MACRO_EXPVAR,
     COL_MACRO_MSE,
     COL_MSE_TEST_PROBE,
     COL_N_CELLS,
-    COL_RMSE_TEST_PROBE,
     COL_SKIPPED,
     COL_WEIGHTED_EXPVAR,
     COL_WEIGHTED_MSE,
     DEFAULT_PNG_DPI,
+    METHOD_DISPLAY_NAMES,
+    COL_EXPVAR_TEST_PROBE_RAW,
+    COL_EXPVAR_TEST_PROBE_LOGNORM,
+    COL_MSE_TEST_PROBE_RAW,
+    COL_MSE_TEST_PROBE_LOGNORM,
+    COL_WEIGHTED_MSE_RAW,
+    COL_WEIGHTED_MSE_LOGNORM,
+    COL_WEIGHTED_EXPVAR_RAW,
+    COL_WEIGHTED_EXPVAR_LOGNORM,
+    COL_MACRO_MSE_RAW,
+    COL_MACRO_MSE_LOGNORM,
+    COL_MACRO_EXPVAR_RAW,
+    COL_MACRO_EXPVAR_LOGNORM,
+    COL_WEIGHTED_MSE_BASELINE_RAW,
+    COL_WEIGHTED_MSE_BASELINE_LOGNORM,
+    COL_MACRO_MSE_BASELINE_RAW,
+    COL_MACRO_MSE_BASELINE_LOGNORM,
+    COL_WEIGHTED_EXPVAR_BASELINE_RAW,
+    COL_WEIGHTED_EXPVAR_BASELINE_LOGNORM,
+    COL_MACRO_EXPVAR_BASELINE_RAW,
+    COL_MACRO_EXPVAR_BASELINE_LOGNORM,
 )
+
+
+def _method_display(method: str) -> str:
+    """Display name for a variability method (e.g. 'PCA' -> 'PCA', 'ica' -> 'ICA'),
+    for plot titles. Case-insensitive lookup, since the ``method`` string doubles as
+    both a results-dict key / on-disk folder name (which may be any case, e.g. 'PCA'
+    to match a user-requested output-folder convention) and this display purpose."""
+    return METHOD_DISPLAY_NAMES.get(method.lower(), method.title())
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +89,14 @@ __all__ = [
     "is_factor_range_mode",
     "get_factor_specific_colors",
     "extract_display_name_for_factor_range",
-    "generate_category_9_label",
     "extract_strategy_and_display_name",
     "get_category_colors",
     "plot_aggregated_celltype_metrics",
     "plot_celltype_evaluation_results",
+    "plot_ridge_aggregated_celltype_metrics",
     "create_combined_plot_with_info",
-    "plot_standardized_comparison",
+    "plot_expvar_gene_subset_breakdown",
+    "plot_expvar_gene_subset_breakdown_by_celltype",
 ]
 
 def is_factor_range_mode(evaluation_results):
@@ -142,62 +177,6 @@ def extract_display_name_for_factor_range(probeset_name):
     return display_name
 
 
-def generate_category_9_label(probeset_name):
-    """
-    Generate Category 9 specific label that includes filter setting + strategy.
-    
-    Format: {Filter}_{Strategy}
-    - Filter: Scanpy-All-Genes, Scanpy-HVG, Xenium-All-Genes, Xenium-HVG
-    - Strategy: dt_nmf_75%, dt_pca_75%
-    
-    Examples:
-        'Scanpy-Filter_All-Genes_dt_nmf_DT0.25_Dimred0.75_...' → 'Scanpy-All-Genes_dt_nmf_75%'
-        'Xenium-Filter_HVG-Subset_dt_pca_DT0.25_Dimred0.75_...' → 'Xenium-HVG_dt_pca_75%'
-    
-    Parameters:
-    -----------
-    probeset_name : str
-        Full probeset name
-        
-    Returns:
-    --------
-    str
-        Category 9 formatted label
-    """
-    import re
-    
-    # Determine filter prefix
-    filter_label = None
-    if probeset_name.startswith('Scanpy-Filter_All-Genes'):
-        filter_label = 'Scanpy-All-Genes'
-    elif probeset_name.startswith('Scanpy-Filter_HVG-Subset'):
-        filter_label = 'Scanpy-HVG'
-    elif probeset_name.startswith('Xenium-Filter_All-Genes'):
-        filter_label = 'Xenium-All-Genes'
-    elif probeset_name.startswith('Xenium-Filter_HVG-Subset'):
-        filter_label = 'Xenium-HVG'
-    
-    # Extract dimred type and ratio
-    dimred_type = None
-    dimred_ratio = None
-    
-    # Pattern: dt_{dimred}_DT{dt_ratio}_Dimred{dimred_ratio}_
-    pattern = r'dt_(pca|nmf)_DT([\d.]+)_Dimred([\d.]+)'
-    match = re.search(pattern, probeset_name)
-    if match:
-        dimred_type = match.group(1)
-        dimred_ratio_float = float(match.group(3))
-        dimred_percentage = int(dimred_ratio_float * 100)
-        dimred_ratio = f"{dimred_percentage}%"
-    
-    # Construct label
-    if filter_label and dimred_type and dimred_ratio:
-        return f"{filter_label}_dt_{dimred_type}_{dimred_ratio}"
-    
-    # Fallback
-    return probeset_name
-
-
 def extract_strategy_and_display_name(probeset_name, include_size=False):
     """
     Extract strategy category and display name from probeset name.
@@ -206,9 +185,9 @@ def extract_strategy_and_display_name(probeset_name, include_size=False):
     - Simple external panels: Spapros, mMulti_v1, 5k (return simplified identifier)
     - Complex external panels: Any non-pipeline pattern (return full name)
     - Baselines: Random, HVG
-    - Simple strategies: deg_only, dt_simple, dt_deg
-    - Dimred-only: pca_global_method_a, nmf_per_celltype_method_b
-    - Hybrid: dt_pca_DT0.5_Dimred0.5_global_method_a
+    - Simple strategies: deg_only, rf_simple, rf_deg
+    - Dimred-only: dimred_only_nmf_per_celltype (older Modules_v2: pca_global, nmf_per_celltype)
+    - Hybrid: RecoVar_RF_0.5_Dimred_0.5, RecoVar_PCA_RF_0.25_Dimred_0.75
     - Fill-up variants: ..._DEG-based-filling, ..._cell-type-specific-filling, ..._global-gene-filling
     
     This function uses a generic approach to detect external panels:
@@ -218,7 +197,7 @@ def extract_strategy_and_display_name(probeset_name, include_size=False):
     Parameters:
     -----------
     probeset_name : str
-        Full probeset name (e.g., "Scanpy-Filter_All-Genes_dt_pca_DT0.5_Dimred0.5_global_method_a_100_5k-addon")
+        Full probeset name (e.g., "Scanpy-Filter_All-Genes_nmf_per_celltype_100_5k-addon")
     include_size : bool, optional (default=False)
         If True, append panel size (e.g., " (100)") to display name
     
@@ -278,65 +257,81 @@ def extract_strategy_and_display_name(probeset_name, include_size=False):
     if '_5k_' in probeset_name and not probeset_name.endswith('5k-addon'):
         return '5k', add_panel_size('5k', original_probeset_name)
     
-    # Check for baselines (both uppercase and lowercase)
-    if '_Random_' in probeset_name or probeset_name.startswith('Random') or '_random_' in probeset_name:
+    # Check for baselines (both uppercase and lowercase). Both a leading-underscore
+    # substring match and a bare leading-token match are needed: pipeline naming
+    # conventions differ on whether the strategy is the first path/name segment
+    # (e.g. "RecoVar_raw_rf0.5_..." from audit3_validation-style runs, no leading
+    # underscore) or an interior one (e.g. "Scanpy-Filter_All-Genes_rf_deg_100").
+    if ('_Random_' in probeset_name or '_random_' in probeset_name
+            or probeset_name.startswith('Random_') or probeset_name.startswith('random_')
+            or probeset_name == 'Random' or probeset_name == 'random'):
         return 'Random', add_panel_size('Random', original_probeset_name)
-    if '_HVG_' in probeset_name or '_hvg_' in probeset_name or probeset_name.startswith('hvg_'):
+    if ('_HVG_' in probeset_name or '_hvg_' in probeset_name
+            or probeset_name.startswith('HVG_') or probeset_name.startswith('hvg_')
+            or probeset_name == 'HVG' or probeset_name == 'hvg'):
         return 'HVG', add_panel_size('HVG', original_probeset_name)
-    
+
     # Check for simple strategies
-    if '_deg_only_' in probeset_name:
+    if '_deg_only_' in probeset_name or probeset_name.startswith('deg_only_') or probeset_name == 'deg_only':
         display_name = 'DEG Only'
         if filling_suffix:
             display_name = f"{display_name} ({filling_suffix})"
         return 'deg_only', add_panel_size(display_name, original_probeset_name)
-    if '_dt_simple_' in probeset_name:
-        display_name = 'DT Simple'
+    if '_rf_simple_' in probeset_name or probeset_name.startswith('rf_simple_') or probeset_name == 'rf_simple':
+        display_name = 'RF Simple'
         if filling_suffix:
             display_name = f"{display_name} ({filling_suffix})"
-        return 'dt_simple', add_panel_size(display_name, original_probeset_name)
-    if '_dt_deg_' in probeset_name:
-        display_name = 'DT+DEG'
+        return 'rf_simple', add_panel_size(display_name, original_probeset_name)
+    if '_rf_deg_' in probeset_name or probeset_name.startswith('rf_deg_') or probeset_name == 'rf_deg':
+        display_name = 'RF+DEG'
         if filling_suffix:
             display_name = f"{display_name} ({filling_suffix})"
-        return 'dt_deg', add_panel_size(display_name, original_probeset_name)
-    
-    # Check for dimred-only strategies
-    dimred_only_pattern = r'_(pca|nmf)_(global|per_celltype)_method_([ab])_'
-    dimred_only_match = re.search(dimred_only_pattern, probeset_name)
-    if dimred_only_match:
-        dimred_type, analysis_type, method = dimred_only_match.groups()
-        # Use same abbreviations as baseline module
-        method_label = 'abs' if method == 'a' else 'norm'
-        selection_label = 'global' if analysis_type == 'global' else 'CT'
-        category = f"{dimred_type}_{analysis_type}_method_{method}"
-        display_name = f"{dimred_type}_{selection_label}_{method_label}"
-        if filling_suffix:
-            display_name = f"{display_name} ({filling_suffix})"
-        return category, add_panel_size(display_name, original_probeset_name)
-    
-    # Check for hybrid strategies (dt_pca/dt_nmf)
-    hybrid_pattern = r'_dt_(pca|nmf)_DT([\d.]+)_Dimred([\d.]+)_(global|per_celltype)_method_([ab])_'
+        return 'rf_deg', add_panel_size(display_name, original_probeset_name)
+
+    # Check for hybrid strategies (RecoVar / RecoVar_PCA): RF share + dimred share.
+    # Checked before the dimred-only / simple-literal matches so the '_RecoVar_'
+    # substring inside a hybrid name is not mistaken for the bare 'RecoVar' strategy.
+    hybrid_pattern = r'RecoVar(_PCA)?_RF_([\d.]+)_Dimred_([\d.]+)'
     hybrid_match = re.search(hybrid_pattern, probeset_name)
     if hybrid_match:
-        dimred_type, dt_ratio, dimred_ratio, analysis_type, method = hybrid_match.groups()
-        dimred_ratio_float = float(dimred_ratio)
-        percentage = int(dimred_ratio_float * 100)
-        
-        # Create category for color mapping that matches the color dictionary keys
-        # Format: dt_{dimred_type}_{percentage}_{analysis_type}_{method}
-        # E.g., 'dt_nmf_25_global_a', 'dt_nmf_75_per_celltype_b'
-        category = f"dt_{dimred_type}_{percentage}_{analysis_type}_{method}"
-        
-        # Create display name matching baseline module format: "dt_nmf_75%_CT_abs"
-        # Use same abbreviations as baseline module
-        method_label = 'abs' if method == 'a' else 'norm'
-        selection_label = 'global' if analysis_type == 'global' else 'CT'
-        display_name = f"dt_{dimred_type}_{percentage}%_{selection_label}_{method_label}"
+        pca_flag, rf_ratio, dimred_ratio = hybrid_match.groups()
+        percentage = int(round(float(dimred_ratio) * 100))
+        prefix = 'RecoVar_PCA' if pca_flag else 'RecoVar'
+        # Category (colour-dict key) and display name are both keyed by dimred share.
+        category = f"{prefix}_{percentage}"
+        display_name = f"{prefix} {percentage}%"
         if filling_suffix:
             display_name = f"{display_name} ({filling_suffix})"
-        
         return category, add_panel_size(display_name, original_probeset_name)
+
+    # Bare RecoVar / RecoVar_PCA (no ratio segment) — checked after the hybrid pattern.
+    # Leading-token match (startswith/exact) covers names where RecoVar is the first
+    # segment (e.g. "RecoVar_raw_rf0.5_nmf0.5_LCA_500genes_seed42"), not just where
+    # it's bounded by underscores on both sides.
+    if ('_RecoVar_PCA_' in probeset_name or probeset_name.startswith('RecoVar_PCA_')
+            or probeset_name == 'RecoVar_PCA'):
+        display_name = 'RecoVar_PCA'
+        if filling_suffix:
+            display_name = f"{display_name} ({filling_suffix})"
+        return 'RecoVar_PCA', add_panel_size(display_name, original_probeset_name)
+    if ('_RecoVar_' in probeset_name or probeset_name.startswith('RecoVar_')
+            or probeset_name == 'RecoVar'):
+        display_name = 'RecoVar'
+        if filling_suffix:
+            display_name = f"{display_name} ({filling_suffix})"
+        return 'RecoVar', add_panel_size(display_name, original_probeset_name)
+
+    # Check for dimred-only strategies. RecoVar emits 'dimred_only_{nmf,pca}_per_celltype';
+    # older Modules_v2 names were '{nmf,pca}_{global,per_celltype}' with an optional
+    # trailing _method_a/_method_b. Only the dimred token (nmf / pca) is meaningful now.
+    dimred_only_pattern = r'_(?:dimred_only_)?(pca|nmf)_(?:global|per_celltype)(?:_method_[ab])?_'
+    dimred_only_match = re.search(dimred_only_pattern, probeset_name)
+    if dimred_only_match:
+        dimred_type = dimred_only_match.group(1)
+        display_name = dimred_type
+        if filling_suffix:
+            display_name = f"{display_name} ({filling_suffix})"
+        return dimred_type, add_panel_size(display_name, original_probeset_name)
     
     # === CATEGORY B: Generic external panel detection ===
     # If we reached here, check if this is an unknown external panel
@@ -346,9 +341,9 @@ def extract_strategy_and_display_name(probeset_name, include_size=False):
     # 3. Is NOT an addon suffix
     
     pipeline_patterns = [
-        'dt_pca_DT', 'dt_nmf_DT',  # Hybrid strategies (checked above but included for clarity)
-        'pca_global_', 'pca_per_celltype_',  # PCA-only (checked above)
-        'nmf_global_', 'nmf_per_celltype_',  # NMF-only (checked above)
+        'RecoVar_RF_', 'RecoVar_PCA_RF_',  # Hybrid strategies (checked above but included for clarity)
+        'RecoVar',  # Bare RecoVar / RecoVar_PCA (checked above)
+        'dimred_only', '_pca_', '_nmf_',  # Dimred-only (checked above)
     ]
     
     is_pipeline_pattern = any(pattern in probeset_name for pattern in pipeline_patterns)
@@ -417,76 +412,27 @@ def get_category_colors(external_names=None):
         
         # Simple strategies
         'deg_only': "#fa9c4a",       # Orange
-        'dt_simple': "#d56a0d",      # Dark orange
-        'dt_deg': "#875223",         # Brown
-        
-        # === DIMRED-ONLY STRATEGIES ===
-        # NMF-only: Pink/Magenta family - CLEARLY DIFFERENT from dt_nmf blues
-        'nmf_global_method_a': '#ff99ff',      # Light magenta - global, abs
-        'nmf_global_method_b': '#cc3399',      # Dark magenta - global, norm
-        'nmf_per_celltype_method_a': '#cc0066',  # Dark pink - CT, abs
-        'nmf_per_celltype_method_b': '#800040',  # Very dark magenta - CT, norm
-        
-        # PCA-only: Green family - CLEARLY DIFFERENT from dt_pca cyans
-        'pca_global_method_a': '#99ff99',      # Light green - global, abs
-        'pca_global_method_b': '#339933',      # Dark green - global, norm
-        'pca_per_celltype_method_a': '#006600',  # Dark forest green - CT, abs
-        'pca_per_celltype_method_b': '#003300',  # Very dark forest green - CT, norm
-        
-        # === DT_NMF HYBRID STRATEGIES ===
-        # HIGHLY DISTINCT COLORS - different color families for each combination
-        # Global + Method A (abs): BRIGHT BLUE family
-        'dt_nmf_10_global_a': '#80C0FF',   # Very light sky blue
-        'dt_nmf_25_global_a': '#4DA6FF',   # Bright sky blue
-        'dt_nmf_50_global_a': '#0080FF',   # Vivid blue
-        'dt_nmf_75_global_a': '#0052CC',   # Strong blue
-        'dt_nmf_90_global_a': '#003D99',   # Very deep blue
-        # Global + Method B (norm): ORANGE-RED family
-        'dt_nmf_10_global_b': '#FFBB99',   # Very light orange
-        'dt_nmf_25_global_b': '#FF9966',   # Light orange
-        'dt_nmf_50_global_b': '#FF6633',   # Bright orange
-        'dt_nmf_75_global_b': '#FF3300',   # Red-orange
-        'dt_nmf_90_global_b': '#CC1A00',   # Very deep red-orange
-        # Per-celltype + Method A (abs): PURPLE family
-        'dt_nmf_10_per_celltype_a': '#DDAAFF',  # Very light purple
-        'dt_nmf_25_per_celltype_a': '#BB88FF',  # Light purple
-        'dt_nmf_50_per_celltype_a': '#9933FF',  # Vivid purple
-        'dt_nmf_75_per_celltype_a': '#7700CC',  # Deep purple
-        'dt_nmf_90_per_celltype_a': '#550099',  # Very deep purple
-        # Per-celltype + Method B (norm): BURGUNDY-BROWN family
-        'dt_nmf_10_per_celltype_b': '#EE88BB',  # Very light rosy brown
-        'dt_nmf_25_per_celltype_b': '#CC6699',  # Rosy brown
-        'dt_nmf_50_per_celltype_b': '#993366',  # Wine red
-        'dt_nmf_75_per_celltype_b': '#661133',  # Dark burgundy
-        'dt_nmf_90_per_celltype_b': '#440022',  # Very dark burgundy
-        
-        # === DT_PCA HYBRID STRATEGIES ===
-        # HIGHLY DISTINCT COLORS - different from dt_nmf
-        # Global + Method A (abs): CYAN-TURQUOISE family
-        'dt_pca_10_global_a': '#99FFDD',   # Very light turquoise
-        'dt_pca_25_global_a': '#66FFCC',   # Light turquoise
-        'dt_pca_50_global_a': '#00FFAA',   # Bright cyan-green
-        'dt_pca_75_global_a': '#00CC88',   # Deep turquoise
-        'dt_pca_90_global_a': '#009966',   # Very deep turquoise
-        # Global + Method B (norm): YELLOW-AMBER family
-        'dt_pca_10_global_b': '#FFEE99',   # Very light yellow
-        'dt_pca_25_global_b': '#FFD966',   # Light yellow
-        'dt_pca_50_global_b': '#FFBB33',   # Golden yellow
-        'dt_pca_75_global_b': '#FF9900',   # Amber
-        'dt_pca_90_global_b': '#CC7700',   # Very deep amber
-        # Per-celltype + Method A (abs): LIME-GREEN family
-        'dt_pca_10_per_celltype_a': '#CCFF88',  # Very light lime
-        'dt_pca_25_per_celltype_a': '#AAFF55',  # Light lime
-        'dt_pca_50_per_celltype_a': '#77DD22',  # Vivid lime
-        'dt_pca_75_per_celltype_a': '#55AA00',  # Deep lime green
-        'dt_pca_90_per_celltype_a': '#338800',  # Very deep lime green
-        # Per-celltype + Method B (norm): TEAL-FOREST family
-        'dt_pca_10_per_celltype_b': '#88CCAA',  # Very light teal
-        'dt_pca_25_per_celltype_b': '#66AA88',  # Light teal
-        'dt_pca_50_per_celltype_b': '#338866',  # Teal green
-        'dt_pca_75_per_celltype_b': '#002626',  # Almost black green
-        'dt_pca_90_per_celltype_b': '#001515',  # Very dark forest green
-        
+        'rf_simple': "#d56a0d",      # Dark orange
+        'rf_deg': "#875223",         # Brown
+
+        # === DIMRED-ONLY STRATEGIES ===  one colour per dimred type
+        'nmf': '#cc0066',            # Dark pink
+        'pca': '#006600',            # Dark forest green
+
+        # === RecoVar HYBRID (RF + NMF) ===  keyed by dimred (NMF) share, PURPLE family
+        'RecoVar_10': '#DDAAFF',  # Very light purple
+        'RecoVar_25': '#BB88FF',  # Light purple
+        'RecoVar_50': '#9933FF',  # Vivid purple
+        'RecoVar_75': '#7700CC',  # Deep purple
+        'RecoVar_90': '#550099',  # Very deep purple
+
+        # === RecoVar_PCA HYBRID (RF + PCA) ===  keyed by dimred (PCA) share, LIME-GREEN family
+        'RecoVar_PCA_10': '#CCFF88',  # Very light lime
+        'RecoVar_PCA_25': '#AAFF55',  # Light lime
+        'RecoVar_PCA_50': '#77DD22',  # Vivid lime
+        'RecoVar_PCA_75': '#55AA00',  # Deep lime green
+        'RecoVar_PCA_90': '#338800',  # Very deep lime green
+
         'Other': '#7f7f7f'    # Gray
     }
     
@@ -534,7 +480,7 @@ def get_category_colors(external_names=None):
     return category_colors
 
 
-def plot_aggregated_celltype_metrics(evaluation_results, plots_dir, title_suffix="", PNG_DPI=300, external_names=None, group_name=None):
+def plot_aggregated_celltype_metrics(evaluation_results, plots_dir, title_suffix="", PNG_DPI=DEFAULT_PNG_DPI, external_names=None, group_name=None, methods=('nmf', 'mapping')):
     """
     Create plots showing weighted and macro aggregated evaluation metrics across all cell types.
     
@@ -549,7 +495,7 @@ def plot_aggregated_celltype_metrics(evaluation_results, plots_dir, title_suffix
     with factor-specific colors instead of aggregating by strategy.
     
     MULTI-SIZE MODE: When multiple panel sizes are detected (100, 200, 500), includes
-    panel sizes in labels to plot them separately (e.g., "dt_nmf_75%_CT_abs (100)").
+    panel sizes in labels to plot them separately (e.g., "RecoVar 75% (100)").
     
     Parameters:
     -----------
@@ -559,13 +505,18 @@ def plot_aggregated_celltype_metrics(evaluation_results, plots_dir, title_suffix
         Directory to save plots
     title_suffix: str, optional (default="")
         Suffix to add to plot title
-    DEFAULT_PNG_DPI: int, optional (default=300)
+    PNG_DPI: int, optional
         DPI resolution for saved plots
     external_names: list, optional
         List of external panel names for custom coloring
     group_name: str, optional
         Plot group name (e.g., 'category-2') for special formatting
-        
+    methods: tuple of str, optional (default=('nmf', 'mapping'))
+        Which methods' summary keys (``f'{method}_celltype_summary'`` /
+        ``f'{method}_global_summary'``) to extract and plot, e.g. ``('nmf', 'pca', 'ica')``.
+        Each name must match the key convention ``load_variability_results()`` /
+        ``convert_variability_df_to_dict()`` use (the ``group_type`` string).
+
     Returns:
     --------
     plot_df: pandas.DataFrame or None
@@ -620,101 +571,43 @@ def plot_aggregated_celltype_metrics(evaluation_results, plots_dir, title_suffix
             category = f"factor_{factor_num}" if factor_num else "unknown"
         else:
             # Use helper function to extract strategy and display name
-            # Check for Category 9 first to apply special labeling
-            if group_name and 'category-9' in group_name.lower():
-                display_name = generate_category_9_label(probeset_name)
-                category, _ = extract_strategy_and_display_name(probeset_name)
-            else:
-                category, display_name = extract_strategy_and_display_name(probeset_name, include_size=include_size_in_labels)
-        
+            category, display_name = extract_strategy_and_display_name(probeset_name, include_size=include_size_in_labels)
+
         # Log the category assignment for debugging
         logging.info(f"  Probeset '{probeset_name}' → category='{category}', display='{display_name}'")
         
-        # NMF summary results (both celltype and global)
-        if 'nmf_celltype_summary' in results or 'nmf_global_summary' in results:
-            # Check which summary type is available
-            summary_key = 'nmf_celltype_summary' if 'nmf_celltype_summary' in results else 'nmf_global_summary'
-            summary = results[summary_key]
-            logging.debug(f"    Found {summary_key}, type={type(summary)}, keys={list(summary.keys()) if isinstance(summary, dict) else 'N/A'}")
-            if isinstance(summary, dict):
-                # Check if we have the required keys
-                has_weighted_mse = COL_WEIGHTED_MSE in summary
-                has_macro_mse = COL_MACRO_MSE in summary
-                logging.debug(f"    Summary has weighted_mse: {has_weighted_mse}, macro_mse: {has_macro_mse}")
-                if has_weighted_mse:
-                    logging.debug(f"    weighted_mse_test_probe = {summary.get(COL_WEIGHTED_MSE)}")
-                
-                # Store factor number if in factor-range mode
-                factor_num = extract_factor_number_from_dataset_name(probeset_name) if factor_range_mode else None
-                
-                aggregated_data.append({
-                    'probeset': probeset_name,
-                    'probeset_display': display_name,
-                    'category': category,
-                    'method': 'nmf',
-                    'aggregation': 'weighted',
-                    'mse': summary.get(COL_WEIGHTED_MSE, np.nan),
-                    'mse_std': summary.get(f'{COL_WEIGHTED_MSE}_std', np.nan),
-                    'expvar': summary.get(COL_WEIGHTED_EXPVAR, np.nan),
-                    'expvar_std': summary.get(f'{COL_WEIGHTED_EXPVAR}_std', np.nan),
-                    'mse_baseline': summary.get('weighted_mse_test_baseline', np.nan),
-                    'expvar_baseline': summary.get('weighted_expvar_test_baseline', np.nan),
-                    'factor_num': factor_num  # Add factor number for factor-range mode
-                })
-                aggregated_data.append({
-                    'probeset': probeset_name,
-                    'probeset_display': display_name,
-                    'category': category,
-                    'method': 'nmf',
-                    'aggregation': 'macro',
-                    'mse': summary.get(COL_MACRO_MSE, np.nan),
-                    'mse_std': summary.get(f'{COL_MACRO_MSE}_std', np.nan),
-                    'expvar': summary.get(COL_MACRO_EXPVAR, np.nan),
-                    'expvar_std': summary.get(f'{COL_MACRO_EXPVAR}_std', np.nan),
-                    'mse_baseline': summary.get('macro_mse_test_baseline', np.nan),
-                    'expvar_baseline': summary.get('macro_expvar_test_baseline', np.nan),
-                    'factor_num': factor_num  # Add factor number for factor-range mode
-                })
-        else:
-            logging.debug(f"    No NMF summary found (has {list(results.keys())})")
-        
-        # Mapping summary results (both celltype and global)
-        if 'mapping_celltype_summary' in results or 'mapping_global_summary' in results:
-            # Check which summary type is available
-            summary_key = 'mapping_celltype_summary' if 'mapping_celltype_summary' in results else 'mapping_global_summary'
-            summary = results[summary_key]
-            if isinstance(summary, dict):
-                # Store factor number if in factor-range mode
-                factor_num = extract_factor_number_from_dataset_name(probeset_name) if factor_range_mode else None
-                
-                aggregated_data.append({
-                    'probeset': probeset_name,
-                    'probeset_display': display_name,
-                    'category': category,
-                    'method': 'mapping',
-                    'aggregation': 'weighted',
-                    'mse': summary.get(COL_WEIGHTED_MSE, np.nan),
-                    'mse_std': summary.get(f'{COL_WEIGHTED_MSE}_std', np.nan),
-                    'expvar': summary.get(COL_WEIGHTED_EXPVAR, np.nan),
-                    'expvar_std': summary.get(f'{COL_WEIGHTED_EXPVAR}_std', np.nan),
-                    'mse_baseline': summary.get('weighted_mse_test_baseline', np.nan),
-                    'expvar_baseline': summary.get('weighted_expvar_test_baseline', np.nan),
-                    'factor_num': factor_num  # Add factor number for factor-range mode
-                })
-                aggregated_data.append({
-                    'probeset': probeset_name,
-                    'probeset_display': display_name,
-                    'category': category,
-                    'method': 'mapping',
-                    'aggregation': 'macro',
-                    'mse': summary.get(COL_MACRO_MSE, np.nan),
-                    'mse_std': summary.get(f'{COL_MACRO_MSE}_std', np.nan),
-                    'expvar': summary.get(COL_MACRO_EXPVAR, np.nan),
-                    'expvar_std': summary.get(f'{COL_MACRO_EXPVAR}_std', np.nan),
-                    'mse_baseline': summary.get('macro_mse_test_baseline', np.nan),
-                    'expvar_baseline': summary.get('macro_expvar_test_baseline', np.nan),
-                    'factor_num': factor_num  # Add factor number for factor-range mode
-                })
+        # Per-method summary results (both celltype and global), e.g. nmf/pca/ica/mapping
+        for method in methods:
+            celltype_key = f'{method}_celltype_summary'
+            global_key = f'{method}_global_summary'
+            if celltype_key in results or global_key in results:
+                summary_key = celltype_key if celltype_key in results else global_key
+                summary = results[summary_key]
+                logging.debug(f"    Found {summary_key}, type={type(summary)}, keys={list(summary.keys()) if isinstance(summary, dict) else 'N/A'}")
+                if isinstance(summary, dict):
+                    # Store factor number if in factor-range mode
+                    factor_num = extract_factor_number_from_dataset_name(probeset_name) if factor_range_mode else None
+
+                    for aggregation, mse_col, expvar_col in (
+                        ('weighted', COL_WEIGHTED_MSE, COL_WEIGHTED_EXPVAR),
+                        ('macro', COL_MACRO_MSE, COL_MACRO_EXPVAR),
+                    ):
+                        aggregated_data.append({
+                            'probeset': probeset_name,
+                            'probeset_display': display_name,
+                            'category': category,
+                            'method': method,
+                            'aggregation': aggregation,
+                            'mse': summary.get(mse_col, np.nan),
+                            'mse_std': summary.get(f'{mse_col}_std', np.nan),
+                            'expvar': summary.get(expvar_col, np.nan),
+                            'expvar_std': summary.get(f'{expvar_col}_std', np.nan),
+                            'mse_baseline': summary.get(f'{aggregation}_mse_test_baseline', np.nan),
+                            'expvar_baseline': summary.get(f'{aggregation}_expvar_test_baseline', np.nan),
+                            'factor_num': factor_num  # Add factor number for factor-range mode
+                        })
+            else:
+                logging.debug(f"    No {method} summary found (has {list(results.keys())})")
     
     if not aggregated_data:
         logging.warning("No valid summary data found for plotting")
@@ -752,13 +645,13 @@ def plot_aggregated_celltype_metrics(evaluation_results, plots_dir, title_suffix
         def get_color_for_row(row):
             return category_colors.get(row['category'], '#7f7f7f')
     
-    # Create combined plots for each method (nmf and mapping)
-    for method in ['nmf', 'mapping']:
+    # Create combined plots for each requested method
+    for method in methods:
         method_data = plot_df[plot_df['method'] == method].copy()
-        
+
         if method_data.empty:
             continue
-        
+
         # Create MSE plot - comparing weighted vs macro
         if not method_data['mse'].isna().all():
             logging.info(f"  Creating aggregated MSE plot for {method} ({len(method_data)} rows)")
@@ -799,17 +692,17 @@ def plot_aggregated_celltype_metrics(evaluation_results, plots_dir, title_suffix
                 ax.legend(loc='lower right', fontsize=14)
 
                 # Set title and labels
-                ax.set_title(f'{method.title()} MSE - {aggregation_type.title()} Average (lower is better)')
+                ax.set_title(f'{_method_display(method)} MSE - {aggregation_type.title()} Average (lower is better)')
                 ax.set_xlabel('MSE (lower is better)')
                 ax.set_ylabel('Geneset')
-            
-            plt.suptitle(f'{method.title()} MSE - Weighted vs Macro Comparison{title_suffix}', fontsize=20, y=1.00)
+
+            plt.suptitle(f'{_method_display(method)} MSE - Weighted vs Macro Comparison{title_suffix}', fontsize=20, y=1.00)
             plt.tight_layout()
             
             # Save MSE plot
             plot_filename = f"aggregated_{method}_mse_weighted_macro_comparison{title_suffix.replace(' ', '_').replace('/', '_')}.png"
             plot_path = os.path.join(plots_dir, plot_filename)
-            plt.savefig(plot_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+            plt.savefig(plot_path, dpi=PNG_DPI, bbox_inches='tight')
             plt.close()
             
             logging.info(f"Created aggregated MSE plot: {plot_filename}")
@@ -856,17 +749,17 @@ def plot_aggregated_celltype_metrics(evaluation_results, plots_dir, title_suffix
                 ax.legend(loc='lower right', fontsize=14)
 
                 # Set title and labels
-                ax.set_title(f'{method.title()} Explained Variance - {aggregation_type.title()} Average (higher is better)')
+                ax.set_title(f'{_method_display(method)} Explained Variance - {aggregation_type.title()} Average (higher is better)')
                 ax.set_xlabel('Explained Variance (higher is better)')
                 ax.set_ylabel('Geneset')
-            
-            plt.suptitle(f'{method.title()} Explained Variance - Weighted vs Macro Comparison{title_suffix}', fontsize=20, y=1.00)
+
+            plt.suptitle(f'{_method_display(method)} Explained Variance - Weighted vs Macro Comparison{title_suffix}', fontsize=20, y=1.00)
             plt.tight_layout()
             
             # Save Explained Variance plot
             plot_filename = f"aggregated_{method}_expvar_weighted_macro_comparison{title_suffix.replace(' ', '_').replace('/', '_')}.png"
             plot_path = os.path.join(plots_dir, plot_filename)
-            plt.savefig(plot_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+            plt.savefig(plot_path, dpi=PNG_DPI, bbox_inches='tight')
             plt.close()
             
             logging.info(f"Created aggregated Explained Variance plot: {plot_filename}")
@@ -876,7 +769,7 @@ def plot_aggregated_celltype_metrics(evaluation_results, plots_dir, title_suffix
     return plot_df
 
 
-def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix="", PNG_DPI=300, external_names=None, group_name=None, plot_celltype=True):
+def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix="", PNG_DPI=DEFAULT_PNG_DPI, external_names=None, group_name=None, plot_celltype=True, methods=('nmf', 'mapping')):
     """
     Create combined plots showing celltype-specific evaluation results with all NMF:DEG ratios 
     and baseline methods in single plots with reference lines.
@@ -887,7 +780,7 @@ def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix
     with factor-specific colors instead of aggregating by strategy.
     
     MULTI-SIZE MODE: When multiple panel sizes are detected (100, 200, 500), includes
-    panel sizes in labels to plot them separately (e.g., "dt_nmf_75%_CT_abs (100)").
+    panel sizes in labels to plot them separately (e.g., "RecoVar 75% (100)").
     
     Parameters:
     -----------
@@ -897,7 +790,7 @@ def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix
         Directory to save plots
     title_suffix: str, optional (default="")
         Suffix to add to plot title
-    DEFAULT_PNG_DPI: int, optional (default=300)
+    PNG_DPI: int, optional
         DPI resolution for saved plots
     external_names: list, optional
         List of external panel names for custom coloring
@@ -905,7 +798,10 @@ def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix
         Plot group name (e.g., 'category-2') for special formatting
     plot_celltype: bool, optional (default=True)
         If False, skip creating individual celltype plots
-        
+    methods: tuple of str, optional (default=('nmf', 'mapping'))
+        Which methods' celltype-results keys (``f'{method}_celltype_celltype_results'``)
+        to extract and plot, e.g. ``('nmf', 'pca', 'ica')``.
+
     Returns:
     --------
     plot_df: pandas.DataFrame or None
@@ -914,17 +810,20 @@ def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix
     if not evaluation_results:
         logging.warning("No evaluation results to plot")
         return None
-    
+
     # Skip celltype plots if requested
     if not plot_celltype:
         logging.info("Skipping celltype-specific plots (plot_celltype=False)")
         return None
-    
+
     # Check if any results contain celltype data
     has_celltype_data = False
     for probeset_name, results in evaluation_results.items():
-        if any(key.startswith('nmf_celltype_celltype_results') or
-               key.startswith('mapping_celltype_celltype_results') for key in results.keys()):
+        if any(
+            key.startswith(f'{m}_celltype_celltype_results')
+            for m in methods
+            for key in results.keys()
+        ):
             has_celltype_data = True
             break
     
@@ -960,60 +859,33 @@ def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix
             category = f"factor_{factor_num}" if factor_num else "unknown"
         else:
             # Use helper function to extract strategy and display name
-            # Check for Category 9 first to apply special labeling
-            if group_name and 'category-9' in group_name.lower():
-                display_name = generate_category_9_label(probeset_name)
-                category, _ = extract_strategy_and_display_name(probeset_name)
-            else:
-                category, display_name = extract_strategy_and_display_name(probeset_name, include_size=include_size_in_labels)
-        
-        # NMF celltype results
-        if 'nmf_celltype_celltype_results' in results:
-            celltype_results = results['nmf_celltype_celltype_results']
-            if isinstance(celltype_results, dict):
-                for celltype, celltype_metrics in celltype_results.items():
-                    if not celltype_metrics.get(COL_SKIPPED, False):
-                        # Store factor number if in factor-range mode
-                        factor_num = extract_factor_number_from_dataset_name(probeset_name) if factor_range_mode else None
+            category, display_name = extract_strategy_and_display_name(probeset_name, include_size=include_size_in_labels)
 
-                        celltype_data.append({
-                            'probeset': probeset_name,
-                            'probeset_display': display_name,
-                            'category': category,
-                            'celltype': celltype,
-                            'method': 'nmf',
-                            # Use absolute values 
-                            'mse': celltype_metrics.get(COL_MSE_TEST_PROBE, np.nan),
-                            'expvar': celltype_metrics.get(COL_EXPVAR_TEST_PROBE, np.nan),
-                            'mse_baseline': celltype_metrics.get('mse_test_baseline', np.nan),
-                            'expvar_baseline': celltype_metrics.get('expvar_test_baseline', np.nan),
-                            COL_N_CELLS: celltype_metrics.get(COL_N_CELLS, 0),
-                            'factor_num': factor_num  # Add factor number for factor-range mode
-                        })
-        
-        # Mapping celltype results
-        if 'mapping_celltype_celltype_results' in results:
-            celltype_results = results['mapping_celltype_celltype_results']
-            if isinstance(celltype_results, dict):
-                for celltype, celltype_metrics in celltype_results.items():
-                    if not celltype_metrics.get(COL_SKIPPED, False):
-                        # Store factor number if in factor-range mode
-                        factor_num = extract_factor_number_from_dataset_name(probeset_name) if factor_range_mode else None
-                        
-                        celltype_data.append({
-                            'probeset': probeset_name,
-                            'probeset_display': display_name,
-                            'category': category,
-                            'celltype': celltype,
-                            'method': 'mapping',
-                            # Use absolute values
-                            'mse': celltype_metrics.get(COL_MSE_TEST_PROBE, np.nan),
-                            'expvar': celltype_metrics.get(COL_EXPVAR_TEST_PROBE, np.nan),
-                            'mse_baseline': celltype_metrics.get('mse_test_baseline', np.nan),
-                            'expvar_baseline': celltype_metrics.get('expvar_test_baseline', np.nan),
-                            COL_N_CELLS: celltype_metrics.get(COL_N_CELLS, 0),
-                            'factor_num': factor_num  # Add factor number for factor-range mode
-                        })
+        # Per-method celltype results, e.g. nmf/pca/ica/mapping
+        for method in methods:
+            key = f'{method}_celltype_celltype_results'
+            if key in results:
+                celltype_results = results[key]
+                if isinstance(celltype_results, dict):
+                    for celltype, celltype_metrics in celltype_results.items():
+                        if not celltype_metrics.get(COL_SKIPPED, False):
+                            # Store factor number if in factor-range mode
+                            factor_num = extract_factor_number_from_dataset_name(probeset_name) if factor_range_mode else None
+
+                            celltype_data.append({
+                                'probeset': probeset_name,
+                                'probeset_display': display_name,
+                                'category': category,
+                                'celltype': celltype,
+                                'method': method,
+                                # Use absolute values
+                                'mse': celltype_metrics.get(COL_MSE_TEST_PROBE, np.nan),
+                                'expvar': celltype_metrics.get(COL_EXPVAR_TEST_PROBE, np.nan),
+                                'mse_baseline': celltype_metrics.get('mse_test_baseline', np.nan),
+                                'expvar_baseline': celltype_metrics.get('expvar_test_baseline', np.nan),
+                                COL_N_CELLS: celltype_metrics.get(COL_N_CELLS, 0),
+                                'factor_num': factor_num  # Add factor number for factor-range mode
+                            })
     
     if not celltype_data:
         logging.warning("No valid celltype data found for plotting")
@@ -1037,8 +909,8 @@ def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix
         def get_color_for_row(row):
             return category_colors.get(row['category'], '#7f7f7f')
     
-    # Create combined plots for each method and celltype combination (2 plots total per celltype per method)
-    for method in ['nmf', 'mapping']:
+    # Create combined plots for each requested method and celltype combination (2 plots total per celltype per method)
+    for method in methods:
         method_data = plot_df[plot_df['method'] == method].copy()
         
         if method_data.empty:
@@ -1080,7 +952,7 @@ def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix
                                label=f'Full NMF Baseline ({baseline_mse:.2e})', alpha=0.7)
                 
                 # Set title and labels
-                ax.set_title(f'{method.title()} MSE - {celltype} (lower is better){title_suffix}')
+                ax.set_title(f'{_method_display(method)} MSE - {celltype} (lower is better){title_suffix}')
                 ax.set_xlabel('MSE (lower is better)')
                 ax.set_ylabel('Geneset')
                 
@@ -1090,7 +962,7 @@ def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix
                 safe_celltype = celltype.replace('/', '_').replace(' ', '_')
                 plot_filename = f"celltype_{method}_mse_{safe_celltype}_combined{title_suffix.replace(' ', '_').replace('/', '_')}.png"
                 plot_path = os.path.join(plots_dir, plot_filename)
-                plt.savefig(plot_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+                plt.savefig(plot_path, dpi=PNG_DPI, bbox_inches='tight')
                 plt.close()
                 
                 logging.info(f"Created combined celltype MSE plot: {plot_filename}")
@@ -1117,7 +989,7 @@ def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix
                                label=f'Full NMF Baseline ({baseline_expvar:.3f})', alpha=0.7)
                 
                 # Set title and labels
-                ax.set_title(f'{method.title()} Explained Variance - {celltype} (higher is better){title_suffix}')
+                ax.set_title(f'{_method_display(method)} Explained Variance - {celltype} (higher is better){title_suffix}')
                 ax.set_xlabel('Explained Variance (higher is better)')
                 ax.set_ylabel('Geneset')
                 
@@ -1127,7 +999,7 @@ def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix
                 safe_celltype = celltype.replace('/', '_').replace(' ', '_')
                 plot_filename = f"celltype_{method}_expvar_{safe_celltype}_combined{title_suffix.replace(' ', '_').replace('/', '_')}.png"
                 plot_path = os.path.join(plots_dir, plot_filename)
-                plt.savefig(plot_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
+                plt.savefig(plot_path, dpi=PNG_DPI, bbox_inches='tight')
                 plt.close()
                 
                 logging.info(f"Created combined celltype Explained Variance plot: {plot_filename}")
@@ -1135,14 +1007,207 @@ def plot_celltype_evaluation_results(evaluation_results, plots_dir, title_suffix
     return plot_df
 
 
-def create_combined_plot_with_info(classifier_type, gene_count, metric, results, output_dir, 
-                                   filter_type, gene_sel, PNG_DPI=300, external_names=None, group_name=None):
+def plot_ridge_aggregated_celltype_metrics(
+    ridge_df,
+    plots_dir,
+    space,
+    title_suffix="",
+    PNG_DPI=DEFAULT_PNG_DPI,
+    external_names=None,
+    group_name=None,
+):
+    """Ridge aggregated weighted/macro MSE + ExpVar bar comparison for one space.
+
+    Mirrors ``plot_aggregated_celltype_metrics``'s weighted|macro grouped-bar-chart
+    layout, but reads Ridge's flat per-panel DataFrame directly (``celltype ==
+    "summary"``, ``analysis_type == "per_celltype"`` rows) instead of the
+    nmf/pca/ica-style nested ``"{method}_celltype_summary"`` dict, since Ridge's
+    column-naming convention (``_raw``/``_lognorm`` suffix, ``mean_baseline`` not
+    ``test_baseline``) doesn't fit that shape.
+
+    v1 scope: only this aggregated weighted/macro comparison ships for Ridge —
+    per-celltype bars, the global combined plot, and the gene-subset/expvar-mode
+    grid are deferred.
+
+    Args:
+        ridge_df: Concatenated per-panel Ridge variability DataFrame (typically
+            ``results['ridge']`` from ``load_variability_results()``). Column
+            names may be either bare (per-fold CSVs) or ``_mean``/``_std``-suffixed
+            (fold-aggregated CSVs); both are handled via a fallback lookup.
+        plots_dir: Output directory (created if missing).
+        space: ``"raw"`` or ``"lognorm"`` — which of Ridge's two spaces to plot.
+        title_suffix: Appended to plot titles / filenames.
+        PNG_DPI: Save resolution.
+        external_names: Passed to ``extract_strategy_and_display_name`` for labels.
+        group_name: Unused; accepted for call-site symmetry with the NMF/PCA/ICA
+            plotting functions.
+
+    Returns:
+        plot_df: pandas.DataFrame with one row per (panel, aggregation) used for
+            plotting, or ``None`` if no usable data was found.
+    """
+    if space not in ("raw", "lognorm"):
+        raise ValueError(f"space must be 'raw' or 'lognorm', got {space!r}")
+    if ridge_df is None or len(ridge_df) == 0:
+        logging.warning("plot_ridge_aggregated_celltype_metrics: empty ridge_df — skipping")
+        return None
+
+    col_map = {
+        "weighted_mse": COL_WEIGHTED_MSE_RAW if space == "raw" else COL_WEIGHTED_MSE_LOGNORM,
+        "macro_mse": COL_MACRO_MSE_RAW if space == "raw" else COL_MACRO_MSE_LOGNORM,
+        "weighted_expvar": COL_WEIGHTED_EXPVAR_RAW if space == "raw" else COL_WEIGHTED_EXPVAR_LOGNORM,
+        "macro_expvar": COL_MACRO_EXPVAR_RAW if space == "raw" else COL_MACRO_EXPVAR_LOGNORM,
+        "weighted_mse_baseline": COL_WEIGHTED_MSE_BASELINE_RAW if space == "raw" else COL_WEIGHTED_MSE_BASELINE_LOGNORM,
+        "macro_mse_baseline": COL_MACRO_MSE_BASELINE_RAW if space == "raw" else COL_MACRO_MSE_BASELINE_LOGNORM,
+        "weighted_expvar_baseline": COL_WEIGHTED_EXPVAR_BASELINE_RAW if space == "raw" else COL_WEIGHTED_EXPVAR_BASELINE_LOGNORM,
+        "macro_expvar_baseline": COL_MACRO_EXPVAR_BASELINE_RAW if space == "raw" else COL_MACRO_EXPVAR_BASELINE_LOGNORM,
+    }
+
+    def _val(row, base_col):
+        # Bare column first (per-fold CSVs), then _mean (fold-aggregated CSVs).
+        for candidate in (base_col, f"{base_col}_mean"):
+            if candidate in row.index and pd.notna(row[candidate]):
+                try:
+                    return float(row[candidate])
+                except (TypeError, ValueError):
+                    continue
+        return np.nan
+
+    def _std(row, base_col):
+        candidate = f"{base_col}_std"
+        if candidate in row.index and pd.notna(row[candidate]):
+            try:
+                return float(row[candidate])
+            except (TypeError, ValueError):
+                return np.nan
+        return np.nan
+
+    if "celltype" not in ridge_df.columns or "analysis_type" not in ridge_df.columns:
+        logging.warning(
+            "plot_ridge_aggregated_celltype_metrics: ridge_df missing 'celltype'/'analysis_type' — skipping"
+        )
+        return None
+    summary_rows = ridge_df[
+        (ridge_df["celltype"] == "summary") & (ridge_df["analysis_type"] == "per_celltype")
+    ]
+    if summary_rows.empty:
+        logging.warning(
+            "plot_ridge_aggregated_celltype_metrics: no celltype=='summary' rows found — skipping"
+        )
+        return None
+
+    panel_col = "gene_list" if "gene_list" in summary_rows.columns else "dataset"
+
+    rows = []
+    for _, row in summary_rows.iterrows():
+        panel_name = row.get(panel_col, row.get("dataset", "unknown"))
+        _, display_name = extract_strategy_and_display_name(panel_name)
+        for aggregation in ("weighted", "macro"):
+            rows.append({
+                "panel": panel_name,
+                "probeset_display": display_name,
+                "aggregation": aggregation,
+                "mse": _val(row, col_map[f"{aggregation}_mse"]),
+                "mse_std": _std(row, col_map[f"{aggregation}_mse"]),
+                "expvar": _val(row, col_map[f"{aggregation}_expvar"]),
+                "expvar_std": _std(row, col_map[f"{aggregation}_expvar"]),
+                "mse_baseline": _val(row, col_map[f"{aggregation}_mse_baseline"]),
+                "expvar_baseline": _val(row, col_map[f"{aggregation}_expvar_baseline"]),
+            })
+
+    plot_df = pd.DataFrame(rows)
+    if plot_df.empty or (plot_df["mse"].isna().all() and plot_df["expvar"].isna().all()):
+        logging.warning(f"plot_ridge_aggregated_celltype_metrics [{space}]: no usable data — skipping")
+        return None
+
+    os.makedirs(plots_dir, exist_ok=True)
+    space_label = "Raw" if space == "raw" else "Lognorm"
+
+    def _safe_filename_suffix():
+        return (
+            f"{title_suffix}_-_Ridge_{space_label}"
+            .replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
+        )
+
+    # MSE plot
+    if not plot_df['mse'].isna().all():
+        fig, axes = plt.subplots(1, 2, figsize=(20, max(8, len(plot_df['probeset_display'].unique()) * 0.5)))
+        for idx, aggregation_type in enumerate(['weighted', 'macro']):
+            ax = axes[idx]
+            agg_data = plot_df[plot_df['aggregation'] == aggregation_type].copy()
+            if agg_data.empty:
+                continue
+            agg_data = agg_data.sort_values('mse', ascending=True)
+            y_pos = np.arange(len(agg_data))
+            mse_vals = agg_data['mse'].to_numpy(dtype=float)
+            mse_std = np.nan_to_num(agg_data['mse_std'].to_numpy(dtype=float), nan=0.0)
+            ax.barh(y=y_pos, width=mse_vals, xerr=mse_std, color='lightblue',
+                    edgecolor='#00008B', linewidth=2, ecolor='#1f2a44', capsize=3)
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(agg_data['probeset_display'].tolist())
+            ax.invert_yaxis()
+            baseline_mse = agg_data['mse_baseline'].dropna().iloc[0] if not agg_data['mse_baseline'].dropna().empty else None
+            if baseline_mse is not None and not np.isnan(baseline_mse):
+                ax.axvline(x=baseline_mse, color='red', linestyle='--',
+                           label=f'Mean-Predictor Baseline ({baseline_mse:.2e})', alpha=0.7)
+            ax.legend(loc='lower right', fontsize=14)
+            ax.set_title(f'Ridge ({space_label}) MSE - {aggregation_type.title()} Average (lower is better)')
+            ax.set_xlabel('MSE (lower is better)')
+            ax.set_ylabel('Geneset')
+        plt.suptitle(f'Ridge ({space_label}) MSE - Weighted vs Macro Comparison{title_suffix}', fontsize=20, y=1.00)
+        plt.tight_layout()
+        plot_filename = f"aggregated_ridge_mse_weighted_macro_comparison_{_safe_filename_suffix()}.png"
+        plt.savefig(os.path.join(plots_dir, plot_filename), dpi=PNG_DPI, bbox_inches='tight')
+        plt.close()
+        logging.info(f"Created aggregated Ridge ({space}) MSE plot: {plot_filename}")
+    else:
+        logging.warning(f"  Skipping aggregated Ridge ({space}) MSE plot: all MSE values are NaN")
+
+    # Explained Variance plot
+    if not plot_df['expvar'].isna().all():
+        fig, axes = plt.subplots(1, 2, figsize=(20, max(8, len(plot_df['probeset_display'].unique()) * 0.5)))
+        for idx, aggregation_type in enumerate(['weighted', 'macro']):
+            ax = axes[idx]
+            agg_data = plot_df[plot_df['aggregation'] == aggregation_type].copy()
+            if agg_data.empty:
+                continue
+            agg_data = agg_data.sort_values('expvar', ascending=False)
+            y_pos = np.arange(len(agg_data))
+            exp_vals = agg_data['expvar'].to_numpy(dtype=float)
+            exp_std = np.nan_to_num(agg_data['expvar_std'].to_numpy(dtype=float), nan=0.0)
+            ax.barh(y=y_pos, width=exp_vals, xerr=exp_std, color='lightblue',
+                    edgecolor='#00008B', linewidth=2, ecolor='#1f2a44', capsize=3)
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(agg_data['probeset_display'].tolist())
+            ax.invert_yaxis()
+            baseline_expvar = agg_data['expvar_baseline'].dropna().iloc[0] if not agg_data['expvar_baseline'].dropna().empty else None
+            if baseline_expvar is not None and not np.isnan(baseline_expvar):
+                ax.axvline(x=baseline_expvar, color='red', linestyle='--',
+                           label=f'Mean-Predictor Baseline ({baseline_expvar:.3f})', alpha=0.7)
+            ax.legend(loc='lower right', fontsize=14)
+            ax.set_title(f'Ridge ({space_label}) Explained Variance - {aggregation_type.title()} Average (higher is better)')
+            ax.set_xlabel('Explained Variance (higher is better)')
+            ax.set_ylabel('Geneset')
+        plt.suptitle(f'Ridge ({space_label}) Explained Variance - Weighted vs Macro Comparison{title_suffix}', fontsize=20, y=1.00)
+        plt.tight_layout()
+        plot_filename = f"aggregated_ridge_expvar_weighted_macro_comparison_{_safe_filename_suffix()}.png"
+        plt.savefig(os.path.join(plots_dir, plot_filename), dpi=PNG_DPI, bbox_inches='tight')
+        plt.close()
+        logging.info(f"Created aggregated Ridge ({space}) ExpVar plot: {plot_filename}")
+    else:
+        logging.warning(f"  Skipping aggregated Ridge ({space}) ExpVar plot: all ExpVar values are NaN")
+
+    return plot_df
+
+
+def create_combined_plot_with_info(classifier_type, gene_count, metric, results, output_dir,
+                                   filter_type, gene_sel, PNG_DPI=DEFAULT_PNG_DPI, external_names=None, group_name=None):
     """
     Create a plot for a specific metric that includes all methods (HVG, Random, Spapros, and all NMF/DEG ratios).
     Plots are saved with evaluation method prefix to prevent overwriting between NMF and mapping strategies.
     
     MULTI-SIZE MODE: When multiple panel sizes are detected (100, 200, 500), includes
-    panel sizes in labels to plot them separately (e.g., "dt_nmf_75%_CT_abs (100)").
+    panel sizes in labels to plot them separately (e.g., "RecoVar 75% (100)").
     
     Parameters:
     -----------
@@ -1151,8 +1216,7 @@ def create_combined_plot_with_info(classifier_type, gene_count, metric, results,
     gene_count: int
         The gene count (100, 200, or 500)
     metric: str
-        The metric to plot (nmf_mse, nmf_expvar, mapping_mse, mapping_expvar,
-        nmf_mse_ratio, nmf_expvar_ratio, mapping_mse_ratio_test, mapping_generalization_gap)
+        The metric to plot (nmf_mse, nmf_expvar, mapping_mse, mapping_expvar)
     results: dict
         Dictionary with metric data for different methods
     output_dir: str
@@ -1161,7 +1225,7 @@ def create_combined_plot_with_info(classifier_type, gene_count, metric, results,
         The filter type (With-Xenium-Filter or No-Xenium-Filter)
     gene_sel: str
         The gene selection method (all-genes or hvg)
-    DEFAULT_PNG_DPI: int, optional (default=300)
+    PNG_DPI: int, optional
         DPI resolution for saved plots
     external_names: list, optional
         List of external panel names for custom coloring
@@ -1170,8 +1234,8 @@ def create_combined_plot_with_info(classifier_type, gene_count, metric, results,
         
     Note:
     -----
-    Filename format: EvaluationMethod_metric_classifier_genecount_filter_geneselection_ratio.png
-    Example: NMF_nmf_mse_ratio_Decision-tree_100genes_NoFilter_allgenes_25-NMF_75-DEG.png
+    Filename format: EvaluationMethod_metric_classifier_genecount_filter_geneselection.png
+    Example: NMF_nmf_mse_Decision-tree_100genes_NoFilter_allgenes_25-NMF_75-DEG.png
     """
     # Skip if no data for this metric
     if not results or metric not in results or not results[metric]:
@@ -1228,13 +1292,8 @@ def create_combined_plot_with_info(classifier_type, gene_count, metric, results,
             category = f"factor_{factor_num}" if factor_num else "unknown"
         else:
             # Use helper function to extract strategy and display name
-            # Check for Category 9 first to apply special labeling
-            if group_name and 'category-9' in group_name.lower():
-                display_name = generate_category_9_label(method)
-                category, _ = extract_strategy_and_display_name(method)
-            else:
-                category, display_name = extract_strategy_and_display_name(method, include_size=include_size_in_labels)
-        
+            category, display_name = extract_strategy_and_display_name(method, include_size=include_size_in_labels)
+
         plot_data.append({
             'Method': method,
             'DisplayName': display_name,
@@ -1256,7 +1315,7 @@ def create_combined_plot_with_info(classifier_type, gene_count, metric, results,
     # In factor-range mode, sort by factor number instead
     if factor_range_mode:
         plot_df = plot_df.sort_values('FactorNum', ascending=True)
-    elif metric in ["mse", "nmf_mse", "mapping_mse", "representation_ratio_mse", "nmf_mse_ratio", "mapping_mse_ratio_test", "mapping_generalization_gap"]:
+    elif metric in ["mse", "nmf_mse", "mapping_mse"]:
         plot_df = plot_df.sort_values('Value', ascending=True)
     else:
         plot_df = plot_df.sort_values('Value', ascending=False)
@@ -1305,37 +1364,6 @@ def create_combined_plot_with_info(classifier_type, gene_count, metric, results,
     elif metric == "explained_variance":
         title = f"Explained Variance - {gene_count} genes"
         xlabel = "Explained Variance (higher is better)"
-    elif metric == "representation_ratio_mse":
-        title = f"MSE Ratio (Probeset/Full) - {gene_count} genes"
-        xlabel = "MSE Ratio (lower is better)"
-        # Add a line at x=1.0 to show the baseline (full NMF)
-        plt.axvline(x=1.0, color='red', linestyle='--', label='Full NMF Baseline')
-    elif metric == "representation_ratio_var":
-        title = f"Explained Variance Ratio (Probeset/Full) - {gene_count} genes"
-        xlabel = "Explained Variance Ratio (higher is better)"
-        # Add a line at x=1.0 to show the baseline (full NMF)
-        plt.axvline(x=1.0, color='red', linestyle='--', label='Full NMF Baseline')
-    # Legacy ratio metrics
-    elif metric == "nmf_mse_ratio":
-        title = f"NMF MSE Ratio (Probe/Baseline) - {gene_count} genes"
-        xlabel = "MSE Ratio (lower is better)"
-        # Add a line at x=1.0 to show the baseline
-        plt.axvline(x=1.0, color='red', linestyle='--', label='Baseline')
-    elif metric == "nmf_expvar_ratio":
-        title = f"NMF Explained Variance Ratio - {gene_count} genes"
-        xlabel = "ExpVar Ratio (higher is better)"
-        # Add a line at x=1.0 to show the baseline
-        plt.axvline(x=1.0, color='red', linestyle='--', label='Baseline')
-    elif metric == "mapping_mse_ratio_test":
-        title = f"Mapping MSE Ratio (Test) - {gene_count} genes"
-        xlabel = "MSE Ratio (lower is better)"
-        # Add a line at x=1.0 to show the baseline
-        plt.axvline(x=1.0, color='red', linestyle='--', label='Baseline')
-    elif metric == "mapping_generalization_gap":
-        title = f"Mapping Generalization Gap - {gene_count} genes"
-        xlabel = "Generalization Gap (lower is better)"
-        # Add a line at x=0.0 to show the ideal
-        plt.axvline(x=0.0, color='red', linestyle='--', label='Ideal (No Gap)')
     else:
         title = f"{metric} - {gene_count} genes"
         xlabel = metric
@@ -1371,66 +1399,432 @@ def create_combined_plot_with_info(classifier_type, gene_count, metric, results,
     filter_short = "WithFilter" if "With" in filter_type else "NoFilter"
     gene_sel_short = gene_sel.replace("-", "")
     
-    # Determine evaluation method from metric name to avoid overwriting plots
-    if metric.startswith("nmf_"):
-        eval_method_prefix = "NMF"
-        metric_short = metric.replace("nmf_", "")  # Remove prefix to avoid duplication
-    elif metric.startswith("mapping_"):
-        eval_method_prefix = "Mapping"
-        metric_short = metric.replace("mapping_", "")  # Remove prefix to avoid duplication
+    # Determine evaluation method from metric name to avoid overwriting plots.
+    # Generic split on the first "_" + _method_display() lookup, rather than a
+    # hardcoded nmf_/mapping_ check -- the latter silently mis-routed PCA/ICA's
+    # "PCA_mse"/"ICA_mse" metrics (capitalised, no underscore-prefix match) to
+    # "Unknown_...png" instead of "PCA_...png"/"ICA_...png".
+    metric_prefix, sep, metric_short = metric.partition("_")
+    if sep:
+        eval_method_prefix = _method_display(metric_prefix)
     else:
         eval_method_prefix = "Unknown"
         metric_short = metric
     
     # Create combined plot filename
     filename = f"{eval_method_prefix}_{metric_short}_{classifier_name}_{gene_count}genes_{filter_short}_{gene_sel_short}.png"
-    plt.savefig(os.path.join(output_dir, filename), dpi=DEFAULT_PNG_DPI)
+    plt.savefig(os.path.join(output_dir, filename), dpi=PNG_DPI)
     plt.close()
     
     logging.info(f"Created combined plot for {metric} with {gene_count} genes (all NMF:DEG ratios) in {output_dir}/{filename}")
 
 
-def plot_standardized_comparison(
-    summary_df: pd.DataFrame,
-    group_col: str,
-    output_path: str,
-    title: str = "Standardized Performance Comparison",
-    colors: list[str] | None = None,
-) -> None:
-    """Bar chart comparing standardized scores across groups.
+# ---------------------------------------------------------------------------
+# Gene-subset explained-variance breakdown (all-genes / panel-only / non-panel)
+# ---------------------------------------------------------------------------
+
+# scoring-time gene subsets emitted by Evaluation-module/nmf.py's expvar grid
+_GENE_SUBSETS = ["all_genes", "panel_genes_only", "non_panel_genes_only"]
+_GENE_SUBSET_LABEL = {
+    "all_genes": "all genes",
+    "panel_genes_only": "panel genes only",
+    "non_panel_genes_only": "non-panel genes only",
+}
+_GENE_SUBSET_COLOR = {
+    "all_genes": "#00008B",             # dark blue   — the blended number
+    "panel_genes_only": "#FFFFFF",      # white       — genes the panel measures
+    "non_panel_genes_only": "#D3D3D3",  # light grey  — the true generalization
+}
+# explained-variance aggregation modes (mirrors Evaluation-module/metrics.EXPVAR_MODES)
+_EXPVAR_MODES = ["global_mean", "variance_weighted_sum", "mean", "median",
+                 "expression_weighted_sum"]
+
+
+def _gs_agg_prefix(agg):
+    return "" if agg == "global" else f"{agg}_"
+
+
+def _gs_probe_col(agg, subset, mode, suffix="mean"):
+    return f"{_gs_agg_prefix(agg)}expvar_test_probe_{subset}_{mode}_{suffix}"
+
+
+def _gs_baseline_col(agg, mode):
+    # baseline is subset-agnostic (full-gene NMF oracle)
+    return f"{_gs_agg_prefix(agg)}expvar_test_baseline_{mode}_mean"
+
+
+def _gs_pick_row(panel_df, agg):
+    if agg == "global":
+        rows = panel_df[panel_df.get("analysis_type") == "global"]
+    else:
+        rows = panel_df[(panel_df.get("analysis_type") == "per_celltype")
+                        & (panel_df.get("celltype") == "summary")]
+    return rows.iloc[0] if not rows.empty else None
+
+
+def _gs_val(row, col):
+    if row is None or col not in row.index:
+        return np.nan
+    try:
+        return float(row.get(col))
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _gs_resolve_modes(nmf_df, expvar_modes):
+    """Normalise the requested modes.
+
+    ``expvar_modes=None`` -> auto-detect: only the modes whose columns are
+    actually present in the CSV (i.e. only those the evaluation computed).
+    An explicit list is honoured but still filtered to known mode names;
+    modes requested but absent from the CSV are simply skipped later.
+    """
+    if expvar_modes:
+        req = [expvar_modes] if isinstance(expvar_modes, str) else list(expvar_modes)
+        return [m for m in req if m in _EXPVAR_MODES] or ["global_mean"]
+    cols = set(getattr(nmf_df, "columns", []))
+    present = [m for m in _EXPVAR_MODES
+               if f"expvar_test_probe_all_genes_{m}_mean" in cols]
+    if present:
+        return present
+    return ["global_mean"] if "expvar_test_probe" in cols else []
+
+
+def plot_expvar_gene_subset_breakdown(
+    nmf_df,
+    plots_dir,
+    title_suffix="",
+    PNG_DPI=DEFAULT_PNG_DPI,
+    expvar_modes=None,
+    external_names=None,
+    group_name=None,
+):
+    """Diagnostic: probe-reconstruction explained variance split by gene subset.
+
+    For every panel it draws a grouped bar chart of ``expvar_test_probe`` for
+    ``all_genes`` / ``panel_genes_only`` / ``non_panel_genes_only`` (a scoring-time
+    column mask on the same reconstruction — no separate NMF fit), with the
+    full-gene NMF oracle baseline as a red dashed reference. The
+    ``non_panel_genes_only`` bar is the real generalization number: how much of
+    the variance of genes the panel does *not* measure it can still recover.
+
+    One figure per (aggregation level x explained-variance mode) is written:
+      ``expvar_gene_subset_breakdown_{agg}_{mode}{suffix}.png``
+    ``agg`` in ``global`` (``analysis_type == "global"`` row) and ``macro``
+    (per-cell-type ``summary`` row, ``macro_expvar_test_probe_*``, when present).
+    A ``mode`` is only plotted if the evaluation actually computed it (i.e. its
+    ``expvar_test_probe_all_genes_<mode>_mean`` column exists) — with
+    ``expvar_modes=None`` that set is auto-detected, so a default single-mode
+    run yields just ``global_mean`` and a multi-mode run yields one figure each.
 
     Args:
-        summary_df: DataFrame with standardized_score_mean and _std columns.
-        group_col: Column name for grouping (e.g., 'method', 'scenario').
-        output_path: Path to save the plot.
-        title: Plot title.
-        colors: Optional list of colors for bars. Defaults to matplotlib color cycle.
-
-    Note:
-        Expects summary_df to have columns: {group_col}, standardized_score_mean,
-        and standardized_score_std. The standardized_score_mean represents the
-        average performance across iterations/folds, with error bars showing ±1 std.
+        nmf_df: The concatenated per-panel NMF variability DataFrame
+            (``results['nmf']`` in ``plot_evaluation.py``). Needs the raw
+            ``expvar_test_probe_{subset}_{mode}_mean`` columns; degrades to a
+            warning + skip when they are absent (e.g. an evaluation run that
+            predates the ``--gene_subsets`` default).
+        plots_dir: Output directory (created if missing).
+        title_suffix: Appended to plot titles / filenames.
+        PNG_DPI: Save resolution.
+        expvar_modes: str or list from ``global_mean`` / ``variance_weighted_sum``
+            / ``mean`` / ``median`` / ``expression_weighted_sum``. ``None``
+            (default) auto-detects every mode the CSV contains.
+        external_names: Passed to ``extract_strategy_and_display_name`` for
+            labels (unused for colour here — colour encodes the gene subset).
+        group_name: Unused; accepted for call-site symmetry.
     """
-    fig, ax = plt.subplots(figsize=(8, 6))
+    if nmf_df is None or len(nmf_df) == 0 or "gene_list" not in getattr(nmf_df, "columns", []):
+        logging.warning("plot_expvar_gene_subset_breakdown: empty / malformed nmf_df — skipping")
+        return None
 
-    groups = summary_df[group_col]
-    scores = summary_df["standardized_score_mean"]
-    stds = summary_df["standardized_score_std"]
+    modes = _gs_resolve_modes(nmf_df, expvar_modes)
+    if not modes:
+        logging.warning(
+            "plot_expvar_gene_subset_breakdown: no explained-variance columns found — "
+            "re-run run_evaluation.py (its --gene_subsets default now emits the subsets)"
+        )
+        return None
 
-    if colors is None:
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+    os.makedirs(plots_dir, exist_ok=True)
+    panels = list(dict.fromkeys(nmf_df["gene_list"].tolist()))
+    include_size = len({m.group(1) for p in panels
+                        for m in [re.search(r'_(\d+)(?:_|$)', p)] if m}) > 1
+    safe_suffix = title_suffix.replace(" ", "_").replace("/", "_")
 
-    ax.bar(
-        groups, scores, yerr=stds, capsize=5, alpha=0.7,
-        color=colors[:len(groups)]
-    )
-    ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
-    ax.set_xlabel(group_col.replace('_', ' ').title(), fontsize=12)
-    ax.set_ylabel("Standardized Score", fontsize=12)
-    ax.set_title(title, fontsize=14, fontweight='bold')
-    ax.grid(axis='y', alpha=0.3, linestyle=':', linewidth=0.8)
+    any_drawn = False
+    for mode in modes:
+        for agg in ["global", "macro"]:
+            rows = []
+            for panel in panels:
+                panel_df = nmf_df[nmf_df["gene_list"] == panel]
+                row = _gs_pick_row(panel_df, agg)
+                _, disp = extract_strategy_and_display_name(panel, include_size=include_size)
+                baseline = _gs_val(row, _gs_baseline_col(agg, mode))
+                if np.isnan(baseline) and agg == "global":
+                    baseline = _gs_val(row, "expvar_test_baseline")  # legacy unsuffixed
+                for subset in _GENE_SUBSETS:
+                    val = _gs_val(row, _gs_probe_col(agg, subset, mode))
+                    std = _gs_val(row, _gs_probe_col(agg, subset, mode, suffix="std"))
+                    if np.isnan(val) and agg == "global" and subset == "all_genes" \
+                            and mode == "global_mean":
+                        val = _gs_val(row, "expvar_test_probe")       # legacy unsuffixed
+                        std = _gs_val(row, "expvar_test_probe_std")
+                    rows.append({"panel": panel, "display": disp, "subset": subset,
+                                 "expvar": val, "std": std, "baseline": baseline})
 
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=DEFAULT_PNG_DPI, bbox_inches='tight')
-    plt.close()
+            plot_df = pd.DataFrame(rows)
+            good_panels = [p for p in panels
+                           if not plot_df.loc[plot_df["panel"] == p, "expvar"].isna().all()]
+            plot_df = plot_df[plot_df["panel"].isin(good_panels)]
+            dropped = [p for p in panels if p not in good_panels]
+            if dropped:
+                logging.warning(
+                    f"plot_expvar_gene_subset_breakdown [{agg}/{mode}]: no gene-subset "
+                    f"expvar columns for {len(dropped)} panel(s) — skipped: {dropped[:3]}"
+                )
+            if plot_df.empty:
+                logging.info(
+                    f"plot_expvar_gene_subset_breakdown [{agg}/{mode}]: nothing to plot"
+                )
+                continue
+            # the whole point is the breakdown — skip if only all_genes has data
+            subset_only = plot_df[plot_df["subset"].isin(
+                ["panel_genes_only", "non_panel_genes_only"])]
+            if subset_only["expvar"].isna().all():
+                logging.info(
+                    f"plot_expvar_gene_subset_breakdown [{agg}/{mode}]: only all_genes "
+                    "present (run evaluation with all 3 --gene_subsets — now default) — skipping"
+                )
+                continue
+
+            def _short(s, n=24):
+                return s if len(s) <= n else s[: n - 1] + "…"
+
+            disp_names = [_short(plot_df.loc[plot_df["panel"] == p, "display"].iloc[0])
+                          for p in good_panels]
+            n_panels = len(good_panels)
+            x = np.arange(n_panels)
+            width = 0.8 / len(_GENE_SUBSETS)
+
+            fig, ax = plt.subplots(figsize=(max(9, n_panels * 2.6 + 3.5), 6.5))
+            for si, subset in enumerate(_GENE_SUBSETS):
+                sub = (plot_df[plot_df["subset"] == subset]
+                       .set_index("panel").reindex(good_panels))
+                offs = x + (si - (len(_GENE_SUBSETS) - 1) / 2) * width
+                vals = sub["expvar"].to_numpy(dtype=float)
+                errs = np.nan_to_num(sub["std"].to_numpy(dtype=float), nan=0.0)
+                ax.bar(offs, vals, width=width, yerr=errs, capsize=3,
+                       color=_GENE_SUBSET_COLOR[subset], edgecolor="#333333",
+                       linewidth=1.5, label=_GENE_SUBSET_LABEL[subset])
+                for xi, v in zip(offs, vals):
+                    if not np.isnan(v):
+                        ax.annotate(f"{v:.2f}", (xi, v), textcoords="offset points",
+                                    xytext=(0, 3), ha="center", va="bottom", fontsize=10)
+
+            # per-panel full-NMF baseline (all genes) as a short dashed segment
+            base_by_panel = (plot_df.groupby("panel")["baseline"].first()
+                             .reindex(good_panels))
+            for xi, b in zip(x, base_by_panel.to_numpy(dtype=float)):
+                if not np.isnan(b):
+                    ax.hlines(b, xi - 0.45, xi + 0.45, colors="red", linestyles="--",
+                              linewidth=2, alpha=0.8,
+                              label="full-NMF baseline (all genes)" if xi == 0 else None)
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(disp_names, rotation=25, ha="right", fontsize=10)
+            ax.set_xlim(-0.6, n_panels - 0.4)
+            ax.set_ylabel(f"Explained variance ({mode})")
+            ax.set_ylim(0, 1)
+            agg_txt = "global" if agg == "global" else "macro (per-celltype avg)"
+            ax.set_title(
+                f"Explained variance by gene subset — {agg_txt} / {mode}{title_suffix}",
+                fontsize=14,
+            )
+            ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18),
+                      ncol=len(_GENE_SUBSETS) + 1, fontsize=10, framealpha=0.9)
+            ax.grid(axis="y", alpha=0.3)
+            ax.text(0.015, 0.985,
+                    "non-panel bar = variance recovered for genes the panel does NOT\n"
+                    "measure (the true generalization)",
+                    transform=ax.transAxes, ha="left", va="top",
+                    fontsize=9, style="italic", color="#555555")
+
+            out_path = os.path.join(
+                plots_dir,
+                f"expvar_gene_subset_breakdown_{agg}_{mode}{safe_suffix}.png",
+            )
+            fig.savefig(out_path, dpi=PNG_DPI, bbox_inches="tight")
+            plt.close(fig)
+            any_drawn = True
+            logging.info(f"Created gene-subset expvar breakdown [{agg}/{mode}]: {out_path}")
+
+    if not any_drawn:
+        logging.warning(
+            "plot_expvar_gene_subset_breakdown: no panel had panel/non-panel expvar "
+            "columns — re-run run_evaluation.py (its --gene_subsets default now emits them)"
+        )
+    return None
+
+
+def plot_expvar_gene_subset_breakdown_by_celltype(
+    nmf_df,
+    plots_dir,
+    title_suffix="",
+    PNG_DPI=DEFAULT_PNG_DPI,
+    expvar_modes=None,
+    external_names=None,
+    group_name=None,
+):
+    """Per-cell-type version of :func:`plot_expvar_gene_subset_breakdown`.
+
+    For each panel and each explained-variance mode present in the CSV, draws one
+    figure: x-axis = cell types, three grouped bars per cell type
+    (``all_genes`` / ``panel_genes_only`` / ``non_panel_genes_only``) of
+    ``expvar_test_probe``, with each cell type's full-gene NMF oracle baseline as a
+    short red dashed segment. Reads the ``analysis_type == "per_celltype"`` rows
+    (excluding the ``summary`` row).
+
+    Explained variance only — per-cell-type MSE for ``panel_genes_only`` runs
+    ~50-60x the other subsets (panel genes are high-magnitude markers), so a
+    shared-axis MSE bar chart is not informative; expvar (``1 - MSE/Var``)
+    normalises that out.
+
+    Args:
+        nmf_df: ``results['nmf']`` DataFrame from
+            ``plot_evaluation.py::load_variability_results``.
+        plots_dir: Output directory (created if missing).
+        title_suffix: Appended to titles / filenames.
+        PNG_DPI: Save resolution.
+        expvar_modes: str/list of modes, or ``None`` (default) to auto-detect
+            every mode the CSV contains (see
+            :func:`plot_expvar_gene_subset_breakdown`).
+        external_names: Passed to ``extract_strategy_and_display_name`` for the
+            panel title.
+        group_name: Unused; accepted for call-site symmetry.
+    """
+    if nmf_df is None or len(nmf_df) == 0 or "gene_list" not in getattr(nmf_df, "columns", []):
+        logging.warning(
+            "plot_expvar_gene_subset_breakdown_by_celltype: empty / malformed nmf_df — skipping"
+        )
+        return None
+    if "analysis_type" not in nmf_df.columns or "celltype" not in nmf_df.columns:
+        logging.warning(
+            "plot_expvar_gene_subset_breakdown_by_celltype: no analysis_type/celltype "
+            "columns — skipping"
+        )
+        return None
+
+    modes = _gs_resolve_modes(nmf_df, expvar_modes)
+    if not modes:
+        logging.warning(
+            "plot_expvar_gene_subset_breakdown_by_celltype: no explained-variance "
+            "columns found — re-run run_evaluation.py"
+        )
+        return None
+
+    os.makedirs(plots_dir, exist_ok=True)
+    ct_df = nmf_df[(nmf_df["analysis_type"] == "per_celltype")
+                   & (nmf_df["celltype"] != "summary")]
+    if ct_df.empty:
+        logging.info(
+            "plot_expvar_gene_subset_breakdown_by_celltype: no per-celltype rows — skipping"
+        )
+        return None
+
+    panels = list(dict.fromkeys(ct_df["gene_list"].tolist()))
+    include_size = len({m.group(1) for p in panels
+                        for m in [re.search(r'_(\d+)(?:_|$)', p)] if m}) > 1
+    safe_suffix = title_suffix.replace(" ", "_").replace("/", "_")
+
+    any_drawn = False
+    for mode in modes:
+        for panel in panels:
+            panel_df = ct_df[ct_df["gene_list"] == panel]
+            _, disp = extract_strategy_and_display_name(panel, include_size=include_size)
+            celltypes = sorted(panel_df["celltype"].dropna().unique().tolist())
+
+            rows = []
+            for ct in celltypes:
+                row = panel_df[panel_df["celltype"] == ct].iloc[0]
+                baseline = _gs_val(row, _gs_baseline_col("global", mode))
+                if np.isnan(baseline):
+                    baseline = _gs_val(row, "expvar_test_baseline_mean")  # global_mean fallback
+                for subset in _GENE_SUBSETS:
+                    rows.append({
+                        "celltype": ct, "subset": subset,
+                        "expvar": _gs_val(row, _gs_probe_col("global", subset, mode)),
+                        "std": _gs_val(row, _gs_probe_col("global", subset, mode, suffix="std")),
+                        "baseline": baseline,
+                    })
+            plot_df = pd.DataFrame(rows)
+
+            good_ct = [c for c in celltypes
+                       if not plot_df.loc[plot_df["celltype"] == c, "expvar"].isna().all()]
+            plot_df = plot_df[plot_df["celltype"].isin(good_ct)]
+            if plot_df.empty:
+                continue
+            subset_only = plot_df[plot_df["subset"].isin(
+                ["panel_genes_only", "non_panel_genes_only"])]
+            if subset_only["expvar"].isna().all():
+                logging.info(
+                    f"plot_expvar_gene_subset_breakdown_by_celltype [{mode}/{disp}]: "
+                    "only all_genes present — skipping"
+                )
+                continue
+
+            n_ct = len(good_ct)
+            x = np.arange(n_ct)
+            width = 0.8 / len(_GENE_SUBSETS)
+
+            fig, ax = plt.subplots(figsize=(max(12, n_ct * 1.15 + 3), 7))
+            for si, subset in enumerate(_GENE_SUBSETS):
+                sub = (plot_df[plot_df["subset"] == subset]
+                       .set_index("celltype").reindex(good_ct))
+                offs = x + (si - (len(_GENE_SUBSETS) - 1) / 2) * width
+                ax.bar(offs, sub["expvar"].to_numpy(dtype=float), width=width,
+                       yerr=np.nan_to_num(sub["std"].to_numpy(dtype=float), nan=0.0),
+                       capsize=2, color=_GENE_SUBSET_COLOR[subset], edgecolor="#333333",
+                       linewidth=1.2, label=_GENE_SUBSET_LABEL[subset])
+
+            base_by_ct = (plot_df.groupby("celltype")["baseline"].first().reindex(good_ct))
+            for xi, b in zip(x, base_by_ct.to_numpy(dtype=float)):
+                if not np.isnan(b):
+                    ax.hlines(b, xi - 0.42, xi + 0.42, colors="red", linestyles="--",
+                              linewidth=1.8, alpha=0.8,
+                              label="full-NMF baseline (all genes)" if xi == 0 else None)
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(
+                [c if len(c) <= 22 else c[:21] + "…" for c in good_ct],
+                rotation=35, ha="right", fontsize=9,
+            )
+            ax.set_xlim(-0.6, n_ct - 0.4)
+            ax.set_ylabel(f"Explained variance ({mode})")
+            ax.set_ylim(0, 1)
+            ax.set_title(
+                f"Explained variance by gene subset, per cell type — {mode}{title_suffix}\n"
+                f"{disp}",
+                fontsize=14,
+            )
+            ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22),
+                      ncol=len(_GENE_SUBSETS) + 1, fontsize=10, framealpha=0.9)
+            ax.grid(axis="y", alpha=0.3)
+
+            panel_safe = re.sub(r"[^\w.-]", "_", disp)[:60]
+            out_path = os.path.join(
+                plots_dir,
+                f"expvar_gene_subset_by_celltype_{mode}__{panel_safe}{safe_suffix}.png",
+            )
+            fig.savefig(out_path, dpi=PNG_DPI, bbox_inches="tight")
+            plt.close(fig)
+            any_drawn = True
+            logging.info(
+                f"Created per-celltype gene-subset expvar breakdown [{mode}/{disp}]: {out_path}"
+            )
+
+    if not any_drawn:
+        logging.warning(
+            "plot_expvar_gene_subset_breakdown_by_celltype: no per-celltype panel/non-panel "
+            "expvar columns — re-run run_evaluation.py (its --gene_subsets default emits them)"
+        )
+    return None

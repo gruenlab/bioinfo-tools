@@ -29,7 +29,6 @@ import shutil
 import sys
 import tempfile
 import time
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -44,15 +43,14 @@ pd.options.mode.string_storage = "python"
 # ---------------------------------------------------------------------------
 # Set up import paths BEFORE importing any local modules.
 #
-# Multiple modules (Preprocessing, Evaluation, Utility) each have their own
-# _constants.py — relying on sys.path ordering to pick the right one is
-# fragile. Instead we load Preprocessing-module/_constants.py explicitly by
-# file path using importlib, then add the other module directories for the
-# remaining imports (_preprocessing, _utils).
+# Preprocessing, Evaluation and Utility each ship their own _constants.py, so
+# sys.path ordering alone cannot reliably pick this module's copy. Load
+# Preprocessing-module/_constants.py explicitly by file path, then add the
+# sibling module directories for the remaining imports (_preprocessing, _utils).
 # ---------------------------------------------------------------------------
 _SCRIPT_DIR = Path(__file__).parent.absolute()
-_MODULES_DIR = _SCRIPT_DIR.parent           # SpatialProbeDesign/Modules/
-_PROJECT_DIR = _MODULES_DIR.parent          # SpatialProbeDesign/
+_MODULES_DIR = _SCRIPT_DIR.parent           # Code/RecoVar/
+_PROJECT_DIR = _MODULES_DIR.parent          # Code/
 
 # Load Preprocessing-module constants by explicit path to avoid any ambiguity
 import importlib.util as _ilu                                                  # noqa: E402
@@ -243,7 +241,6 @@ def preprocess_reference_for_analysis_scripts(
         layer="counts",
         hvg=False,
         subset=False,
-        scale=False,
         dataset_name="analysis_input",
         dimensionality_reduction=dimensionality_reduction,
         filter_genes=True,

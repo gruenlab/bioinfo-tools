@@ -2,11 +2,7 @@
 
 This module contains publication-quality plotting functions for visualizing
 reconstruction quality and gene selection stability across different K values
-(number of NMF/cNMF components).
-
-Functions moved from Analysis-scripts/plot_k_varying_results.py and
-plot_per_celltype_grid.py, optimized for publication quality with configurable
-DPI, formats, colors, and font sizes.
+(number of NMF components), with configurable DPI, formats, colors, and font sizes.
 """
 
 from __future__ import annotations
@@ -20,30 +16,34 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+# --- load THIS directory's _constants.py by path (sibling dirs share the name) ---
+import importlib.util as _ilu, sys as _sys
+from pathlib import Path as _cpath
+_cspec = _ilu.spec_from_file_location("_constants", _cpath(__file__).resolve().parent / "_constants.py")
+_sys.modules["_constants"] = _ilu.module_from_spec(_cspec)
+_cspec.loader.exec_module(_sys.modules["_constants"])
+
+
 try:
     from ._constants import (
         ANALYSIS_PNG_DPI,
-        K_VARYING_CNMF_COLOR,
         K_VARYING_NMF_COLOR,
         PUB_LABEL_SIZE,
         PUB_LEGEND_SIZE,
         PUB_SUPTITLE_SIZE,
         PUB_TICK_SIZE,
         PUB_TITLE_SIZE,
-        PUB_VALUE_SIZE,
     )
 except ImportError:
     # Support direct script execution where package-relative imports are unavailable.
     from _constants import (
         ANALYSIS_PNG_DPI,
-        K_VARYING_CNMF_COLOR,
         K_VARYING_NMF_COLOR,
         PUB_LABEL_SIZE,
         PUB_LEGEND_SIZE,
         PUB_SUPTITLE_SIZE,
         PUB_TICK_SIZE,
         PUB_TITLE_SIZE,
-        PUB_VALUE_SIZE,
     )
 
 if TYPE_CHECKING:
@@ -67,7 +67,7 @@ def plot_reconstruction_quality(
     """Plot reconstruction quality metrics (MSE/ExpVar) vs K for different methods.
 
     Creates separate plots for MSE and Explained Variance, with subplots for
-    different evaluation methods (NMF-eval and cNMF-eval).
+    the NMF evaluation method.
 
     Parameters
     ----------
@@ -78,12 +78,12 @@ def plot_reconstruction_quality(
         Directory to save plots (plots/ subdirectory will be created)
     metric_type : str, default "global"
         Type of metrics to plot: 'global', 'macro', or 'weighted'
-    png_dpi : int, default ANALYSIS_PNG_DPI (600)
+    png_dpi : int, default ANALYSIS_PNG_DPI (300)
         Resolution for saved plots
     fig_format : str, default "png"
         Output format: 'png', 'pdf', or 'svg'
     colors : dict, optional
-        Custom colors for selection methods. Default: NMF=blue, cNMF=orange
+        Custom colors for selection methods. Default: NMF=blue
     metric_filter : list, optional
         Subset of metrics to render from {'mse', 'expvar'}. If None, renders both.
 
@@ -120,7 +120,7 @@ def plot_reconstruction_quality(
 
     # Use default or custom colors
     if colors is None:
-        colors = {"nmf": K_VARYING_NMF_COLOR, "cnmf": K_VARYING_CNMF_COLOR}
+        colors = {"nmf": K_VARYING_NMF_COLOR}
 
     selected_metrics = {"mse", "expvar"}
     if metric_filter:
@@ -133,8 +133,6 @@ def plot_reconstruction_quality(
     plot_configs = [
         ("nmf", mse_col, f"MSE (lower is better)", "mse"),
         ("nmf", expvar_col, f"Explained Variance (higher is better)", "expvar"),
-        ("cnmf", mse_col, f"MSE (lower is better)", "mse"),
-        ("cnmf", expvar_col, f"Explained Variance (higher is better)", "expvar"),
     ]
 
     for eval_method, metric_col, ylabel, suffix in plot_configs:
@@ -143,7 +141,7 @@ def plot_reconstruction_quality(
 
         fig, ax = plt.subplots(figsize=(10, 6))
 
-        for selection_method in ["nmf", "cnmf"]:
+        for selection_method in ["nmf"]:
             # Filter data
             mask = (
                 (df["eval_method"] == eval_method)
@@ -169,7 +167,7 @@ def plot_reconstruction_quality(
                 capsize=5,
                 linewidth=2,
                 markersize=8,
-                color=colors.get(selection_method, K_VARYING_NMF_COLOR if selection_method == "nmf" else K_VARYING_CNMF_COLOR),
+                color=colors.get(selection_method, K_VARYING_NMF_COLOR),
                 alpha=0.8,
             )
 
@@ -217,12 +215,12 @@ def plot_gene_stability(
         pairwise_jaccard, intersection_pct
     output_dir : Path
         Directory to save plots (plots/ subdirectory will be created)
-    png_dpi : int, default ANALYSIS_PNG_DPI (600)
+    png_dpi : int, default ANALYSIS_PNG_DPI (300)
         Resolution for saved plots
     fig_format : str, default "png"
         Output format: 'png', 'pdf', or 'svg'
     colors : dict, optional
-        Custom colors for selection methods. Default: NMF=blue, cNMF=orange
+        Custom colors for selection methods. Default: NMF=blue
 
     Outputs
     -------
@@ -241,7 +239,7 @@ def plot_gene_stability(
 
     # Use default or custom colors
     if colors is None:
-        colors = {"nmf": K_VARYING_NMF_COLOR, "cnmf": K_VARYING_CNMF_COLOR}
+        colors = {"nmf": K_VARYING_NMF_COLOR}
 
     # Plot Jaccard similarity vs K
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -344,7 +342,7 @@ def plot_aggregate_metrics(
         Reconstruction quality dataframe
     output_dir : Path
         Directory to save plots (plots/ subdirectory will be created)
-    png_dpi : int, default ANALYSIS_PNG_DPI (600)
+    png_dpi : int, default ANALYSIS_PNG_DPI (300)
         Resolution for saved plots
     fig_format : str, default "png"
         Output format: 'png', 'pdf', or 'svg'
@@ -510,7 +508,7 @@ def plot_reconstruction_metrics_grid(
 ) -> None:
     """Create unified 2×3 grid plot showing all reconstruction metrics.
 
-    Allows direct visual comparison of NMF vs cNMF stability across:
+    Shows NMF reconstruction stability across:
     - Global, Macro, and Weighted MSE (row 1)
     - Global, Macro, and Weighted ExpVar (row 2)
 
@@ -525,12 +523,12 @@ def plot_reconstruction_metrics_grid(
         Global reconstruction quality results
     output_dir : Path
         Directory to save plots (plots/ subdirectory will be created)
-    png_dpi : int, default ANALYSIS_PNG_DPI (600)
+    png_dpi : int, default ANALYSIS_PNG_DPI (300)
         Resolution for saved plots
     fig_format : str, default "png"
         Output format: 'png', 'pdf', or 'svg'
     colors : dict, optional
-        Custom colors for methods. Default: nmf-nmf=blue, cnmf-cnmf=orange
+        Custom colors for methods. Default: nmf-nmf=blue
 
     Outputs
     -------
@@ -589,7 +587,6 @@ def plot_reconstruction_metrics_grid(
     if colors is None:
         colors = {
             "nmf-nmf": K_VARYING_NMF_COLOR,
-            "cnmf-cnmf": K_VARYING_CNMF_COLOR,
         }
 
     # Get k-values for x-axis
@@ -601,7 +598,7 @@ def plot_reconstruction_metrics_grid(
 
     # --- Panel 1,1: Global MSE ---
     ax = axes[0, 0]
-    for method in ["nmf-nmf", "cnmf-cnmf"]:
+    for method in ["nmf-nmf"]:
         sel_method, eval_method = method.split("-")
         mask = (
             (global_df["selection_method"] == sel_method)
@@ -633,7 +630,7 @@ def plot_reconstruction_metrics_grid(
 
     # --- Panel 1,2: Macro MSE ---
     ax = axes[0, 1]
-    for method in ["nmf-nmf", "cnmf-cnmf"]:
+    for method in ["nmf-nmf"]:
         sel_method, eval_method = method.split("-")
         mask = (
             (results_df_clean["selection_method"] == sel_method)
@@ -665,7 +662,7 @@ def plot_reconstruction_metrics_grid(
 
     # --- Panel 1,3: Weighted MSE ---
     ax = axes[0, 2]
-    for method in ["nmf-nmf", "cnmf-cnmf"]:
+    for method in ["nmf-nmf"]:
         sel_method, eval_method = method.split("-")
         mask = (
             (results_df_clean["selection_method"] == sel_method)
@@ -701,7 +698,7 @@ def plot_reconstruction_metrics_grid(
 
     # --- Panel 2,1: Global ExpVar ---
     ax = axes[1, 0]
-    for method in ["nmf-nmf", "cnmf-cnmf"]:
+    for method in ["nmf-nmf"]:
         sel_method, eval_method = method.split("-")
         mask = (
             (global_df["selection_method"] == sel_method)
@@ -733,7 +730,7 @@ def plot_reconstruction_metrics_grid(
 
     # --- Panel 2,2: Macro ExpVar ---
     ax = axes[1, 1]
-    for method in ["nmf-nmf", "cnmf-cnmf"]:
+    for method in ["nmf-nmf"]:
         sel_method, eval_method = method.split("-")
         mask = (
             (results_df_clean["selection_method"] == sel_method)
@@ -765,7 +762,7 @@ def plot_reconstruction_metrics_grid(
 
     # --- Panel 2,3: Weighted ExpVar ---
     ax = axes[1, 2]
-    for method in ["nmf-nmf", "cnmf-cnmf"]:
+    for method in ["nmf-nmf"]:
         sel_method, eval_method = method.split("-")
         mask = (
             (results_df_clean["selection_method"] == sel_method)
@@ -796,7 +793,7 @@ def plot_reconstruction_metrics_grid(
     ax.grid(True, alpha=0.3)
 
     # Overall title
-    title_text = "Reconstruction Quality: NMF vs cNMF Comparison Across All Metrics\n(Mean ± Std across iterations)"
+    title_text = "Reconstruction Quality Across All Metrics\n(Mean ± Std across iterations)"
     if outliers_removed:
         n_outliers = len(outliers_removed)
         title_text += f"\nNote: {n_outliers} extreme outlier(s) removed (>10×IQR)"
@@ -835,12 +832,12 @@ def plot_baseline_comparison(
         Global reconstruction quality dataframe with baseline columns
     output_dir : Path
         Directory to save plots (plots/ subdirectory will be created)
-    png_dpi : int, default ANALYSIS_PNG_DPI (600)
+    png_dpi : int, default ANALYSIS_PNG_DPI (300)
         Resolution for saved plots
     fig_format : str, default "png"
         Output format: 'png', 'pdf', or 'svg'
     colors : dict, optional
-        Custom colors for selection methods. Default: NMF=blue, cNMF=orange
+        Custom colors for selection methods. Default: NMF=blue
 
     Outputs
     -------
@@ -864,13 +861,13 @@ def plot_baseline_comparison(
 
     # Use default or custom colors
     if colors is None:
-        colors = {"nmf": K_VARYING_NMF_COLOR, "cnmf": K_VARYING_CNMF_COLOR}
+        colors = {"nmf": K_VARYING_NMF_COLOR}
 
     # Plot MSE improvement
     for eval_method in df["eval_method"].unique():
         fig, ax = plt.subplots(figsize=(10, 6))
 
-        for selection_method in ["nmf", "cnmf"]:
+        for selection_method in ["nmf"]:
             mask = (
                 (df["eval_method"] == eval_method)
                 & (df["selection_method"] == selection_method)
@@ -933,7 +930,7 @@ def plot_per_celltype_grid(
     """Create grid plot showing metric vs k-value for each celltype.
 
     Each subplot shows the variation of MSE or ExpVar across K values for
-    a specific cell type, with separate lines for NMF-NMF and cNMF-cNMF methods.
+    a specific cell type (NMF-NMF selection/evaluation).
 
     Parameters
     ----------
@@ -949,10 +946,10 @@ def plot_per_celltype_grid(
         Path to save figure
     figsize_per_plot : tuple, default (3, 2.5)
         Size of each subplot (width, height)
-    png_dpi : int, default ANALYSIS_PNG_DPI (600)
+    png_dpi : int, default ANALYSIS_PNG_DPI (300)
         Resolution for saved plots
     colors : dict, optional
-        Custom colors for methods. Default: nmf-nmf=blue, cnmf-cnmf=orange
+        Custom colors for methods. Default: nmf-nmf=blue
 
     Outputs
     -------
@@ -982,13 +979,11 @@ def plot_per_celltype_grid(
     if colors is None:
         colors = {
             "nmf-nmf": K_VARYING_NMF_COLOR,
-            "cnmf-cnmf": K_VARYING_CNMF_COLOR,
         }
     else:
         # Accept either explicit method keys or selection-method aliases.
         colors = {
             "nmf-nmf": colors.get("nmf-nmf", colors.get("nmf", K_VARYING_NMF_COLOR)),
-            "cnmf-cnmf": colors.get("cnmf-cnmf", colors.get("cnmf", K_VARYING_CNMF_COLOR)),
         }
 
     # Plot each celltype
@@ -997,7 +992,7 @@ def plot_per_celltype_grid(
         ct_df = aggregated_data[celltype]
 
         # Plot both methods
-        for method in ["nmf-nmf", "cnmf-cnmf"]:
+        for method in ["nmf-nmf"]:
             method_df = ct_df[ct_df["method"] == method].sort_values("k_value")
 
             if method_df.empty:
