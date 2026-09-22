@@ -17,6 +17,37 @@ from torch.distributions import NegativeBinomial
 
 @dataclass(frozen=True)
 class ScviPredictor:
+    """scVI-based predictor conforming to PredictorProtocol.
+
+    Unlike ``PcaPredictor``/``FastIcaPredictor``/``NmfPredictor`` -- which fit one
+    indexer-independent basis once on the full gene set, then cheaply evaluate *any*
+    later probe-gene subset by column-selecting that fixed basis -- ``ScviPredictor``
+    cannot do this. Its recVAE encoder's input layer is built with width
+    ``len(indexer)`` at construction time (see ``_model.py``), so a model built for one
+    probe panel has an encoder that structurally cannot accept a different one.
+
+    Consequently:
+    - ``fit()`` is nearly a no-op: it only wraps/stores the reference data (and, if
+      ``n_factors`` is ``None``, runs a KMeans/kneedle search to pick one) -- no VAE is
+      trained there.
+    - **All** training happens inside ``predict()``, which builds a fresh SCVI/recVAE
+      model sized to that call's ``indexer`` and trains it from scratch (``max_epochs``
+      epochs), every single call -- even two calls with the *same* indexer on the *same*
+      fitted predictor retrain independently. There is no cached/reusable basis
+      (``feature_embedding`` always returns ``None``) and no seed/determinism control
+      anywhere in this wrapper.
+
+    This is an implementation property of the current encoder design, not a
+    mathematical requirement of VAEs in general -- an amortized/masked encoder that
+    accepts an arbitrary observed-gene subset without retraining is possible in
+    principle; this one just isn't built that way. Contrast conceptually with a
+    supervised probe-to-full-transcriptome regression, where indexer-dependence at fit
+    time *is* mathematically unavoidable (the model's coefficients are only defined
+    once the predictor/probe genes are chosen) -- here, the retraining is a
+    cost/architecture limitation of this implementation, not an inherent constraint of
+    the scVI method itself.
+    """
+
     n_factors: Optional[int] = None
     max_epochs: int = 200
     preprocessing_steps: Sequence[Callable[[NumericArray], NumericArray]] | None = None
@@ -59,6 +90,7 @@ class ScviPredictor:
             n_query_features=n_query_features,
         )
 
+        # Full retrain, every call -- see class docstring for why.
         model = _train_scvi(
             adata=self._adata_reference.copy(),
             indexer=indexer_valid,

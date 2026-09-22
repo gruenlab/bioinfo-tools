@@ -7,6 +7,7 @@ from nico2_lib.predictors._nmf._nmf_pred import (
 )
 from nico2_lib.predictors._pca._pca_pred import PcaPredictor
 from nico2_lib.predictors._protocol import PredictorProtocol
+from nico2_lib.predictors._ridge._ridge_pred import RidgePredictor
 
 __all__ = [
     "PcaPredictor",
@@ -16,6 +17,7 @@ __all__ = [
     "PredictorProtocol",
     "shuffle_by_embedding_neighbors",
     "FastIcaPredictor",
+    "RidgePredictor",
 ]
 
 # These predictors pull in heavy, optional dependencies (mofaflex, scvi-tools,

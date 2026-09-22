@@ -123,3 +123,9 @@ def test_mofaflex_classic(n_factors: int):
 def test_tangram_predictor():
     tangram_predictor = n2l.pd.TangramPredictor()
     run_predictor_test_suite(tangram_predictor)
+
+
+@pytest.mark.parametrize("use_ridgecv", [False, True])
+def test_ridge_predictor(use_ridgecv: bool):
+    ridge_predictor = n2l.pd.RidgePredictor(use_ridgecv=use_ridgecv, random_state=0)
+    run_predictor_test_suite(ridge_predictor)
