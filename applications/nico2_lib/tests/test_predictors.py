@@ -4,6 +4,7 @@ import nico2_lib as n2l
 import numpy as np
 import pytest
 from nico2_lib.typing import NumericArray
+from sklearn.decomposition import non_negative_factorization
 from sklearn.model_selection import train_test_split
 
 rng = np.random.default_rng(0)
@@ -87,6 +88,42 @@ def test_pca_predictor(embedding_size: int):
 def test_nmf_predictor(embedding_size: int):
     nmf_predictor = n2l.pd.NmfPredictor(n_components=embedding_size)
     run_predictor_test_suite(nmf_predictor)
+
+
+def test_nmf_predict_normalizes_factors():
+    # Low-rank counts with distinct factors. On unstructured noise the factors are nearly
+    # collinear and the solver stops at its tolerance at a point that depends on the scale of H,
+    # so agreement below is to solver tolerance, not to rounding error.
+    data_rng = np.random.default_rng(0)
+    w_true = data_rng.gamma(1.0, 1.0, size=(n_obs, 3))
+    h_true = data_rng.gamma(0.2, 5.0, size=(3, n_var))
+    structured = data_rng.poisson(w_true @ h_true).astype(np.float64)
+
+    predictor = n2l.pd.NmfPredictor(n_components=3, random_state=0).fit(
+        structured[cell_train_idx]
+    )
+    h_fitted = predictor.h_reference.copy()
+    x_query = structured[cell_test_idx][:, gene_train_idx]
+
+    w_query, reconstruction = predictor.predict(x_query, indexer=gene_train_idx)
+
+    # same solve with the factors as fitted, to compare against
+    w_raw, _, _ = non_negative_factorization(
+        X=x_query,
+        H=h_fitted[:, gene_train_idx],
+        init="custom",
+        update_H=False,
+        n_components=3,
+        max_iter=predictor.max_iter,
+        solver=predictor.solver,
+        beta_loss=predictor.beta_loss,
+        random_state=0,
+    )
+    factor_sums = h_fitted.sum(axis=1)
+
+    assert np.array_equal(predictor.h_reference, h_fitted), "fit-time H must stay as fitted"
+    np.testing.assert_allclose(reconstruction, w_raw @ h_fitted, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(w_query, w_raw * factor_sums, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize(

@@ -268,23 +268,32 @@ class NmfPredictor:
     ) -> tuple[NumericArray, NumericArray]:
         """Predict all fit-time features using X and a feature index map.
 
+        Each factor of ``h_reference`` is normalized so that its weights sum to 1 over
+        all fit-time features (not only those in ``indexer``), so differences in counts
+        between cells or modalities go into the returned embedding. ``h_reference`` itself
+        stays as fitted.
+
         Args:
             X: Feature matrix for prediction, shape (n_samples, n_features_pred).
             indexer: Sequence or array of indices, length n_features_fit, where
                 each value points to the corresponding feature column in X.
 
         Returns:
-            Predicted outputs containing all fit-time features in the original
-            fit order, shape (n_samples, n_features_fit).
+            The query embedding, on the scale of the normalized factors, and the predicted
+            outputs containing all fit-time features in the original fit order,
+            shape (n_samples, n_features_fit).
         """
         assert self.h_reference is not None
         assert self.embedding_size is not None, "embedding_size must be set"
         if self.preprocessing_steps is not None:
             for step in self.preprocessing_steps:
                 x = step(x)
+        factor_sums = self.h_reference.sum(axis=1, keepdims=True)
+        factor_sums[factor_sums == 0] = 1.0  # an all-zero factor stays as it is
+        h_normalized = self.h_reference / factor_sums
         _nnf_kwargs: dict = dict(
             X=x.astype(self.h_reference.dtype),
-            H=self.h_reference[:, indexer],
+            H=h_normalized[:, indexer],
             init="custom",
             update_H=False,
             n_components=self.embedding_size,  # type: ignore
@@ -301,7 +310,7 @@ class NmfPredictor:
             # versions -- retry with the solver-appropriate init.
             _nnf_kwargs["init"] = "nndsvda" if self.solver == "mu" else "nndsvd"
             w_query, _, _ = non_negative_factorization(**_nnf_kwargs)
-        return w_query, w_query @ self.h_reference
+        return w_query, w_query @ h_normalized
 
     @property
     def feature_embedding(self) -> NumericArray | None:
